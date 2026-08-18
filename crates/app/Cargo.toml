@@ -1,0 +1,25 @@
+[package]
+name = "s3browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "s3browser"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_tokio.workspace = true
+s3core.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Used by the `--verify-glass` self-check to inspect the real NSWindow.
+# Versions match what gpui 0.2.2 already links.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSApplication", "NSVisualEffectView", "NSColor", "NSGraphics"] }
+objc2-foundation = "0.3"

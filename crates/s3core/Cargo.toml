@@ -1,0 +1,14 @@
+[package]
+name = "s3core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-credential-types.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

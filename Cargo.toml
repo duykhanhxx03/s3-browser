@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/s3core", "crates/gpui_tokio"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+gpui = "0.2.2"
+gpui_tokio = { path = "crates/gpui_tokio" }
+s3core = { path = "crates/s3core" }
+
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+aws-config = { version = "1", features = ["behavior-version-latest", "sso"] }
+aws-sdk-s3 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+
+[profile.dev]
+# GPUI is heavy; optimize dependencies so debug builds stay usable.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

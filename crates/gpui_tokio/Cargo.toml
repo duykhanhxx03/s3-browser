@@ -1,0 +1,14 @@
+[package]
+name = "gpui_tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Vendored from zed-industries/zed (crates/gpui_tokio), Apache-2.0.
+# Upstream is not published to crates.io and depends on gpui_util; the only use
+# of that dependency (`defer`) is inlined here.
+
+[dependencies]
+gpui.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
