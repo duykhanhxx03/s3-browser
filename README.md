@@ -67,6 +67,16 @@ Mọi khác biệt nền tảng gom trong [crates/app/src/platform.rs](crates/ap
 
 Theme không có bảng màu riêng cho từng chế độ: chỉ **nền cửa sổ** đổi giữa trong suốt (glass) và đục (solid), mọi panel phía trên đều là lớp alpha nên hiển thị đúng ở cả hai. Sáng/tối bám theo hệ thống ngay khi người dùng đổi, qua `observe_window_appearance`.
 
+Các nhánh theo nền tảng dùng `cfg!(target_os = …)` (macro runtime) chứ **không** dùng `#[cfg]`, nên
+mọi nhánh đều được biên dịch và kiểm tra kiểu trên mọi nền tảng — chỉ nhánh được chọn là khác. Nhờ
+vậy code Windows/Linux không âm thầm hỏng khi sửa trên máy Mac. Riêng `glass_check.rs` là macOS-only
+thật (dùng objc2) nên được gate bằng `#[cfg(target_os = "macos")]`.
+
+**Đã kiểm chứng tới đâu:** `cargo check -p vault --target x86_64-pc-windows-msvc` và
+`--target x86_64-unknown-linux-gnu` đều sạch — đây là crate có dependency khác nhau theo từng nền
+tảng. Chưa build được trọn `s3browser` cho hai target đó từ máy macOS vì `ring` (dependency TLS)
+cần C toolchain chéo; việc build thật cho Windows/Linux nên chạy trên CI của chính nền tảng đó.
+
 ## Cấu trúc
 
 ```
