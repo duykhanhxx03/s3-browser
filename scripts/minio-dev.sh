@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts a local MinIO with the fixture data the tests and the M0 spike expect.
-# Usage: scripts/minio-dev.sh [start|stop|reset]
+# Usage: scripts/minio-dev.sh [start|stop|reset|orphan]
 set -euo pipefail
 
 CONTAINER=s3browser-minio
@@ -63,7 +63,10 @@ export LARGE
 
 case "${1:-start}" in
   start) start ;;
+  # Abandoning a multipart upload needs raw S3 calls that `mc` does not expose,
+  # so the orphan fixture lives in an example binary.
+  orphan) cargo run -q -p s3core --example seed_orphan "${2:-demo-bucket}" "${3:-manual/orphan.bin}" ;;
   stop) docker rm -f "$CONTAINER" >/dev/null 2>&1 && echo "stopped" ;;
   reset) docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; start ;;
-  *) echo "usage: $0 [start|stop|reset] [--large]" >&2; exit 1 ;;
+  *) echo "usage: $0 [start|stop|reset|orphan] [--large]" >&2; exit 1 ;;
 esac

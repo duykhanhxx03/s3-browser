@@ -11,7 +11,10 @@ use gpui::{
     Modifiers, SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
 use gpui_tokio::Tokio;
-use s3core::{format_size, format_timestamp, sort_entries, Entry, Profile, S3Client, Sort, SortKey};
+use s3core::{
+    format_size, format_timestamp, sort_entries, Entry, OrphanedUpload, Profile, S3Client, Sort,
+    SortKey,
+};
 use transfer::{Job, JobState, TransferEngine};
 use vault::{ImportedProfile, ProfileStore, StoredProfile};
 
@@ -91,6 +94,9 @@ pub struct Browser {
 
     transfers: TransferEngine,
     drawer_open: bool,
+
+    orphans: Vec<OrphanedUpload>,
+    orphans_open: bool,
     /// True while a repaint loop is running to animate transfer progress.
     ticking: bool,
 
@@ -161,6 +167,9 @@ impl Browser {
             error: None,
             transfers,
             drawer_open: false,
+
+            orphans: Vec::new(),
+            orphans_open: false,
             ticking: false,
             connect_task: None,
             listing_task: None,
@@ -698,6 +707,117 @@ impl Browser {
         cx.notify();
     }
 
+    /// Looks for multipart uploads left behind by a crash or a cancel. S3 bills
+    /// for their parts indefinitely and they never show up in a normal listing,
+    /// so this is the only way to find them.
+    fn scan_orphans(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        self.orphans_open = true;
+        self.status = "Đang tìm upload dở…".into();
+
+        let scanning = Tokio::spawn(cx, async move { client.list_orphaned_uploads(&bucket).await });
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = scanning.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(orphans)) => {
+                        this.status = if orphans.is_empty() {
+                            "Không có upload dở nào".into()
+                        } else {
+                            format!("Tìm thấy {} upload dở", orphans.len()).into()
+                        };
+                        this.orphans = orphans;
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        });
+        self.op_task = Some(task);
+        cx.notify();
+    }
+
+    /// Aborts one orphaned upload, releasing the storage it was holding.
+    fn abort_orphan(&mut self, upload_id: SharedString, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let Some(orphan) = self
+            .orphans
+            .iter()
+            .find(|orphan| orphan.upload_id == upload_id.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+
+        let aborting = Tokio::spawn(cx, async move {
+            client
+                .abort_multipart_upload(&bucket, &orphan.key, &orphan.upload_id)
+                .await
+        });
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = aborting.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => this.orphans.retain(|o| o.upload_id != upload_id.as_ref()),
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        });
+        self.op_task = Some(task);
+        cx.notify();
+    }
+
+    /// Aborts every orphan currently listed, reporting how many failed rather
+    /// than stopping at the first error.
+    fn abort_all_orphans(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let orphans = self.orphans.clone();
+        if orphans.is_empty() {
+            return;
+        }
+
+        let aborting = Tokio::spawn(cx, async move {
+            let mut failures = 0usize;
+            for orphan in &orphans {
+                if client
+                    .abort_multipart_upload(&bucket, &orphan.key, &orphan.upload_id)
+                    .await
+                    .is_err()
+                {
+                    failures += 1;
+                }
+            }
+            (orphans.len(), failures)
+        });
+
+        let task = cx.spawn(async move |this, cx| {
+            let (total, failures) = aborting.await.unwrap_or((0, 0));
+            _ = this.update(cx, |this, cx| {
+                // Anything that failed is still out there, so re-scan rather than
+                // leaving the list claiming the bucket is clean.
+                this.orphans.clear();
+                this.status = abort_summary(total, failures).into();
+                if failures > 0 {
+                    this.scan_orphans(cx);
+                }
+                cx.notify();
+            });
+        });
+        self.op_task = Some(task);
+        cx.notify();
+    }
+
     /// Repaints while transfers move, so progress bars animate. The loop stops
     /// itself once the queue goes quiet rather than burning a timer forever.
     fn start_ticking(&mut self, cx: &mut Context<Self>) {
@@ -1010,6 +1130,13 @@ impl Browser {
                     |this, _event, _window, cx| this.start_prompt(Prompt::NewFolder, cx),
                 )),
             )
+            .when(bucket.is_some(), |this| {
+                this.child(
+                    action_button("scan-orphans", "Dọn upload dở", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.scan_orphans(cx),
+                    )),
+                )
+            })
             .when(!self.selection.is_empty(), |this| {
                 let count = self.selection.len();
                 this.child(
@@ -1265,6 +1392,108 @@ impl Browser {
         )
     }
 
+    fn render_orphans(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.orphans_open {
+            return None;
+        }
+        let theme = self.theme;
+        let count = self.orphans.len();
+
+        Some(
+            div()
+                .h(px(168.))
+                .flex()
+                .flex_col()
+                .bg(theme.panel)
+                .border_t_1()
+                .border_color(theme.border_strong)
+                .child(
+                    div()
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!("UPLOAD DỞ · {count}")))
+                        .child(div().flex_1())
+                        .when(count > 0, |this| {
+                            this.child(danger_button(
+                                "abort-all-orphans",
+                                SharedString::from(format!("Huỷ tất cả ({count})")),
+                                theme,
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.abort_all_orphans(cx)
+                            })))
+                        })
+                        .child(
+                            action_button("close-orphans", "Đóng", theme).on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.orphans_open = false;
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                )
+                .child(if self.orphans.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child("Không có upload dở nào")
+                        .into_any_element()
+                } else {
+                    uniform_list(
+                        "orphans",
+                        self.orphans.len(),
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            range
+                                .filter_map(|ix| this.orphans.get(ix).cloned())
+                                .map(|orphan| this.render_orphan(orphan, cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .flex_1()
+                    .into_any_element()
+                }),
+        )
+    }
+
+    fn render_orphan(&self, orphan: OrphanedUpload, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let upload_id = SharedString::from(orphan.upload_id.clone());
+        let when: SharedString = orphan
+            .initiated_epoch
+            .map(format_timestamp)
+            .unwrap_or_else(|| "?".into())
+            .into();
+
+        div()
+            .id(upload_id.clone())
+            .h(px(32.))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(theme.text)
+                    .overflow_hidden()
+                    .child(SharedString::from(orphan.key)),
+            )
+            .child(div().text_color(theme.text_faint).child(when))
+            .child(action_button("abort-orphan", "Huỷ", theme).on_click(cx.listener(
+                move |this, _event, _window, cx| this.abort_orphan(upload_id.clone(), cx),
+            )))
+    }
+
     fn render_job(&self, job: Job, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let id = job.id;
@@ -1454,6 +1683,7 @@ impl Render for Browser {
                     ),
             )
             .children(self.render_drawer(cx))
+            .children(self.render_orphans(cx))
             .child(self.render_status(cx))
     }
 }
@@ -1599,6 +1829,19 @@ fn object_row(
 
 // ------------------------------------------------------------------- helpers
 
+/// What to tell the user after a bulk abort. Pure because the partial-failure
+/// arithmetic is the easy thing to get backwards.
+fn abort_summary(total: usize, failures: usize) -> String {
+    let succeeded = total.saturating_sub(failures);
+    if failures == 0 {
+        format!("Đã huỷ {total} upload dở")
+    } else if succeeded == 0 {
+        format!("Không huỷ được upload nào ({failures} lỗi)")
+    } else {
+        format!("Đã huỷ {succeeded}/{total} upload dở, {failures} lỗi")
+    }
+}
+
 /// Whether the visible range is close enough to the end to justify fetching the
 /// next page. Pure so the paging rule can be tested without a client.
 fn should_prefetch(
@@ -1714,6 +1957,9 @@ mod tests {
             error: None,
             transfers: TransferEngine::in_memory().expect("in-memory queue"),
             drawer_open: false,
+
+            orphans: Vec::new(),
+            orphans_open: false,
             ticking: false,
             connect_task: None,
             listing_task: None,
@@ -1839,5 +2085,17 @@ mod tests {
         assert!(!should_prefetch(&(940..1000), rows, true, true));
         // A short listing that fits on screen still must not fetch when done.
         assert!(!should_prefetch(&(0..5), 5, false, false));
+    }
+
+    #[test]
+    fn abort_summary_reports_partial_failures_honestly() {
+        assert_eq!(abort_summary(3, 0), "Đã huỷ 3 upload dở");
+        // The success count is what landed, not the total.
+        assert_eq!(abort_summary(3, 1), "Đã huỷ 2/3 upload dở, 1 lỗi");
+        // Claiming a partial win when nothing worked would be a lie.
+        assert_eq!(abort_summary(3, 3), "Không huỷ được upload nào (3 lỗi)");
+        // A task that died before reporting must not underflow.
+        assert_eq!(abort_summary(0, 0), "Đã huỷ 0 upload dở");
+        assert_eq!(abort_summary(1, 5), "Không huỷ được upload nào (5 lỗi)");
     }
 }
