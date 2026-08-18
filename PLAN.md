@@ -139,8 +139,15 @@ let cfg = aws_sdk_s3::config::Builder::from(&sdk_config)
 2. `ExternalPaths` **không dựng được từ crate ngoài** ở 0.2.2 (field `pub(crate)`) → test drop chỉ gửi payload rỗng; muốn test payload thật phải dùng git rev.
 3. **Metal Toolchain (688 MB) là dependency ẩn** của GPUI — `xcodebuild -downloadComponent MetalToolchain`, phải đưa vào hướng dẫn onboarding.
 
-### M1 — Browse (2–3 tuần)
-Profile manager + Keychain + import `~/.aws`; sidebar buckets; list object ảo hóa nạp trang dần (continuation token, hủy khi đổi thư mục); breadcrumb, sort, filter; tạo/xóa bucket, folder; context menu; light/dark theme.
+### M1 — Browse ✅ **XONG (18/08/2026)**
+
+Profile manager + credential store OS + import `~/.aws`; sidebar profile/bucket; list ảo hóa **phân trang tự động khi cuộn**; breadcrumb bấm từng cấp; sort theo tên/kích thước/ngày; filter; tạo folder + bucket; xoá nhiều mục (đệ quy, batch 1000); light/dark theo hệ thống. 28 test pass.
+
+**Cross-platform** (theo yêu cầu bổ sung): mọi khác biệt macOS/Windows/Linux gom vào `platform.rs` — nền cửa sổ (blur / Acrylic / solid vì Linux chỉ KDE có blur), traffic lights, font stack, phím `⌘`/`Ctrl`, credential store, thư mục config. Theme chỉ đổi **nền cửa sổ** giữa glass và solid; mọi panel là lớp alpha nên đúng ở cả hai chế độ.
+
+**Còn nợ kỹ thuật, làm ở M2:** dùng `gpui-component 0.5.1` (đã kiểm chứng build được với gpui 0.2.2) để thay ô nhập tự chế bằng `Input`, thêm context menu chuột phải và dialog xác nhận. Lưu ý khi tích hợp: icon cần `AssetSource` với file SVG Lucide đặt tại `icons/<tên>.svg`, và `Root` phải tự render 3 layer dialog/sheet/notification.
+
+**Ba API thiếu ở gpui 0.2.2 đã phải tự xử lý:** không có ô text input (dùng cơ chế bắt phím chung cho filter + đặt tên), không có `on_double_click` (dùng `ClickEvent.click_count`), không có accessor "visible range" công khai trên `UniformListScrollHandle` (dùng chính range mà `uniform_list` truyền vào callback).
 
 ### M2 — Transfers (3–4 tuần)
 Drag-drop upload (đệ quy thư mục) + overlay; download; transfer drawer với queue persist qua SQLite (pause/resume/cancel/retry, tốc độ, throttle); multipart engine đầy đủ như §4; xử lý 503/retry; dọn multipart mồ côi.

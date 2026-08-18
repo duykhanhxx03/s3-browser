@@ -5679,6 +5679,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "s3core",
+ "vault",
 ]
 
 [[package]]

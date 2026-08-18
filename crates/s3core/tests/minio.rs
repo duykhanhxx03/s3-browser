@@ -137,3 +137,45 @@ async fn lists_inside_a_prefix() {
     // Names are shown relative to the prefix, not as full keys.
     assert!(page.entries.iter().any(|e| e.name == "file-1.txt"));
 }
+
+/// The 1000-key page cap is the reason the UI pages at all; this proves the
+/// continuation token actually walks a prefix larger than one page.
+#[tokio::test]
+async fn pages_through_a_prefix_larger_than_one_page() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+
+    let first = client
+        .list_page("demo-bucket", "many/", None)
+        .await
+        .expect("first page");
+    if first.entries.is_empty() {
+        eprintln!("skipping: run scripts/minio-dev.sh reset --large to seed many/");
+        return;
+    }
+
+    assert_eq!(first.entries.len(), 1000, "S3 caps a page at 1000 keys");
+    let token = first
+        .continuation
+        .clone()
+        .expect("a truncated listing must carry a continuation token");
+
+    let second = client
+        .list_page("demo-bucket", "many/", Some(token))
+        .await
+        .expect("second page");
+    assert_eq!(second.entries.len(), 200);
+    assert!(
+        second.continuation.is_none(),
+        "the last page must not ask for more"
+    );
+
+    // Pages must not overlap, or the UI would show duplicates while scrolling.
+    let first_keys: std::collections::HashSet<_> =
+        first.entries.iter().map(|e| e.key.clone()).collect();
+    assert!(
+        second.entries.iter().all(|e| !first_keys.contains(&e.key)),
+        "pages overlapped"
+    );
+}

@@ -41,11 +41,29 @@ seed() {
     echo "hello from s3browser" | mc pipe local/demo-bucket/readme.txt >/dev/null
     head -c 3000000 /dev/urandom | mc pipe local/demo-bucket/blob.bin >/dev/null
   ' >/dev/null
+
+  if [ "${LARGE:-0}" = "1" ]; then
+    # 1200 keys, so listings cross the 1000-key page boundary and exercise paging.
+    docker run --rm --network "$NETWORK" --entrypoint sh minio/mc -c '
+      mc alias set local http://s3browser-minio:9000 minioadmin minioadmin >/dev/null
+      mkdir -p /tmp/many && cd /tmp/many
+      for i in $(seq 1 1200); do printf "obj %04d" $i > file-$(printf "%04d" $i).txt; done
+      mc cp --recursive /tmp/many/ local/demo-bucket/many/ >/dev/null 2>&1
+    ' >/dev/null
+    echo "seeded demo-bucket/many/ with 1200 objects"
+  fi
 }
+
+# `--large` also seeds a 1200-key prefix for the paging tests.
+LARGE=0
+for arg in "$@"; do
+  [ "$arg" = "--large" ] && LARGE=1
+done
+export LARGE
 
 case "${1:-start}" in
   start) start ;;
   stop) docker rm -f "$CONTAINER" >/dev/null 2>&1 && echo "stopped" ;;
   reset) docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; start ;;
-  *) echo "usage: $0 [start|stop|reset]" >&2; exit 1 ;;
+  *) echo "usage: $0 [start|stop|reset] [--large]" >&2; exit 1 ;;
 esac
