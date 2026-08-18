@@ -12,8 +12,10 @@ path = "src/main.rs"
 gpui.workspace = true
 gpui_tokio.workspace = true
 s3core.workspace = true
+transfer.workspace = true
 vault.workspace = true
 anyhow.workspace = true
+dirs = "6"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

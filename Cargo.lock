@@ -5719,12 +5719,14 @@ name = "s3browser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs 6.0.0",
  "gpui",
  "gpui_tokio",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "s3core",
+ "transfer",
  "vault",
 ]
 

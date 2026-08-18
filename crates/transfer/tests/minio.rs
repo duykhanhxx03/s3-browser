@@ -17,6 +17,7 @@ async fn client_or_skip() -> Option<S3Client> {
         eprintln!("skipping: MinIO not reachable on 127.0.0.1:9000");
         return None;
     }
+    // These tests bring their own bucket, so an empty MinIO is fine.
     // Ignore "already owned by you".
     client.create_bucket(BUCKET).await.ok();
     Some(client)

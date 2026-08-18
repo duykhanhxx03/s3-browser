@@ -10,17 +10,33 @@
 
 use s3core::{Profile, S3Client};
 
+/// Returns a client only when MinIO is reachable *and* seeded. Three outcomes
+/// have to stay distinguishable: no server (skip), server without the fixture
+/// data (skip, with the command to fix it), and a real assertion failure.
 async fn client_or_skip() -> Option<S3Client> {
-    match S3Client::connect(&Profile::minio_local()).await {
-        Ok(client) => match client.list_buckets().await {
-            Ok(_) => Some(client),
-            Err(_) => {
-                eprintln!("skipping: MinIO not reachable on 127.0.0.1:9000");
-                None
-            }
-        },
-        Err(_) => None,
+    let client = match S3Client::connect(&Profile::minio_local()).await {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("skipping: cannot build client: {error}");
+            return None;
+        }
+    };
+
+    let buckets = match client.list_buckets().await {
+        Ok(buckets) => buckets,
+        Err(_) => {
+            eprintln!("skipping: MinIO not reachable on 127.0.0.1:9000");
+            return None;
+        }
+    };
+
+    if !buckets.iter().any(|bucket| bucket == "demo-bucket") {
+        eprintln!(
+            "skipping: MinIO has no fixture data; run scripts/minio-dev.sh reset --large"
+        );
+        return None;
     }
+    Some(client)
 }
 
 #[tokio::test]
@@ -32,6 +48,10 @@ async fn lists_buckets() {
     assert!(
         buckets.iter().any(|b| b == "demo-bucket"),
         "expected demo-bucket in {buckets:?}"
+    );
+    assert!(
+        buckets.iter().any(|b| b == "photos-2026"),
+        "the fixture seeds a second bucket too: {buckets:?}"
     );
 }
 

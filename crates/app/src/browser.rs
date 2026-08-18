@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, uniform_list, ClickEvent, Context, ExternalPaths, FocusHandle, KeyDownEvent,
@@ -11,6 +12,7 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use s3core::{format_size, format_timestamp, sort_entries, Entry, Profile, S3Client, Sort, SortKey};
+use transfer::{Job, JobState, TransferEngine};
 use vault::{ImportedProfile, ProfileStore, StoredProfile};
 
 use crate::platform::{self, Chrome};
@@ -84,11 +86,21 @@ pub struct Browser {
     selection: HashSet<String>,
 
     scroll: UniformListScrollHandle,
-    dropped: Vec<PathBuf>,
     status: SharedString,
     error: Option<SharedString>,
 
-    tasks: Vec<Task<()>>,
+    transfers: TransferEngine,
+    drawer_open: bool,
+    /// True while a repaint loop is running to animate transfer progress.
+    ticking: bool,
+
+    /// Named slots rather than a growing vec: replacing the listing task cancels
+    /// the request it superseded, and nothing accumulates for the session.
+    connect_task: Option<Task<()>>,
+    listing_task: Option<Task<()>>,
+    paging_task: Option<Task<()>>,
+    op_task: Option<Task<()>>,
+    tick_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
 }
 
@@ -113,6 +125,15 @@ impl Browser {
             .and_then(|store| store.load().ok())
             .unwrap_or_default();
 
+        // The queue lives next to the profiles so unfinished transfers come back
+        // after a restart.
+        let transfers = store
+            .as_ref()
+            .and_then(|store| store.path().parent().map(|dir| dir.join("transfers.db")))
+            .and_then(|path| TransferEngine::open(&path).ok())
+            .or_else(|| TransferEngine::in_memory().ok())
+            .expect("an in-memory queue always opens");
+
         let mut this = Self {
             focus: cx.focus_handle(),
             theme,
@@ -136,10 +157,16 @@ impl Browser {
             prompt_text: String::new(),
             selection: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
-            dropped: Vec::new(),
             status: "Chọn một profile để bắt đầu".into(),
             error: None,
-            tasks: Vec::new(),
+            transfers,
+            drawer_open: false,
+            ticking: false,
+            connect_task: None,
+            listing_task: None,
+            paging_task: None,
+            op_task: None,
+            tick_task: None,
             _appearance: Some(appearance),
         };
 
@@ -293,7 +320,7 @@ impl Browser {
                 cx.notify();
             });
         });
-        self.tasks.push(task);
+        self.connect_task = Some(task);
         cx.notify();
     }
 
@@ -353,7 +380,7 @@ impl Browser {
                 cx.notify();
             });
         });
-        self.tasks.push(task);
+        self.listing_task = Some(task);
         cx.notify();
     }
 
@@ -400,7 +427,7 @@ impl Browser {
                 cx.notify();
             });
         });
-        self.tasks.push(task);
+        self.paging_task = Some(task);
     }
 
     fn listing_summary(&self) -> SharedString {
@@ -496,7 +523,7 @@ impl Browser {
                 cx.notify();
             });
         });
-        self.tasks.push(task);
+        self.op_task = Some(task);
     }
 
     fn create_bucket(&mut self, name: String, cx: &mut Context<Self>) {
@@ -523,7 +550,7 @@ impl Browser {
                 cx.notify();
             });
         });
-        self.tasks.push(task);
+        self.op_task = Some(task);
     }
 
     fn delete_selection(&mut self, cx: &mut Context<Self>) {
@@ -573,8 +600,131 @@ impl Browser {
                 cx.notify();
             });
         });
-        self.tasks.push(task);
+        self.op_task = Some(task);
         cx.notify();
+    }
+
+    // -------------------------------------------------------------- transfers
+
+    /// Queues everything dropped from the file manager into the open prefix.
+    fn start_uploads(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            self.report("Chưa mở bucket nào để tải lên".into());
+            return;
+        };
+
+        let engine = self.transfers.clone();
+        let prefix = self.prefix.clone();
+        let count = paths.len();
+        self.drawer_open = true;
+        self.status = format!("Đang xếp {count} mục vào hàng đợi…").into();
+
+        let queueing = Tokio::spawn(cx, async move {
+            engine
+                .enqueue_uploads(client, &bucket, &prefix, &paths)
+                .await
+        });
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = queueing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(ids)) => {
+                        debug_log!("queued {} uploads", ids.len());
+                        this.status = format!("Đã xếp {} tệp vào hàng đợi", ids.len()).into();
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                this.start_ticking(cx);
+                cx.notify();
+            });
+        });
+        self.op_task = Some(task);
+        cx.notify();
+    }
+
+    /// Downloads the selected objects into the platform's Downloads folder.
+    fn download_selection(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let keys: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_folder && self.selection.contains(&entry.key))
+            .map(|entry| entry.key.clone())
+            .collect();
+        if keys.is_empty() {
+            self.report("Chọn tệp để tải xuống (thư mục chưa hỗ trợ)".into());
+            return;
+        }
+
+        let Some(destination) = dirs::download_dir().or_else(dirs::home_dir) else {
+            self.report("Không tìm được thư mục Downloads".into());
+            return;
+        };
+
+        let engine = self.transfers.clone();
+        self.drawer_open = true;
+
+        let queueing = Tokio::spawn(cx, async move {
+            let mut ids = Vec::new();
+            for key in keys {
+                ids.push(
+                    engine
+                        .enqueue_download(client.clone(), &bucket, &key, &destination)
+                        .await?,
+                );
+            }
+            anyhow::Ok(ids)
+        });
+
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = queueing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(ids)) => {
+                        this.status = format!("Đang tải xuống {} tệp", ids.len()).into()
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                this.start_ticking(cx);
+                cx.notify();
+            });
+        });
+        self.op_task = Some(task);
+        cx.notify();
+    }
+
+    /// Repaints while transfers move, so progress bars animate. The loop stops
+    /// itself once the queue goes quiet rather than burning a timer forever.
+    fn start_ticking(&mut self, cx: &mut Context<Self>) {
+        if self.ticking {
+            return;
+        }
+        self.ticking = true;
+
+        let executor = cx.background_executor().clone();
+        self.tick_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(Duration::from_millis(250)).await;
+                let still_working = this.update(cx, |this, cx| {
+                    cx.notify();
+                    this.transfers.has_active_work()
+                });
+                match still_working {
+                    Ok(true) => continue,
+                    // Entity gone, or the queue is idle.
+                    _ => break,
+                }
+            }
+            _ = this.update(cx, |this, cx| {
+                this.ticking = false;
+                cx.notify();
+            });
+        }));
     }
 
     // ------------------------------------------------------------------ input
@@ -633,6 +783,12 @@ impl Browser {
                     if let (Some(bucket), prefix) = (self.bucket.clone(), self.prefix.clone()) {
                         self.open(bucket, prefix, cx);
                     }
+                    return;
+                }
+                "d" => return self.download_selection(cx),
+                "j" => {
+                    self.drawer_open = !self.drawer_open;
+                    cx.notify();
                     return;
                 }
                 "backspace" | "delete" => return self.delete_selection(cx),
@@ -857,6 +1013,11 @@ impl Browser {
             .when(!self.selection.is_empty(), |this| {
                 let count = self.selection.len();
                 this.child(
+                    action_button("download", "Tải xuống", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.download_selection(cx),
+                    )),
+                )
+                .child(
                     danger_button("delete", SharedString::from(format!("Xoá {count}")), theme)
                         .on_click(cx.listener(|this, _event, _window, cx| {
                             this.delete_selection(cx)
@@ -969,12 +1130,25 @@ impl Browser {
         }
     }
 
-    fn render_status(&self) -> impl IntoElement {
+    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let dropped = match self.dropped.len() {
-            0 => String::new(),
-            1 => format!("Đã thả: {}", self.dropped[0].display()),
-            n => format!("Đã thả {n} mục"),
+        let stats = self.transfers.stats();
+        let queue_label = if stats.active + stats.queued > 0 {
+            let speed = if stats.bytes_per_second > 0 {
+                format!(" · {}/s", format_size(stats.bytes_per_second as i64))
+            } else {
+                String::new()
+            };
+            format!(
+                "{} đang chạy, {} chờ{speed}",
+                stats.active, stats.queued
+            )
+        } else if stats.failed > 0 {
+            format!("{} lỗi", stats.failed)
+        } else if stats.done > 0 {
+            format!("{} xong", stats.done)
+        } else {
+            String::new()
         };
 
         div()
@@ -996,20 +1170,207 @@ impl Browser {
                 div()
                     .text_color(theme.text_faint)
                     .child(SharedString::from(format!(
-                        "{m}F lọc · {m}N thư mục · {m}⌫ xoá",
+                        "{m}F lọc · {m}N thư mục · {m}D tải xuống · {m}J hàng đợi",
                         m = platform::primary_modifier()
                     ))),
             )
             .when(self.loading || self.loading_more, |this| {
                 this.child(div().text_color(theme.accent).child("đang tải…"))
             })
-            .when(!dropped.is_empty(), |this| {
+            .when(!queue_label.is_empty(), |this| {
+                let open = self.drawer_open;
                 this.child(
                     div()
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(dropped)),
+                        .id("queue-toggle")
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(if open { theme.selected } else { theme.hover })
+                        .text_color(theme.text)
+                        .hover(|this| this.bg(theme.selected))
+                        .child(SharedString::from(format!(
+                            "{} {queue_label}",
+                            if open { "▾" } else { "▴" }
+                        )))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.drawer_open = !this.drawer_open;
+                            cx.notify();
+                        })),
                 )
             })
+    }
+
+    /// The transfer queue. Collapsed by default; the status bar toggles it.
+    fn render_drawer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.drawer_open {
+            return None;
+        }
+        let theme = self.theme;
+        let jobs = self.transfers.snapshot();
+
+        Some(
+            div()
+                .h(px(168.))
+                .flex()
+                .flex_col()
+                .bg(theme.panel)
+                .border_t_1()
+                .border_color(theme.border_strong)
+                .child(
+                    div()
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!("HÀNG ĐỢI · {}", jobs.len())))
+                        .child(div().flex_1())
+                        .child(
+                            action_button("clear-finished", "Xoá mục đã xong", theme).on_click(
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.transfers.clear_finished();
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                )
+                .child(if jobs.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child("Kéo tệp vào danh sách để tải lên")
+                        .into_any_element()
+                } else {
+                    uniform_list(
+                        "transfers",
+                        jobs.len(),
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            let jobs = this.transfers.snapshot();
+                            range
+                                .filter_map(|ix| jobs.get(ix).cloned())
+                                .map(|job| this.render_job(job, cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .flex_1()
+                    .into_any_element()
+                }),
+        )
+    }
+
+    fn render_job(&self, job: Job, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let id = job.id;
+        let fraction = job.fraction();
+        let arrow = match job.direction {
+            transfer::Direction::Upload => "↑",
+            transfer::Direction::Download => "↓",
+        };
+        let (state_label, state_color) = match job.state {
+            JobState::Queued => ("chờ", theme.text_faint),
+            JobState::Running => ("đang chạy", theme.accent),
+            JobState::Paused => ("tạm dừng", theme.text_muted),
+            JobState::Done => ("xong", theme.text_muted),
+            JobState::Failed => ("lỗi", theme.danger),
+            JobState::Canceled => ("đã huỷ", theme.text_faint),
+        };
+
+        div()
+            .id(("job", id as usize))
+            .h(px(38.))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .child(div().w(px(14.)).text_color(theme.text_faint).child(arrow))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(job.display_name())),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(format!(
+                                        "{} / {}",
+                                        format_size(job.transferred as i64),
+                                        format_size(job.size as i64)
+                                    ))),
+                            ),
+                    )
+                    // Progress bar: an outer track with an inner fill sized by
+                    // the completed fraction.
+                    .child(
+                        div()
+                            .h(px(4.))
+                            .w_full()
+                            .rounded_sm()
+                            .bg(theme.hover)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fraction))
+                                    .rounded_sm()
+                                    .bg(if job.state == JobState::Failed {
+                                        theme.danger
+                                    } else {
+                                        theme.accent
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(64.))
+                    .text_color(state_color)
+                    .child(state_label),
+            )
+            .child(match job.state {
+                JobState::Running | JobState::Queued => action_button("pause", "Tạm dừng", theme)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.transfers.pause(id);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                JobState::Paused | JobState::Failed => action_button("resume", "Tiếp tục", theme)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if let Some(client) = this.client.clone() {
+                            this.transfers.resume(id, client);
+                            this.start_ticking(cx);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                _ => div().into_any_element(),
+            })
+            .child(
+                icon_button("remove", "✕", theme).on_click(cx.listener(
+                    move |this, _event, _window, cx| {
+                        this.transfers.remove_job(id);
+                        cx.notify();
+                    },
+                )),
+            )
     }
 
     fn render_prompt(&self) -> Option<impl IntoElement> {
@@ -1085,20 +1446,15 @@ impl Render for Browser {
                             })
                             .on_drop::<ExternalPaths>(cx.listener(
                                 |this, paths: &ExternalPaths, _window, cx| {
-                                    this.dropped.extend(paths.paths().iter().cloned());
-                                    this.status = format!(
-                                        "Nhận {} đường dẫn từ Finder — hàng đợi tải lên là M2",
-                                        paths.paths().len()
-                                    )
-                                    .into();
-                                    cx.notify();
+                                    this.start_uploads(paths.paths().to_vec(), cx);
                                 },
                             ))
                             .child(self.render_columns(cx))
                             .child(self.render_rows(cx)),
                     ),
             )
-            .child(self.render_status())
+            .children(self.render_drawer(cx))
+            .child(self.render_status(cx))
     }
 }
 
@@ -1354,10 +1710,16 @@ mod tests {
             prompt_text: String::new(),
             selection: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
-            dropped: Vec::new(),
             status: "test".into(),
             error: None,
-            tasks: Vec::new(),
+            transfers: TransferEngine::in_memory().expect("in-memory queue"),
+            drawer_open: false,
+            ticking: false,
+            connect_task: None,
+            listing_task: None,
+            paging_task: None,
+            op_task: None,
+            tick_task: None,
             _appearance: None,
         };
         browser.resort_and_filter();
