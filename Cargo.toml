@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/s3core", "crates/gpui_tokio"]
+members = ["crates/app", "crates/s3core", "crates/vault", "crates/gpui_tokio"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ license = "Apache-2.0"
 gpui = "0.2.2"
 gpui_tokio = { path = "crates/gpui_tokio" }
 s3core = { path = "crates/s3core" }
+vault = { path = "crates/vault" }
 
 anyhow = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }

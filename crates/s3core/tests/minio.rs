@@ -77,6 +77,50 @@ async fn lists_root_as_folders_and_files() {
     assert_eq!(blob.size, 3_000_000);
 }
 
+/// Exercises the write path end to end on a scratch bucket: create, add a
+/// folder, delete the folder recursively, then remove the bucket.
+#[tokio::test]
+async fn creates_and_deletes_buckets_and_folders() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = format!("scratch-{}", std::process::id());
+
+    client.create_bucket(&bucket).await.expect("CreateBucket");
+    assert!(client.list_buckets().await.unwrap().contains(&bucket));
+
+    let key = client
+        .create_folder(&bucket, "", "uploads")
+        .await
+        .expect("create_folder");
+    assert_eq!(key, "uploads/", "folders are zero-byte `prefix/` objects");
+
+    // Nested content, so the delete has to expand the prefix rather than just
+    // removing the placeholder.
+    client
+        .create_folder(&bucket, "uploads/", "2026")
+        .await
+        .expect("nested folder");
+
+    let page = client.list_page(&bucket, "", None).await.expect("list");
+    let folders: Vec<_> = page.entries.iter().filter(|e| e.is_folder).collect();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].name, "uploads");
+
+    let report = client
+        .delete_entries(&bucket, &page.entries)
+        .await
+        .expect("delete_entries");
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert!(report.deleted >= 2, "deleted {} keys", report.deleted);
+
+    let after = client.list_page(&bucket, "", None).await.expect("list");
+    assert!(after.entries.is_empty(), "left over: {:?}", after.entries);
+
+    client.delete_bucket(&bucket).await.expect("DeleteBucket");
+    assert!(!client.list_buckets().await.unwrap().contains(&bucket));
+}
+
 #[tokio::test]
 async fn lists_inside_a_prefix() {
     let Some(client) = client_or_skip().await else {
