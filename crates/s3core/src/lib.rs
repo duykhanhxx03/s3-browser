@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use aws_sdk_s3::types::{CompletedMultipartUpload, Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
 
 /// S3 refuses more than this many keys in one DeleteObjects call.
@@ -123,6 +123,31 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
             }
         })
     });
+}
+
+/// What `HeadObject` tells us before a download starts.
+#[derive(Clone, Debug)]
+pub struct ObjectHead {
+    pub size: i64,
+    pub etag: Option<String>,
+}
+
+/// One finished part of a multipart upload. Persisted so a resumed upload can
+/// complete without re-sending what the server already has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedPart {
+    pub part_number: i32,
+    pub etag: String,
+    pub size: u64,
+}
+
+/// A multipart upload left behind by a crash or a cancel. S3 keeps billing for
+/// its parts until it is aborted.
+#[derive(Clone, Debug)]
+pub struct OrphanedUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_epoch: Option<i64>,
 }
 
 /// Result of a batch delete, so the UI can report partial failures honestly
@@ -333,6 +358,238 @@ impl S3Client {
             }
         }
         Ok(report)
+    }
+
+    // ------------------------------------------------------------- transfers
+
+    /// Size and ETag, used to size a download and to detect that an object
+    /// changed underneath a resumed transfer.
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectHead> {
+        let out = self
+            .inner
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("HeadObject failed for s3://{bucket}/{key}"))?;
+
+        Ok(ObjectHead {
+            size: out.content_length().unwrap_or(0),
+            etag: out.e_tag().map(str::to_owned),
+        })
+    }
+
+    /// Single-request upload, for objects below the multipart threshold.
+    pub async fn put_object(&self, bucket: &str, key: &str, body: Vec<u8>) -> Result<()> {
+        self.inner
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body.into())
+            .send()
+            .await
+            .with_context(|| format!("PutObject failed for s3://{bucket}/{key}"))?;
+        Ok(())
+    }
+
+    /// Reads a byte range. `If-Match` makes the server reject the read if the
+    /// object changed since the transfer started, so a resumed download can
+    /// never silently stitch together two different versions.
+    pub async fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: std::ops::Range<u64>,
+        if_match: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut req = self
+            .inner
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            // HTTP ranges are inclusive at both ends.
+            .range(format!("bytes={}-{}", range.start, range.end.saturating_sub(1)));
+
+        if let Some(etag) = if_match {
+            req = req.if_match(etag);
+        }
+
+        let out = req
+            .send()
+            .await
+            .with_context(|| format!("GetObject range failed for s3://{bucket}/{key}"))?;
+
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading body of s3://{bucket}/{key}"))?;
+        Ok(bytes.into_bytes().to_vec())
+    }
+
+    pub async fn create_multipart_upload(&self, bucket: &str, key: &str) -> Result<String> {
+        let out = self
+            .inner
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("CreateMultipartUpload failed for s3://{bucket}/{key}"))?;
+
+        out.upload_id()
+            .map(str::to_owned)
+            .context("CreateMultipartUpload returned no upload id")
+    }
+
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: Vec<u8>,
+    ) -> Result<String> {
+        let out = self
+            .inner
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(body.into())
+            .send()
+            .await
+            .with_context(|| format!("UploadPart {part_number} failed for s3://{bucket}/{key}"))?;
+
+        out.e_tag()
+            .map(str::to_owned)
+            .context("UploadPart returned no ETag")
+    }
+
+    /// Parts must be listed in ascending part-number order or S3 rejects the call.
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        mut parts: Vec<CompletedPart>,
+    ) -> Result<()> {
+        parts.sort_by_key(|part| part.part_number);
+
+        let mut completed = CompletedMultipartUpload::builder();
+        for part in parts {
+            completed = completed.parts(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .part_number(part.part_number)
+                    .e_tag(part.etag)
+                    .build(),
+            );
+        }
+
+        self.inner
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completed.build())
+            .send()
+            .await
+            .with_context(|| format!("CompleteMultipartUpload failed for s3://{bucket}/{key}"))?;
+        Ok(())
+    }
+
+    /// Releases the storage S3 is already billing for an abandoned upload.
+    pub async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<()> {
+        self.inner
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .with_context(|| format!("AbortMultipartUpload failed for s3://{bucket}/{key}"))?;
+        Ok(())
+    }
+
+    /// Which parts the server already holds, so a resumed upload re-sends only
+    /// what is missing rather than starting over.
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<CompletedPart>> {
+        let mut parts = Vec::new();
+        let mut marker = None;
+
+        loop {
+            let mut req = self
+                .inner
+                .list_parts()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id);
+            if let Some(marker) = marker {
+                req = req.part_number_marker(marker);
+            }
+
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("ListParts failed for s3://{bucket}/{key}"))?;
+
+            for part in out.parts() {
+                let (Some(number), Some(etag)) = (part.part_number(), part.e_tag()) else {
+                    continue;
+                };
+                parts.push(CompletedPart {
+                    part_number: number,
+                    etag: etag.to_string(),
+                    size: part.size().unwrap_or(0) as u64,
+                });
+            }
+
+            if out.is_truncated().unwrap_or(false) {
+                marker = out.next_part_number_marker().map(str::to_owned);
+                if marker.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(parts)
+    }
+
+    /// Uploads that were started and never finished or aborted. S3 bills for
+    /// their parts indefinitely, and they are invisible in a normal listing.
+    pub async fn list_orphaned_uploads(&self, bucket: &str) -> Result<Vec<OrphanedUpload>> {
+        let out = self
+            .inner
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .send()
+            .await
+            .with_context(|| format!("ListMultipartUploads failed for {bucket}"))?;
+
+        Ok(out
+            .uploads()
+            .iter()
+            .filter_map(|upload| {
+                Some(OrphanedUpload {
+                    key: upload.key()?.to_string(),
+                    upload_id: upload.upload_id()?.to_string(),
+                    initiated_epoch: upload.initiated().map(|t| t.secs()),
+                })
+            })
+            .collect())
     }
 
     /// Every key under `prefix`, paging until exhausted. No delimiter here — we
