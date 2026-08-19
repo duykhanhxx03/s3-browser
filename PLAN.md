@@ -234,3 +234,94 @@ Sau 1.0: sync hai chiều, bucket policy/CORS/lifecycle editor, drag-out, cross-
 4. Spike drop từ Finder + uniform_list 100k hàng.
 5. `docker run minio/minio` + vendor gpui_tokio + list bucket đầu tiên hiển thị lên list.
 6. Review kết quả M0 → chốt stack, bắt đầu M1.
+
+---
+
+## 6. Đối chiếu với yêu cầu thương mại hoá (19/08/2026)
+
+Đối chiếu bảng tính năng trong `s3-browser-commercial-features.md` với những gì
+thực sự đã build. Chỉ đánh ✅ cho thứ đã chạy được, không đánh cho thứ mới có API.
+
+### Đã có
+
+**P0 gần đủ.** Connection (AWS + endpoint tuỳ ý, access/secret/session token,
+import `~/.aws`, path-style/virtual-host) ✅. Browse kiểu Finder, upload
+file/thư mục, drag & drop, rename/move/delete ✅. Transfer engine: multipart,
+song song, pause/resume/retry, resume sau khi restart, queue có tiến trình và
+tốc độ ✅. Keychain ✅. Presigned URL ✅.
+
+**P1 quá nửa.** Filter, preview ảnh/text/json, metadata + tags + storage class +
+Glacier restore, versioning đầy đủ, SSE-S3/KMS, bandwidth throttling, nhận diện
+provider từ endpoint (R2/B2/Wasabi/Spaces/MinIO) ✅.
+
+**P2 một phần.** SSO device flow (chưa kiểm chứng), AssumeRole + MFA ✅.
+
+### M6 — Vá P0 (ưu tiên cao nhất)
+
+Bốn thứ này nằm ở P0 trong tài liệu mà chưa có. Một trong số đó là lỗi im lặng.
+
+1. **Tải xuống bỏ qua thư mục.** `download_selection` lọc `!entry.is_folder`,
+   nên chọn một thư mục rồi bấm tải xuống thì **không có gì xảy ra và không có
+   thông báo nào**. Tài liệu xếp "download folder" ở P0. Đây là lỗi trước, tính
+   năng sau.
+
+2. **Checksum verification.** Chưa có. Tài liệu xếp P0 và đặt nó trong nhóm ba
+   yếu tố cạnh tranh. PLAN §4 đã ghi cách làm đúng: **không** dùng ETag như MD5
+   vì ETag của multipart không phải MD5 — dùng `x-amz-checksum-*` khi provider
+   hỗ trợ. Việc này phụ thuộc capability detection ở M7 vì không phải provider
+   nào cũng có.
+
+3. **ETA.** Queue đang hiện tốc độ nhưng không hiện thời gian còn lại. Chính
+   tài liệu lấy `16m remaining` làm ví dụ UI. Rẻ, và là thứ người dùng nhìn.
+
+4. **Copy/duplicate trong UI.** `copy_object` đã có và đã test (kể cả đường
+   multipart >5 GB), chỉ thiếu lệnh trong giao diện.
+
+### M7 — Capability detection
+
+Tài liệu gọi đây là **kiến trúc lõi chứ không phải checkbox marketing**, và
+phiên vừa rồi chứng minh điều đó: token R2 phạm vi một bucket bị `AccessDenied`
+ở `ListBuckets` và suýt làm app vô dụng. Hiện app đoán quirk từ endpoint
+(`with_provider_defaults`) nhưng không hỏi provider xem nó làm được gì.
+
+Cần dò và cache theo (provider, bucket): versioning, object lock, tagging,
+lifecycle, checksum algorithms, presigned PUT. UI tự tắt thứ không hỗ trợ thay
+vì để người dùng bấm rồi ăn `501 NotImplemented`. Đã có sẵn hai ca thật để
+kiểm: MinIO không có KMS, R2 không cho ListBuckets.
+
+### M8 — Cấu hình bucket
+
+Lifecycle rules, CORS editor, bucket policy editor, public access block. Bốn
+thứ P1 chưa đụng tới. Nhóm này hợp với gói Pro, và là lý do người ta rời AWS
+Console.
+
+### M9 — Local ↔ S3 sync
+
+Tài liệu gọi là killer feature, và mình đồng ý: nó biến sản phẩm từ "một S3
+client nữa" thành công cụ workflow. Hai panel, compare, preview thay đổi trước
+khi chạy, các chế độ upload-only / download-only / mirror hai chiều, exclude
+pattern, bảo vệ khỏi xoá nhầm.
+
+Cảnh báo phạm vi: đây là milestone lớn nhất trong danh sách, lớn hơn cả M2. So
+sánh cây thư mục hai bên đúng cách (mtime, size, checksum, chuẩn hoá Unicode
+NFC/NFD như §4 đã ghi) là phần khó, không phải phần UI.
+
+### M10 — Enterprise
+
+Object Lock / Legal Hold / retention, proxy support, SSE-C, audit log, cấu hình
+tập trung. Làm khi có khách hàng thật yêu cầu, không làm trước.
+
+### Cố tình không làm
+
+- **Mount S3 như ổ đĩa.** Cần FUSE/kernel extension trên macOS, ký riêng, và là
+  một sản phẩm khác chứ không phải một tính năng.
+- **ACL editor.** AWS khuyến nghị tắt ACL từ 2023, bucket mới mặc định đã tắt.
+  Bucket policy ở M8 hữu ích hơn nhiều.
+- **Scheduled sync** cho tới khi M9 chạy ổn định — lên lịch cho một thứ chưa
+  đáng tin là nhân bản lỗi lên.
+
+### Thứ tự đề xuất
+
+M6 trước, vì có một lỗi im lặng và ba thứ P0. M7 tiếp theo vì M6 phụ thuộc nó
+cho checksum. Rồi M9 nếu mục tiêu là khác biệt hoá, hoặc M8 nếu mục tiêu là bán
+được cho người đang dùng AWS Console.
