@@ -8,6 +8,7 @@
 //! Nothing in this crate knows about GPUI. The UI drives it through
 //! [`TransferEngine::snapshot`] and the control methods.
 
+pub mod checksum;
 mod journal;
 mod throttle;
 mod worker;

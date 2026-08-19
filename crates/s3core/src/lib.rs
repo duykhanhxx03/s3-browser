@@ -154,6 +154,12 @@ pub struct ObjectHead {
     pub modified_epoch: Option<i64>,
     /// User metadata (the `x-amz-meta-` headers), without the prefix.
     pub metadata: Vec<(String, String)>,
+    /// Base64 CRC32 as the server computed it, when it reports one at all.
+    ///
+    /// Absent is the normal answer on objects uploaded before checksums existed
+    /// and on providers that do not implement them, so a caller has to treat
+    /// `None` as "cannot verify" rather than as a failure.
+    pub checksum_crc32: Option<String>,
     /// The raw `x-amz-restore` header for an archived object: it says whether a
     /// restore is still running and when the copy expires.
     pub restore: Option<String>,
@@ -492,6 +498,7 @@ impl S3Client {
                     pairs
                 })
                 .unwrap_or_default(),
+            checksum_crc32: out.checksum_crc32().map(str::to_owned),
             restore: out.restore().map(str::to_owned),
         })
     }

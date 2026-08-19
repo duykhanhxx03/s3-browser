@@ -7497,6 +7497,7 @@ name = "transfer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "rusqlite",
  "s3core",
  "tempfile",

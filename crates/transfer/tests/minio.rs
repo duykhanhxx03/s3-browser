@@ -338,3 +338,78 @@ async fn orphaned_uploads_are_discoverable_and_abortable() {
         "abort should have removed it"
     );
 }
+
+#[tokio::test]
+async fn download_verifies_the_server_checksum() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("verified.bin");
+    let content = write_file(&file, 64 * 1024);
+
+    let engine = TransferEngine::in_memory().unwrap();
+    let ids = engine
+        .enqueue_uploads(client.clone(), BUCKET, "checksum/", &[file])
+        .await
+        .unwrap();
+    wait_for(
+        &engine,
+        ids[0],
+        |state| matches!(state, JobState::Done | JobState::Failed),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Whether this server reports a checksum at all decides what the test can
+    // prove; say which case ran rather than passing silently either way.
+    let head = client
+        .head_object(BUCKET, "checksum/verified.bin")
+        .await
+        .unwrap();
+    match &head.checksum_crc32 {
+        Some(reported) => {
+            // The server's value must match one computed locally, or the
+            // download check would reject every correct file.
+            std::fs::write(dir.path().join("copy.bin"), &content).unwrap();
+            let local = transfer::checksum::crc32_of_file(&dir.path().join("copy.bin")).unwrap();
+            assert_eq!(&local, reported, "local CRC32 disagrees with the server");
+        }
+        None => eprintln!("server không trả x-amz-checksum-crc32; chỉ kiểm được đường bỏ qua"),
+    }
+
+    // Either way the download must succeed: a reported checksum should match,
+    // and an absent one must not be treated as a failure.
+    let landing = tempfile::tempdir().unwrap();
+    let id = engine
+        .enqueue_download(
+            client.clone(),
+            BUCKET,
+            "checksum/verified.bin",
+            landing.path(),
+        )
+        .await
+        .unwrap();
+    let state = wait_for(
+        &engine,
+        id,
+        |state| matches!(state, JobState::Done | JobState::Failed),
+        Duration::from_secs(60),
+    )
+    .await;
+    let job = engine
+        .snapshot()
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap();
+    assert_eq!(state, JobState::Done, "error: {:?}", job.error);
+    assert_eq!(
+        std::fs::read(landing.path().join("verified.bin")).unwrap(),
+        content
+    );
+
+    client
+        .delete_object(BUCKET, "checksum/verified.bin")
+        .await
+        .unwrap();
+}

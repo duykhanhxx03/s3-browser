@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::checksum;
 use crate::{
     part_size_for, Control, Direction, Job, JobState, TransferEngine, MULTIPART_THRESHOLD,
 };
@@ -246,6 +247,7 @@ async fn download(
         tokio::fs::rename(&temp, &job.local)
             .await
             .with_context(|| format!("renaming into {}", job.local.display()))?;
+        verify_download(client, job).await?;
         return Ok(Outcome::Done);
     }
 
@@ -354,6 +356,7 @@ async fn download(
     tokio::fs::rename(&temp, &job.local)
         .await
         .with_context(|| format!("renaming into {}", job.local.display()))?;
+    verify_download(client, job).await?;
     engine.journal().clear_parts(job.id)?;
     Ok(Outcome::Done)
 }
@@ -369,6 +372,37 @@ async fn write_chunk(path: &Path, offset: u64, bytes: &[u8]) -> Result<()> {
         .await
         .with_context(|| format!("writing {} bytes at {offset}", bytes.len()))?;
     file.flush().await?;
+    Ok(())
+}
+
+/// Checks the downloaded bytes against the server's checksum.
+///
+/// Runs after the rename because a file that fails here is still the file the
+/// user asked for — leaving it in place with a loud error is more useful than
+/// deleting it silently and making them download it again to see the same
+/// failure.
+///
+/// The hashing is blocking work over the whole file, so it goes to a blocking
+/// thread rather than stalling a runtime worker for the length of a large read.
+async fn verify_download(client: &S3Client, job: &Job) -> Result<()> {
+    let head = client.head_object(&job.bucket, &job.key).await?;
+    let Some(expected) = head.checksum_crc32 else {
+        // No checksum from the server: nothing to compare, and that is normal
+        // on older objects and on providers that never implemented them.
+        return Ok(());
+    };
+
+    let path = job.local.clone();
+    let verification = tokio::task::spawn_blocking(move || checksum::verify(&path, Some(&expected)))
+        .await
+        .context("tác vụ kiểm checksum không hoàn tất")??;
+
+    if verification == checksum::Verification::Mismatch {
+        anyhow::bail!(
+            "Checksum không khớp cho {}: tệp tải về khác với bản trên máy chủ",
+            job.key
+        );
+    }
     Ok(())
 }
 

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+crc32fast = "1"
 s3core.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "io-util", "sync", "time", "macros"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
