@@ -10,7 +10,9 @@ use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
-use aws_sdk_s3::types::{CompletedMultipartUpload, Delete, ObjectIdentifier};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, Delete, MetadataDirective, ObjectIdentifier, StorageClass,
+};
 use aws_sdk_s3::Client;
 
 /// S3 refuses more than this many keys in one DeleteObjects call.
@@ -133,6 +135,8 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
 pub struct ObjectHead {
     pub size: i64,
     pub etag: Option<String>,
+    /// `None` means STANDARD; S3 omits the header for it.
+    pub storage_class: Option<String>,
 }
 
 /// One finished part of a multipart upload. Persisted so a resumed upload can
@@ -158,6 +162,15 @@ pub struct OrphanedUpload {
 #[derive(Clone, Debug, Default)]
 pub struct DeleteReport {
     pub deleted: usize,
+    pub errors: Vec<String>,
+}
+
+/// Result of moving a whole prefix. A partial move is a real outcome, not an
+/// error: whatever succeeded stays moved, so the caller has to be able to say
+/// what is now where.
+#[derive(Clone, Debug, Default)]
+pub struct MoveReport {
+    pub moved: usize,
     pub errors: Vec<String>,
 }
 
@@ -393,6 +406,7 @@ impl S3Client {
         Ok(ObjectHead {
             size: out.content_length().unwrap_or(0),
             etag: out.e_tag().map(str::to_owned),
+            storage_class: out.storage_class().map(|class| class.as_str().to_owned()),
         })
     }
 
@@ -608,6 +622,252 @@ impl S3Client {
             .collect())
     }
 
+    /// Server-side copy. Picks the strategy by size, because CopyObject refuses
+    /// anything over 5 GiB and the caller should not have to know that.
+    ///
+    /// Storage class is carried over explicitly: a plain CopyObject lands the
+    /// destination in STANDARD regardless of the source, which would silently
+    /// move a Glacier object into a far more expensive tier.
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<()> {
+        let head = self.head_object(src_bucket, src_key).await?;
+        let size = head.size.max(0) as u64;
+
+        if size > COPY_OBJECT_LIMIT {
+            let part_size = copy_part_size_for(size);
+            self.copy_multipart(src_bucket, src_key, dst_bucket, dst_key, size, part_size, &head)
+                .await
+        } else {
+            self.copy_single(src_bucket, src_key, dst_bucket, dst_key, &head)
+                .await
+        }
+    }
+
+    async fn copy_single(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        head: &ObjectHead,
+    ) -> Result<()> {
+        let mut req = self
+            .inner
+            .copy_object()
+            .bucket(dst_bucket)
+            .key(dst_key)
+            .copy_source(encode_copy_source(src_bucket, src_key))
+            // COPY is the default, but saying so keeps the intent visible next
+            // to the storage-class line, which is *not* copied by default.
+            .metadata_directive(MetadataDirective::Copy);
+
+        if let Some(class) = &head.storage_class {
+            req = req.set_storage_class(Some(StorageClass::from(class.as_str())));
+        }
+
+        req.send().await.with_context(|| {
+            format!("CopyObject failed for s3://{src_bucket}/{src_key} → s3://{dst_bucket}/{dst_key}")
+        })?;
+        Ok(())
+    }
+
+    /// The same server-side copy as `copy_object`, but through UploadPartCopy
+    /// with a part size you choose. `copy_object` reaches for this on its own
+    /// past `COPY_OBJECT_LIMIT`; calling it directly lets a test exercise the
+    /// multipart path without moving five gigabytes.
+    pub async fn copy_object_multipart(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        part_size: u64,
+    ) -> Result<()> {
+        let head = self.head_object(src_bucket, src_key).await?;
+        let size = head.size.max(0) as u64;
+        self.copy_multipart(
+            src_bucket, src_key, dst_bucket, dst_key, size, part_size, &head,
+        )
+        .await
+    }
+
+    /// Copy for objects past the CopyObject ceiling, using UploadPartCopy so the
+    /// bytes still never travel through this machine.
+    ///
+    /// Parts run one at a time. Each is a server-side range copy rather than a
+    /// transfer, so the wall-clock cost is the server's, and doing them serially
+    /// keeps the abort-on-failure path simple.
+    async fn copy_multipart(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        size: u64,
+        part_size: u64,
+        head: &ObjectHead,
+    ) -> Result<()> {
+        let source = encode_copy_source(src_bucket, src_key);
+
+        let mut create = self
+            .inner
+            .create_multipart_upload()
+            .bucket(dst_bucket)
+            .key(dst_key);
+        if let Some(class) = &head.storage_class {
+            create = create.set_storage_class(Some(StorageClass::from(class.as_str())));
+        }
+        let upload_id = create
+            .send()
+            .await
+            .with_context(|| format!("CreateMultipartUpload failed for s3://{dst_bucket}/{dst_key}"))?
+            .upload_id()
+            .map(str::to_owned)
+            .context("CreateMultipartUpload returned no upload id")?;
+
+        match self
+            .copy_parts(&source, dst_bucket, dst_key, &upload_id, size, part_size)
+            .await
+        {
+            Ok(parts) => {
+                self.complete_multipart_upload(dst_bucket, dst_key, &upload_id, parts)
+                    .await
+            }
+            Err(error) => {
+                // Leaving the upload behind would bill the user for parts they
+                // cannot see, so clean up before surfacing the original error.
+                _ = self
+                    .abort_multipart_upload(dst_bucket, dst_key, &upload_id)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn copy_parts(
+        &self,
+        source: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        upload_id: &str,
+        size: u64,
+        part_size: u64,
+    ) -> Result<Vec<CompletedPart>> {
+        let mut parts = Vec::new();
+        let mut offset = 0u64;
+        let mut number = 1i32;
+
+        while offset < size {
+            let end = (offset + part_size).min(size) - 1;
+            let out = self
+                .inner
+                .upload_part_copy()
+                .bucket(dst_bucket)
+                .key(dst_key)
+                .upload_id(upload_id)
+                .part_number(number)
+                .copy_source(source)
+                // Inclusive on both ends, unlike a Rust range.
+                .copy_source_range(format!("bytes={offset}-{end}"))
+                .send()
+                .await
+                .with_context(|| format!("UploadPartCopy part {number} failed for {source}"))?;
+
+            let etag = out
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+                .map(str::to_owned)
+                .with_context(|| format!("UploadPartCopy part {number} returned no ETag"))?;
+
+            parts.push(CompletedPart {
+                part_number: number,
+                etag,
+                size: end - offset + 1,
+            });
+            offset = end + 1;
+            number += 1;
+        }
+        Ok(parts)
+    }
+
+    /// Copy then delete. S3 has no rename, and there is no way to make the pair
+    /// atomic — so the delete only runs once the copy is confirmed, leaving a
+    /// duplicate rather than a hole if the second half fails.
+    pub async fn move_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<()> {
+        if (src_bucket, src_key) == (dst_bucket, dst_key) {
+            return Ok(());
+        }
+        self.copy_object(src_bucket, src_key, dst_bucket, dst_key)
+            .await?;
+        self.delete_object(src_bucket, src_key).await
+    }
+
+    /// Renames a folder, which S3 has no concept of: every key under the prefix
+    /// is copied to the new prefix and then deleted.
+    ///
+    /// There is no atomic version of this. Each key is copied *then* deleted
+    /// before moving to the next, so an interruption leaves every key either at
+    /// the source or at the destination — never neither. A failure does not roll
+    /// back what already moved: undoing a move means deleting objects at the
+    /// destination, and if something else wrote there in the meantime that
+    /// deletes someone else's data. Reporting honestly beats guessing.
+    ///
+    /// `progress` is called with (done, total) so a caller can show a bar.
+    pub async fn move_prefix(
+        &self,
+        bucket: &str,
+        src_prefix: &str,
+        dst_prefix: &str,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<MoveReport> {
+        if src_prefix == dst_prefix {
+            return Ok(MoveReport::default());
+        }
+        // Moving a prefix inside itself would walk keys it is still creating.
+        if dst_prefix.starts_with(src_prefix) {
+            anyhow::bail!("Không thể chuyển {src_prefix} vào trong chính nó ({dst_prefix})");
+        }
+
+        let keys = self.list_keys_recursive(bucket, src_prefix).await?;
+        let total = keys.len();
+        let mut report = MoveReport::default();
+        progress(0, total);
+
+        for (done, key) in keys.iter().enumerate() {
+            let suffix = key.strip_prefix(src_prefix).unwrap_or(key);
+            let target = format!("{dst_prefix}{suffix}");
+
+            match self.move_object(bucket, key, bucket, &target).await {
+                Ok(()) => report.moved += 1,
+                Err(error) => report.errors.push(format!("{key}: {error}")),
+            }
+            progress(done + 1, total);
+        }
+        Ok(report)
+    }
+
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.inner
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("DeleteObject failed for s3://{bucket}/{key}"))?;
+        Ok(())
+    }
+
     /// Every key under `prefix`, paging until exhausted. No delimiter here — we
     /// want the whole subtree flat.
     async fn list_keys_recursive(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
@@ -639,6 +899,46 @@ impl S3Client {
         }
         Ok(keys)
     }
+}
+
+/// CopyObject refuses anything larger; past this a copy has to go through
+/// UploadPartCopy instead.
+pub const COPY_OBJECT_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Part size for a server-side copy. Larger than an upload part because nothing
+/// crosses this machine — the only cost of a big part is a longer retry.
+const COPY_PART_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Keeps a server-side copy under the 10,000-part ceiling. A 5 TB object (S3's
+/// maximum) needs parts bigger than the default to fit.
+fn copy_part_size_for(total: u64) -> u64 {
+    let mut size = COPY_PART_SIZE;
+    while total.div_ceil(size) > 10_000 {
+        size *= 2;
+    }
+    size
+}
+
+/// Builds the `x-amz-copy-source` value. The SDK sends this header as given, so
+/// a key containing a space, `+`, `#` or `?` has to be percent-encoded here or
+/// the server reads a different key than the one meant — silently copying the
+/// wrong object, or failing with a confusing 404.
+///
+/// Slashes stay literal: they separate the bucket from the key and the key's own
+/// path segments.
+fn encode_copy_source(bucket: &str, key: &str) -> String {
+    let mut out = String::with_capacity(bucket.len() + key.len() + 1);
+    out.push_str(bucket);
+    out.push('/');
+    for byte in key.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Human-readable byte size, e.g. `4.2 MB`.
@@ -694,6 +994,53 @@ mod tests {
             modified_epoch: modified,
             storage_class: None,
         }
+    }
+
+    #[test]
+    fn copy_source_percent_encodes_what_would_be_misread() {
+        // Ordinary keys pass through untouched, slashes included.
+        assert_eq!(
+            encode_copy_source("my-bucket", "reports/2026/q1.txt"),
+            "my-bucket/reports/2026/q1.txt"
+        );
+
+        // A space and a `+` are the classic pair: unencoded, the server reads
+        // `+` as a space and copies a key nobody asked for.
+        assert_eq!(
+            encode_copy_source("b", "a file+name.txt"),
+            "b/a%20file%2Bname.txt"
+        );
+
+        // `?` and `#` would otherwise start a query or fragment.
+        assert_eq!(encode_copy_source("b", "who?.txt"), "b/who%3F.txt");
+        assert_eq!(encode_copy_source("b", "no#1.txt"), "b/no%231.txt");
+
+        // Non-ASCII is encoded per UTF-8 byte.
+        assert_eq!(encode_copy_source("b", "é"), "b/%C3%A9");
+
+        // Unreserved characters must NOT be encoded, or the key changes.
+        assert_eq!(encode_copy_source("b", "a-_.~z"), "b/a-_.~z");
+    }
+
+    #[test]
+    fn copy_part_size_grows_to_stay_under_the_part_ceiling() {
+        // Anything that fits in 10,000 default-sized parts keeps the default.
+        assert_eq!(copy_part_size_for(0), COPY_PART_SIZE);
+        assert_eq!(copy_part_size_for(COPY_OBJECT_LIMIT), COPY_PART_SIZE);
+
+        // S3's largest object is 5 TB; it must still produce a legal part count.
+        let five_tb = 5 * 1024 * 1024 * 1024 * 1024;
+        let size = copy_part_size_for(five_tb);
+        assert!(
+            five_tb.div_ceil(size) <= 10_000,
+            "5 TB would need {} parts of {size} bytes",
+            five_tb.div_ceil(size)
+        );
+
+        // Exactly at the boundary, one more byte must push the part size up.
+        let exactly_10k = COPY_PART_SIZE * 10_000;
+        assert_eq!(copy_part_size_for(exactly_10k), COPY_PART_SIZE);
+        assert_eq!(copy_part_size_for(exactly_10k + 1), COPY_PART_SIZE * 2);
     }
 
     #[test]

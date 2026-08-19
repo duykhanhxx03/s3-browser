@@ -45,6 +45,9 @@ pub enum Prompt {
     Filter,
     NewFolder,
     NewBucket,
+    /// Renaming the one selected entry; carries its key so the rename still
+    /// targets the right object if the selection changes while typing.
+    Rename(String),
 }
 
 impl Prompt {
@@ -53,6 +56,7 @@ impl Prompt {
             Prompt::Filter => "Lọc",
             Prompt::NewFolder => "Tên thư mục mới",
             Prompt::NewBucket => "Tên bucket mới",
+            Prompt::Rename(_) => "Tên mới",
         }
     }
 }
@@ -707,6 +711,79 @@ impl Browser {
         cx.notify();
     }
 
+    /// Opens the rename prompt, but only for a single entry: renaming several
+    /// things at once has no sensible meaning with one text field.
+    fn start_rename(&mut self, cx: &mut Context<Self>) {
+        let mut selected = self.selection.iter();
+        let (Some(key), None) = (selected.next(), selected.next()) else {
+            return;
+        };
+        let key = key.clone();
+        self.start_prompt(Prompt::Rename(key), cx);
+    }
+
+    /// Renames one entry. A folder is a prefix, so renaming it moves every key
+    /// underneath; a single object is one copy plus one delete.
+    fn rename_entry(&mut self, key: String, new_name: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let Some(target) = renamed_key(&key, &new_name) else {
+            self.report("Tên mới không hợp lệ".into());
+            return;
+        };
+        if target == key {
+            return;
+        }
+
+        let is_folder = key.ends_with('/');
+        let bucket_name = bucket.to_string();
+        let source = key.clone();
+        let destination = target.clone();
+
+        let renaming = Tokio::spawn(cx, async move {
+            if is_folder {
+                client
+                    .move_prefix(&bucket_name, &source, &destination, |_, _| {})
+                    .await
+                    .map(|report| report.errors)
+            } else {
+                client
+                    .move_object(&bucket_name, &source, &bucket_name, &destination)
+                    .await
+                    .map(|()| Vec::new())
+            }
+        });
+
+        self.status = format!("Đang đổi tên {}…", entry_name_of(&key)).into();
+        let task = cx.spawn(async move |this, cx| {
+            let outcome = renaming.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(errors)) if errors.is_empty() => {
+                        this.status = format!("Đã đổi tên thành {new_name}").into();
+                    }
+                    // A partial move leaves keys on both sides; saying "done"
+                    // would send the user away from the ones still stuck.
+                    Ok(Ok(errors)) => this.report(format!(
+                        "Đổi tên chưa xong: {} mục lỗi. {}",
+                        errors.len(),
+                        errors.first().cloned().unwrap_or_default()
+                    )),
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                this.selection.clear();
+                if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
+                    this.open(bucket, prefix, cx);
+                }
+                cx.notify();
+            });
+        });
+        self.op_task = Some(task);
+        cx.notify();
+    }
+
     /// Looks for multipart uploads left behind by a crash or a cancel. S3 bills
     /// for their parts indefinitely and they never show up in a normal listing,
     /// so this is the only way to find them.
@@ -850,10 +927,11 @@ impl Browser {
     // ------------------------------------------------------------------ input
 
     fn start_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
-        self.prompt_text = if prompt == Prompt::Filter {
-            self.filter.clone()
-        } else {
-            String::new()
+        self.prompt_text = match &prompt {
+            Prompt::Filter => self.filter.clone(),
+            // Start from the existing name so a rename is an edit, not retyping.
+            Prompt::Rename(key) => entry_name_of(key),
+            _ => String::new(),
         };
         self.prompt = Some(prompt);
         cx.notify();
@@ -871,6 +949,9 @@ impl Browser {
             }
             Prompt::NewBucket if !text.trim().is_empty() => {
                 self.create_bucket(text.trim().to_string(), cx)
+            }
+            Prompt::Rename(key) if !text.trim().is_empty() => {
+                self.rename_entry(key, text.trim().to_string(), cx)
             }
             _ => {}
         }
@@ -906,6 +987,7 @@ impl Browser {
                     return;
                 }
                 "d" => return self.download_selection(cx),
+                "enter" => return self.start_rename(cx),
                 "j" => {
                     self.drawer_open = !self.drawer_open;
                     cx.notify();
@@ -1134,6 +1216,13 @@ impl Browser {
                 this.child(
                     action_button("scan-orphans", "Dọn upload dở", theme).on_click(cx.listener(
                         |this, _event, _window, cx| this.scan_orphans(cx),
+                    )),
+                )
+            })
+            .when(self.selection.len() == 1, |this| {
+                this.child(
+                    action_button("rename", "Đổi tên", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.start_rename(cx),
                     )),
                 )
             })
@@ -1865,6 +1954,40 @@ fn next_bandwidth_limit(current: u64) -> u64 {
     }
 }
 
+/// The display name of a key: its last path segment. A folder key ends in `/`,
+/// which is part of the key but not part of its name.
+fn entry_name_of(key: &str) -> String {
+    key.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(key)
+        .to_string()
+}
+
+/// The key an entry gets after renaming its last segment. Returns `None` for a
+/// name that cannot be used — empty, or containing a slash, which would move the
+/// entry somewhere else instead of renaming it.
+///
+/// A folder keeps its trailing slash, because losing it turns a prefix into a
+/// zero-byte object with the folder's name.
+fn renamed_key(key: &str, new_name: &str) -> Option<String> {
+    let name = new_name.trim();
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+
+    let is_folder = key.ends_with('/');
+    let body = key.trim_end_matches('/');
+    let parent = match body.rfind('/') {
+        Some(ix) => &body[..=ix],
+        None => "",
+    };
+    Some(format!(
+        "{parent}{name}{}",
+        if is_folder { "/" } else { "" }
+    ))
+}
+
 /// What to tell the user after a bulk abort. Pure because the partial-failure
 /// arithmetic is the easy thing to get backwards.
 fn abort_summary(total: usize, failures: usize) -> String {
@@ -2139,6 +2262,44 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn entry_name_is_the_last_segment_with_or_without_a_trailing_slash() {
+        assert_eq!(entry_name_of("reports/q1.txt"), "q1.txt");
+        assert_eq!(entry_name_of("reports/2026/"), "2026");
+        assert_eq!(entry_name_of("top.txt"), "top.txt");
+        assert_eq!(entry_name_of("solo/"), "solo");
+    }
+
+    #[test]
+    fn renaming_replaces_the_last_segment_and_keeps_the_parent() {
+        // A file at the root and a file in a folder.
+        assert_eq!(
+            renamed_key("reports/q1.txt", "q2.txt").as_deref(),
+            Some("reports/q2.txt")
+        );
+        assert_eq!(renamed_key("q1.txt", "q2.txt").as_deref(), Some("q2.txt"));
+
+        // A folder must keep its trailing slash — without it the prefix turns
+        // into a zero-byte object and the folder's contents are orphaned.
+        assert_eq!(
+            renamed_key("a/b/old/", "new").as_deref(),
+            Some("a/b/new/")
+        );
+        assert_eq!(renamed_key("old/", "new").as_deref(), Some("new/"));
+
+        // Names that would move the entry elsewhere, or nowhere, are refused.
+        assert_eq!(renamed_key("a/b.txt", ""), None);
+        assert_eq!(renamed_key("a/b.txt", "   "), None);
+        assert_eq!(renamed_key("a/b.txt", "c/d.txt"), None);
+        assert_eq!(renamed_key("a/old/", "x/y"), None);
+
+        // Surrounding whitespace is trimmed rather than becoming part of the key.
+        assert_eq!(
+            renamed_key("a/b.txt", "  c.txt  ").as_deref(),
+            Some("a/c.txt")
+        );
     }
 
     #[test]

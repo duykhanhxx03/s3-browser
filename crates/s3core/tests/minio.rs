@@ -199,3 +199,143 @@ async fn pages_through_a_prefix_larger_than_one_page() {
         "pages overlapped"
     );
 }
+
+#[tokio::test]
+async fn copies_moves_and_preserves_the_key_exactly() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    // A key with the characters that break an unencoded copy source.
+    let src = "copy-tests/a file+name?v=1#x.txt";
+    let body = b"copy me".to_vec();
+    client.put_object(bucket, src, body.clone()).await.unwrap();
+
+    let dst = "copy-tests/copied.txt";
+    client.copy_object(bucket, src, bucket, dst).await.unwrap();
+
+    // Both exist, and the copy has the same bytes.
+    assert_eq!(
+        client.head_object(bucket, dst).await.unwrap().size as usize,
+        body.len()
+    );
+    assert!(client.head_object(bucket, src).await.is_ok());
+
+    // Move: the destination appears and the source is gone.
+    let moved = "copy-tests/moved.txt";
+    client.move_object(bucket, dst, bucket, moved).await.unwrap();
+    assert!(client.head_object(bucket, moved).await.is_ok());
+    assert!(
+        client.head_object(bucket, dst).await.is_err(),
+        "move must delete the source"
+    );
+
+    // Moving onto itself is a no-op, not a copy-then-delete that loses the file.
+    client
+        .move_object(bucket, moved, bucket, moved)
+        .await
+        .unwrap();
+    assert!(
+        client.head_object(bucket, moved).await.is_ok(),
+        "a self-move must not delete the object"
+    );
+
+    for key in [src, moved] {
+        client.delete_object(bucket, key).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn multipart_copy_reproduces_the_bytes() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let src = "copy-tests/large-source.bin";
+
+    // Driving the real >5 GiB path would mean moving 5 GiB, so instead the part
+    // loop is exercised directly with a small part size. That covers the range
+    // arithmetic, which is the part that actually goes wrong.
+    let content: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    client
+        .put_object(bucket, src, content.clone())
+        .await
+        .unwrap();
+
+    let dst = "copy-tests/large-copy.bin";
+    // 5 MiB parts over 12 MiB exercises the range arithmetic — the part that
+    // actually goes wrong — without moving a real 5 GiB object.
+    client
+        .copy_object_multipart(bucket, src, bucket, dst, 5 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    // Read it back and compare byte for byte.
+    let read = client
+        .get_range(bucket, dst, 0..content.len() as u64, None)
+        .await
+        .unwrap();
+    assert_eq!(read, content, "copied bytes differ from the source");
+
+    for key in [src, dst] {
+        client.delete_object(bucket, key).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn moves_a_whole_prefix_keeping_its_structure() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let src = "move-tests/trip/";
+    let dst = "move-tests/journey/";
+
+    for key in ["readme.txt", "day-1/photo.bin", "day-1/notes/a.txt"] {
+        client
+            .put_object(bucket, &format!("{src}{key}"), key.as_bytes().to_vec())
+            .await
+            .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let report = client
+        .move_prefix(bucket, src, dst, |done, total| seen.push((done, total)))
+        .await
+        .unwrap();
+
+    assert_eq!(report.moved, 3);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    // Progress runs from 0 to total, so a bar can start empty and end full.
+    assert_eq!(seen.first(), Some(&(0, 3)));
+    assert_eq!(seen.last(), Some(&(3, 3)));
+
+    // Nesting is preserved and the source is gone.
+    for key in ["readme.txt", "day-1/photo.bin", "day-1/notes/a.txt"] {
+        assert!(
+            client.head_object(bucket, &format!("{dst}{key}")).await.is_ok(),
+            "{key} should have landed under the new prefix"
+        );
+        assert!(
+            client.head_object(bucket, &format!("{src}{key}")).await.is_err(),
+            "{key} should be gone from the old prefix"
+        );
+    }
+
+    for key in ["readme.txt", "day-1/photo.bin", "day-1/notes/a.txt"] {
+        client.delete_object(bucket, &format!("{dst}{key}")).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn refuses_to_move_a_prefix_into_itself() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    // Walking keys the move is still creating would never terminate.
+    let error = client
+        .move_prefix("demo-bucket", "a/", "a/b/", |_, _| {})
+        .await
+        .expect_err("moving a prefix inside itself must be refused");
+    assert!(error.to_string().contains("chính nó"), "{error}");
+}
