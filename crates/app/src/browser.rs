@@ -56,6 +56,9 @@ const INSPECTOR_WIDTH: f32 = 320.;
 /// filter is typed and more rows appear than fit.
 const PALETTE_HEIGHT: f32 = 452.;
 const PROGRESS_HEIGHT: f32 = 4.;
+/// Every button is this tall. Sizing to content let a long label grow taller
+/// than the bar holding it, so buttons in the same row did not match.
+const BUTTON_HEIGHT: f32 = 22.;
 const SIDEBAR_WIDTH: f32 = 214.;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
@@ -2942,11 +2945,12 @@ impl Browser {
                         .child(SharedString::from(format!("HÀNG ĐỢI · {}", jobs.len())))
                         .child(div().flex_1())
                         .child(
-                            action_button("bandwidth", "", theme)
-                                .child(SharedString::from(format!(
-                                    "Băng thông: {}",
-                                    bandwidth_label(self.transfers.bandwidth_limit())
-                                )))
+                            setting_chip(
+                                "bandwidth",
+                                "Băng thông",
+                                bandwidth_label(self.transfers.bandwidth_limit()),
+                                theme,
+                            )
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     let next = next_bandwidth_limit(
                                         this.transfers.bandwidth_limit(),
@@ -2958,11 +2962,12 @@ impl Browser {
                         .when_some(self.client.clone(), |this, client| {
                             let current = client.encryption();
                             this.child(
-                                action_button("encryption", "", theme)
-                                    .child(SharedString::from(format!(
-                                        "Mã hoá: {}",
-                                        encryption_label(&current)
-                                    )))
+                                setting_chip(
+                                    "encryption",
+                                    "Mã hoá",
+                                    encryption_label(&current),
+                                    theme,
+                                )
                                     .on_click(cx.listener(move |this, _event, window, cx| {
                                         match next_encryption(&current) {
                                             // KMS needs a key id, so it asks
@@ -2979,7 +2984,7 @@ impl Browser {
                             )
                         })
                         .child(
-                            action_button("clear-finished", "Xoá mục đã xong", theme).on_click(
+                            action_button("clear-finished", "Xoá đã xong", theme).on_click(
                                 cx.listener(|this, _event, _window, cx| {
                                     this.transfers.clear_finished();
                                     cx.notify();
@@ -4261,8 +4266,10 @@ fn sidebar_row(
 fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .h(px(BUTTON_HEIGHT))
         .px_2()
-        .py_1()
+        .flex()
+        .items_center()
         .rounded_md()
         .text_xs()
         .cursor_pointer()
@@ -4270,6 +4277,30 @@ fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::S
         .text_color(theme.text)
         .hover(|this| this.bg(theme.selected))
         .child(label)
+}
+
+/// A compact toggle showing what it is set to. The label is faint and the value
+/// is not, so the eye lands on the part that changes.
+fn setting_chip(
+    id: &'static str,
+    label: &'static str,
+    value: String,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(BUTTON_HEIGHT))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(theme.hover)
+        .hover(|this| this.bg(theme.selected))
+        .child(div().text_color(theme.text_faint).child(label))
+        .child(div().text_color(theme.text).child(SharedString::from(value)))
 }
 
 /// One `label: value` line in the inspector.
@@ -4344,8 +4375,10 @@ fn action_button_dyn(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .h(px(BUTTON_HEIGHT))
         .px_2()
-        .py_0p5()
+        .flex()
+        .items_center()
         .rounded_md()
         .text_xs()
         .text_color(theme.text)
@@ -4357,7 +4390,10 @@ fn action_button_dyn(
 fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .h(px(BUTTON_HEIGHT))
         .px_2()
+        .flex()
+        .items_center()
         .py_1()
         .rounded_md()
         .text_xs()
@@ -4467,7 +4503,7 @@ const BANDWIDTH_PRESETS: [u64; 4] = [1_000_000, 5_000_000, 20_000_000, 0];
 
 fn bandwidth_label(limit: u64) -> String {
     if limit == 0 {
-        "không giới hạn".into()
+        "∞".into()
     } else {
         format!("{} MB/s", limit / 1_000_000)
     }
@@ -4513,7 +4549,7 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
 
 fn encryption_label(encryption: &Encryption) -> String {
     match encryption {
-        Encryption::BucketDefault => "theo bucket".into(),
+        Encryption::BucketDefault => "bucket".into(),
         Encryption::Aes256 => "SSE-S3".into(),
         // The key id can be a full ARN, which would push everything else off the
         // row; the tail is the part that identifies it to a human.
@@ -5192,7 +5228,7 @@ mod tests {
 
     #[test]
     fn bandwidth_presets_cycle_and_always_return_to_unlimited() {
-        assert_eq!(bandwidth_label(0), "không giới hạn");
+        assert_eq!(bandwidth_label(0), "∞");
         assert_eq!(bandwidth_label(5_000_000), "5 MB/s");
 
         // Starting from unlimited, cycling through every preset comes back.
@@ -5415,7 +5451,7 @@ mod tests {
 
     #[test]
     fn encryption_cycle_asks_before_it_needs_a_key() {
-        assert_eq!(encryption_label(&Encryption::BucketDefault), "theo bucket");
+        assert_eq!(encryption_label(&Encryption::BucketDefault), "bucket");
         assert_eq!(encryption_label(&Encryption::Aes256), "SSE-S3");
 
         // A full ARN would push the rest of the row off screen; the tail is what
