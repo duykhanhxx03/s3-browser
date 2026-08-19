@@ -470,3 +470,133 @@ async fn reads_metadata_and_round_trips_tags() {
 
     client.delete_object(bucket, key).await.unwrap();
 }
+
+#[tokio::test]
+async fn versions_restore_and_delete_individually() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "versioned-bucket";
+    if client.list_page(bucket, "", None).await.is_err() {
+        eprintln!("skipping: no versioned-bucket; run scripts/minio-dev.sh reset");
+        return;
+    }
+    let key = "versions/notes.txt";
+    // A sibling sharing the prefix: ListObjectVersions takes a prefix, not a
+    // key, so this would show up as a phantom version without filtering.
+    let sibling = "versions/notes.txt.bak";
+
+    client.put_object(bucket, key, b"v1".to_vec()).await.unwrap();
+    client.put_object(bucket, key, b"v2".to_vec()).await.unwrap();
+    client
+        .put_object(bucket, sibling, b"unrelated".to_vec())
+        .await
+        .unwrap();
+
+    let versions = client.list_versions(bucket, key).await.unwrap();
+    assert_eq!(versions.len(), 2, "two puts make two versions: {versions:?}");
+    assert!(
+        versions.iter().all(|v| v.key == key),
+        "a sibling key leaked in: {versions:?}"
+    );
+    assert!(versions[0].is_latest, "newest must come first");
+
+    // The current bytes are v2; restoring the older version brings v1 back as a
+    // new latest, without losing v2 from the history.
+    let older = versions
+        .iter()
+        .find(|v| !v.is_latest)
+        .expect("an older version");
+    client
+        .restore_version(bucket, key, &older.version_id)
+        .await
+        .unwrap();
+
+    let current = client.get_range(bucket, key, 0..2, None).await.unwrap();
+    assert_eq!(current, b"v1", "restore should bring the old bytes back");
+    assert_eq!(
+        client.list_versions(bucket, key).await.unwrap().len(),
+        3,
+        "restoring adds a version rather than replacing one"
+    );
+
+    // An ordinary delete in a versioned bucket hides rather than removes.
+    client.delete_object(bucket, key).await.unwrap();
+    let after_delete = client.list_versions(bucket, key).await.unwrap();
+    assert!(
+        after_delete.iter().any(|v| v.is_delete_marker),
+        "deleting should write a delete marker: {after_delete:?}"
+    );
+    assert_eq!(
+        after_delete.iter().filter(|v| !v.is_delete_marker).count(),
+        3,
+        "the data versions must survive a plain delete"
+    );
+
+    // Deleting versions one by one removes data for good.
+    for version in &after_delete {
+        client
+            .delete_version(bucket, key, &version.version_id)
+            .await
+            .unwrap();
+    }
+    assert!(client.list_versions(bucket, key).await.unwrap().is_empty());
+
+    for version in client.list_versions(bucket, sibling).await.unwrap() {
+        client
+            .delete_version(bucket, sibling, &version.version_id)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn emptying_a_versioned_bucket_clears_hidden_versions_too() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    // A bucket of its own: this test destroys everything in it.
+    let bucket = "empty-flow-test";
+    client.create_bucket(bucket).await.ok();
+
+    for i in 0..3 {
+        let key = format!("doc-{i}.txt");
+        client.put_object(bucket, &key, b"a".to_vec()).await.unwrap();
+        // A second put makes a second version if the bucket is versioned, and
+        // simply overwrites if it is not — either way the flow must cope.
+        client.put_object(bucket, &key, b"bb".to_vec()).await.unwrap();
+    }
+    // Delete one the ordinary way: in a versioned bucket that leaves a delete
+    // marker, which is exactly what makes DeleteBucket fail later.
+    client.delete_object(bucket, "doc-0.txt").await.unwrap();
+
+    let mut progress = Vec::new();
+    let report = client
+        .empty_bucket(bucket, |done, seen| progress.push((done, seen)))
+        .await
+        .unwrap();
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.deleted > 0, "nothing was deleted");
+    assert!(!progress.is_empty(), "progress should be reported");
+
+    // Nothing visible, nothing hidden.
+    let page = client.list_page(bucket, "", None).await.unwrap();
+    assert!(page.entries.is_empty(), "bucket still lists {page:?}");
+    for i in 0..3 {
+        assert!(
+            client
+                .list_versions(bucket, &format!("doc-{i}.txt"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "doc-{i}.txt still has versions"
+        );
+    }
+
+    // The real proof: an empty bucket is one S3 will let you delete.
+    client
+        .delete_bucket(bucket)
+        .await
+        .expect("DeleteBucket should succeed once every version is gone");
+}

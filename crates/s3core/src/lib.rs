@@ -192,6 +192,19 @@ pub struct DeleteReport {
     pub errors: Vec<String>,
 }
 
+/// One historical version of a key. A delete marker is also a "version" as far
+/// as S3 is concerned, but it holds no data — it only hides what is underneath,
+/// so the UI has to tell them apart or it will offer to download nothing.
+#[derive(Clone, Debug)]
+pub struct ObjectVersion {
+    pub key: String,
+    pub version_id: String,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
+    pub size: i64,
+    pub modified_epoch: Option<i64>,
+}
+
 /// Result of moving a whole prefix. A partial move is a real outcome, not an
 /// error: whatever succeeded stays moved, so the caller has to be able to say
 /// what is now where.
@@ -663,6 +676,221 @@ impl S3Client {
                 })
             })
             .collect())
+    }
+
+    /// Removes everything in a bucket, versions and delete markers included.
+    ///
+    /// A plain object delete is not enough in a versioned bucket: it writes a
+    /// delete marker and leaves the data, so `DeleteBucket` then fails with
+    /// BucketNotEmpty and nothing explains why. This walks
+    /// `ListObjectVersions`, which is the only listing that sees the hidden
+    /// versions at all.
+    ///
+    /// Deletes go out in batches of 1000, the API's limit. `progress` reports
+    /// (done, seen-so-far) — the total is not knowable upfront without walking
+    /// the whole bucket first, which for a large bucket costs as much as the
+    /// deletion.
+    pub async fn empty_bucket(
+        &self,
+        bucket: &str,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<DeleteReport> {
+        let mut report = DeleteReport::default();
+        let mut key_marker: Option<String> = None;
+        let mut version_marker: Option<String> = None;
+        let mut seen = 0usize;
+
+        loop {
+            let mut req = self
+                .inner
+                .list_object_versions()
+                .bucket(bucket)
+                .max_keys(1000);
+            if let Some(marker) = &key_marker {
+                req = req.key_marker(marker);
+            }
+            if let Some(marker) = &version_marker {
+                req = req.version_id_marker(marker);
+            }
+
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("ListObjectVersions failed for s3://{bucket}"))?;
+
+            let mut batch: Vec<ObjectIdentifier> = Vec::new();
+            for (key, version_id) in out
+                .versions()
+                .iter()
+                .filter_map(|v| Some((v.key()?, v.version_id()?)))
+                .chain(
+                    out.delete_markers()
+                        .iter()
+                        .filter_map(|m| Some((m.key()?, m.version_id()?))),
+                )
+            {
+                if let Ok(id) = ObjectIdentifier::builder()
+                    .key(key)
+                    .version_id(version_id)
+                    .build()
+                {
+                    batch.push(id);
+                }
+            }
+
+            seen += batch.len();
+            if !batch.is_empty() {
+                let deleted = batch.len();
+                let request = Delete::builder()
+                    .set_objects(Some(batch))
+                    .quiet(true)
+                    .build()
+                    .context("danh sách xoá không hợp lệ")?;
+
+                let out = self
+                    .inner
+                    .delete_objects()
+                    .bucket(bucket)
+                    .delete(request)
+                    .send()
+                    .await
+                    .with_context(|| format!("DeleteObjects failed for s3://{bucket}"))?;
+
+                let failed = out.errors().len();
+                for error in out.errors() {
+                    report.errors.push(format!(
+                        "{}: {}",
+                        error.key().unwrap_or("?"),
+                        error.message().unwrap_or("lỗi không rõ")
+                    ));
+                }
+                report.deleted += deleted - failed;
+                progress(report.deleted, seen);
+            }
+
+            if out.is_truncated().unwrap_or(false) {
+                key_marker = out.next_key_marker().map(str::to_owned);
+                version_marker = out.next_version_id_marker().map(str::to_owned);
+                if key_marker.is_none() && version_marker.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Every version of one key, newest first, delete markers included.
+    ///
+    /// `ListObjectVersions` takes a prefix, not a key, so it happily returns
+    /// `notes.txt.bak` when asked about `notes.txt`; the caller-visible filter
+    /// keeps that from showing up as a mysterious extra version.
+    pub async fn list_versions(&self, bucket: &str, key: &str) -> Result<Vec<ObjectVersion>> {
+        let mut versions = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_marker: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .inner
+                .list_object_versions()
+                .bucket(bucket)
+                .prefix(key)
+                .max_keys(1000);
+            if let Some(marker) = &key_marker {
+                req = req.key_marker(marker);
+            }
+            if let Some(marker) = &version_marker {
+                req = req.version_id_marker(marker);
+            }
+
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("ListObjectVersions failed for s3://{bucket}/{key}"))?;
+
+            for version in out.versions() {
+                let Some(found) = version.key() else { continue };
+                if found != key {
+                    continue;
+                }
+                versions.push(ObjectVersion {
+                    key: found.to_string(),
+                    version_id: version.version_id().unwrap_or_default().to_string(),
+                    is_latest: version.is_latest().unwrap_or(false),
+                    is_delete_marker: false,
+                    size: version.size().unwrap_or(0),
+                    modified_epoch: version.last_modified().map(|t| t.secs()),
+                });
+            }
+
+            for marker in out.delete_markers() {
+                let Some(found) = marker.key() else { continue };
+                if found != key {
+                    continue;
+                }
+                versions.push(ObjectVersion {
+                    key: found.to_string(),
+                    version_id: marker.version_id().unwrap_or_default().to_string(),
+                    is_latest: marker.is_latest().unwrap_or(false),
+                    is_delete_marker: true,
+                    size: 0,
+                    modified_epoch: marker.last_modified().map(|t| t.secs()),
+                });
+            }
+
+            if out.is_truncated().unwrap_or(false) {
+                key_marker = out.next_key_marker().map(str::to_owned);
+                version_marker = out.next_version_id_marker().map(str::to_owned);
+                if key_marker.is_none() && version_marker.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Newest first. S3 returns them in key order, and within a key roughly
+        // newest-first, but sorting on the timestamp makes that a guarantee.
+        versions.sort_by(|a, b| b.modified_epoch.cmp(&a.modified_epoch));
+        Ok(versions)
+    }
+
+    /// Makes an old version current again by copying it over the top.
+    ///
+    /// The old version is *not* deleted: in a versioned bucket the copy becomes
+    /// a new latest version and everything stays in the history. That is what
+    /// makes this safe to do by accident.
+    pub async fn restore_version(&self, bucket: &str, key: &str, version_id: &str) -> Result<()> {
+        let source = format!("{}?versionId={version_id}", encode_copy_source(bucket, key));
+
+        self.inner
+            .copy_object()
+            .bucket(bucket)
+            .key(key)
+            .copy_source(source)
+            .metadata_directive(MetadataDirective::Copy)
+            .send()
+            .await
+            .with_context(|| {
+                format!("Khôi phục version {version_id} của s3://{bucket}/{key} thất bại")
+            })?;
+        Ok(())
+    }
+
+    /// Deletes one specific version. Unlike an ordinary delete this removes data
+    /// for good — it does not write a delete marker.
+    pub async fn delete_version(&self, bucket: &str, key: &str, version_id: &str) -> Result<()> {
+        self.inner
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await
+            .with_context(|| format!("Xoá version {version_id} của s3://{bucket}/{key} thất bại"))?;
+        Ok(())
     }
 
     pub async fn object_tags(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>> {

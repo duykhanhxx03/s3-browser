@@ -13,7 +13,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
-    OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
+    ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{ImportedProfile, ProfileStore, StoredProfile};
@@ -71,6 +71,11 @@ pub struct Confirm {
     title: SharedString,
     detail: SharedString,
     doomed: Vec<Entry>,
+    /// Set when the thing being confirmed is one version rather than a set of
+    /// entries: (key, version id).
+    version: Option<(String, String)>,
+    /// Set when the whole bucket is to be emptied.
+    empty_bucket: Option<SharedString>,
 }
 
 /// The share panel's state. Signing is a request, so the URL arrives after the
@@ -92,6 +97,9 @@ pub struct Inspection {
     tags: Vec<(String, String)>,
     loading: bool,
     preview: Option<Preview>,
+    /// Only populated for versioned buckets — asking elsewhere is a request that
+    /// can only ever come back with the one version you already know about.
+    versions: Vec<ObjectVersion>,
 }
 
 /// What the inspector can show of an object's contents. Only ever holds the
@@ -667,6 +675,8 @@ impl Browser {
             title: delete_title(&doomed).into(),
             detail: delete_detail(&doomed, self.bucket_versioned).into(),
             doomed,
+            version: None,
+            empty_bucket: None,
         });
         cx.notify();
     }
@@ -680,7 +690,11 @@ impl Browser {
         let Some(confirm) = self.confirm.take() else {
             return;
         };
-        self.delete_entries(confirm.doomed, cx);
+        match (confirm.version, confirm.empty_bucket) {
+            (Some((key, version_id)), _) => self.delete_version(key, version_id, cx),
+            (_, Some(bucket)) => self.empty_bucket(bucket, cx),
+            _ => self.delete_entries(confirm.doomed, cx),
+        }
     }
 
     fn delete_entries(&mut self, doomed: Vec<Entry>, cx: &mut Context<Self>) {
@@ -851,6 +865,7 @@ impl Browser {
             tags: Vec::new(),
             loading: true,
             preview: None,
+            versions: Vec::new(),
         });
         self.load_inspection(key, cx);
         cx.notify();
@@ -861,12 +876,18 @@ impl Browser {
             return;
         };
 
+        let versioned = self.bucket_versioned;
         let loading = Tokio::spawn(cx, async move {
             let head = client.head_object(&bucket, &key).await;
             // Tagging is a separate request, and a provider that does not
             // implement it must not blank out the metadata that did load.
             let tags = client.object_tags(&bucket, &key).await.unwrap_or_default();
-            head.map(|head| (head, tags))
+            let versions = if versioned {
+                client.list_versions(&bucket, &key).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            head.map(|head| (head, tags, versions))
         });
 
         self.op_task = Some(cx.spawn(async move |this, cx| {
@@ -875,9 +896,10 @@ impl Browser {
                 if let Some(inspector) = this.inspector.as_mut() {
                     inspector.loading = false;
                     match outcome {
-                        Ok(Ok((head, tags))) => {
+                        Ok(Ok((head, tags, versions))) => {
                             inspector.head = Some(head);
                             inspector.tags = tags;
+                            inspector.versions = versions;
                         }
                         Ok(Err(error)) => this.report(format!("{error}")),
                         Err(error) => this.report(format!("Task lỗi: {error}")),
@@ -1004,6 +1026,139 @@ impl Browser {
         if self.inspector.is_some() {
             self.load_preview(cx);
         }
+    }
+
+    /// The most destructive thing the app can do, so the dialog names the bucket
+    /// and says plainly that versions go too.
+    fn ask_empty_bucket(&mut self, cx: &mut Context<Self>) {
+        let Some(bucket) = self.bucket.clone() else {
+            return;
+        };
+        self.confirm = Some(Confirm {
+            title: format!("Dọn sạch {bucket}?").into(),
+            detail: if self.bucket_versioned {
+                "Xoá mọi object, mọi phiên bản cũ và mọi delete marker. Bucket này bật versioning nên đây là xoá vĩnh viễn, không hoàn tác được."
+                    .into()
+            } else {
+                "Xoá mọi object trong bucket. Không hoàn tác được.".into()
+            },
+            doomed: Vec::new(),
+            version: None,
+            empty_bucket: Some(bucket),
+        });
+        cx.notify();
+    }
+
+    fn empty_bucket(&mut self, bucket: SharedString, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.status = format!("Đang dọn {bucket}…").into();
+        let reopen = bucket.clone();
+
+        let emptying = Tokio::spawn(cx, async move {
+            client.empty_bucket(&bucket, |_, _| {}).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = emptying.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(report)) if report.errors.is_empty() => {
+                        this.status = format!("Đã xoá {} mục", report.deleted).into();
+                    }
+                    Ok(Ok(report)) => this.report(format!(
+                        "Xoá {} mục, {} lỗi: {}",
+                        report.deleted,
+                        report.errors.len(),
+                        report.errors.first().cloned().unwrap_or_default()
+                    )),
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                this.open(reopen, String::new(), cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn restore_version(&mut self, version_id: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let key = inspector.key.clone();
+        let reload = key.clone();
+
+        let restoring = Tokio::spawn(cx, async move {
+            client.restore_version(&bucket, &key, &version_id).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = restoring.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.status = "Đã khôi phục version — bản cũ vẫn còn trong lịch sử".into();
+                        this.load_inspection(reload, cx);
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Deleting one version removes data permanently, which an ordinary delete
+    /// in a versioned bucket does not — so this one asks first.
+    fn ask_delete_version(&mut self, version: ObjectVersion, cx: &mut Context<Self>) {
+        let what = if version.is_delete_marker {
+            "delete marker"
+        } else {
+            "version"
+        };
+        self.confirm = Some(Confirm {
+            title: format!("Xoá hẳn {what} này?").into(),
+            detail: if version.is_delete_marker {
+                "Xoá delete marker sẽ làm object hiện lại như trước khi bị xoá.".into()
+            } else {
+                "Version bị xoá là mất hẳn, khác với xoá thường trong bucket versioning.".into()
+            },
+            doomed: Vec::new(),
+            version: Some((version.key, version.version_id)),
+            empty_bucket: None,
+        });
+        cx.notify();
+    }
+
+    fn delete_version(&mut self, key: String, version_id: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let reload = key.clone();
+
+        let deleting = Tokio::spawn(cx, async move {
+            client.delete_version(&bucket, &key, &version_id).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = deleting.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.status = "Đã xoá version".into();
+                        this.load_inspection(reload, cx);
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn restore_inspected(&mut self, cx: &mut Context<Self>) {
@@ -1728,6 +1883,13 @@ impl Browser {
                     )),
                 )
             })
+            .when(bucket.is_some() && self.selection.is_empty(), |this| {
+                this.child(
+                    danger_button("empty-bucket", "Dọn sạch bucket".into(), theme).on_click(
+                        cx.listener(|this, _event, _window, cx| this.ask_empty_bucket(cx)),
+                    ),
+                )
+            })
             .when(self.selection.len() == 1, |this| {
                 this.child(
                     action_button("rename", "Đổi tên", theme).on_click(cx.listener(
@@ -2182,6 +2344,98 @@ impl Browser {
                             .child("Không xem trước được kiểu này")
                             .into_any_element(),
                     }))
+                    .when(!inspector.versions.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_color(theme.text_faint).child(
+                                    SharedString::from(format!(
+                                        "PHIÊN BẢN · {}",
+                                        inspector.versions.len()
+                                    )),
+                                ))
+                                .children(inspector.versions.iter().map(|version| {
+                                    let for_restore = version.version_id.clone();
+                                    let for_delete = version.clone();
+                                    let when = version
+                                        .modified_epoch
+                                        .map(format_timestamp)
+                                        .unwrap_or_default();
+
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                // A delete marker holds no data;
+                                                // saying so stops the user asking
+                                                // to download nothing.
+                                                .text_color(if version.is_delete_marker {
+                                                    theme.text_faint
+                                                } else {
+                                                    theme.text
+                                                })
+                                                .child(SharedString::from(if version
+                                                    .is_delete_marker
+                                                {
+                                                    format!("{when} · delete marker")
+                                                } else {
+                                                    format!(
+                                                        "{when} · {}{}",
+                                                        format_size(version.size),
+                                                        if version.is_latest {
+                                                            " · hiện tại"
+                                                        } else {
+                                                            ""
+                                                        }
+                                                    )
+                                                })),
+                                        )
+                                        .when(
+                                            !version.is_latest && !version.is_delete_marker,
+                                            |row| {
+                                                row.child(
+                                                    action_button_dyn(
+                                                        SharedString::from(format!(
+                                                            "restore-{for_restore}"
+                                                        )),
+                                                        "Khôi phục".into(),
+                                                        theme,
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _event, _window, cx| {
+                                                            this.restore_version(
+                                                                for_restore.clone(),
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            icon_button_dyn(
+                                                SharedString::from(format!(
+                                                    "rm-ver-{}",
+                                                    for_delete.version_id
+                                                )),
+                                                "✕",
+                                                theme,
+                                            )
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    this.ask_delete_version(for_delete.clone(), cx)
+                                                },
+                                            )),
+                                        )
+                                })),
+                        )
+                    })
                     .when(!head.metadata.is_empty(), |this| {
                         this.child(
                             div()

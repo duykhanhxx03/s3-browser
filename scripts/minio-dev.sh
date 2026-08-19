@@ -40,6 +40,11 @@ seed() {
     done
     echo "hello from s3browser" | mc pipe local/demo-bucket/readme.txt >/dev/null
     head -c 3000000 /dev/urandom | mc pipe local/demo-bucket/blob.bin >/dev/null
+
+    # A versioned bucket, so the version UI and the empty-bucket flow have
+    # something real to work against. Deleting here writes delete markers.
+    mc mb -p local/versioned-bucket >/dev/null
+    mc version enable local/versioned-bucket >/dev/null
   ' >/dev/null
 
   if [ "${LARGE:-0}" = "1" ]; then
