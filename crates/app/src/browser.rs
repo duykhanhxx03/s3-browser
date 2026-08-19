@@ -157,6 +157,10 @@ pub struct Browser {
     orphans_open: bool,
 
     confirm: Option<Confirm>,
+    /// The command palette: `Some` with the query typed so far.
+    palette: Option<String>,
+    /// Which row the palette has highlighted.
+    palette_selected: usize,
     /// The share panel: which key it is for, and the URL once it exists.
     share: Option<Share>,
     inspector: Option<Inspection>,
@@ -238,6 +242,8 @@ impl Browser {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            palette: None,
+            palette_selected: 0,
             share: None,
             inspector: None,
             bucket_versioned: false,
@@ -681,6 +687,57 @@ impl Browser {
             version: None,
             empty_bucket: None,
         });
+        cx.notify();
+    }
+
+    fn open_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette = Some(String::new());
+        self.palette_selected = 0;
+        cx.notify();
+    }
+
+    /// Commands whose label matches what has been typed.
+    fn palette_matches(&self) -> Vec<Command> {
+        let query = self.palette.clone().unwrap_or_default();
+        Command::all()
+            .into_iter()
+            .filter(|command| command_matches(command.label().0, &query))
+            .collect()
+    }
+
+    fn run_command(&mut self, command: Command, cx: &mut Context<Self>) {
+        self.palette = None;
+        match command {
+            Command::Refresh => {
+                if let (Some(bucket), prefix) = (self.bucket.clone(), self.prefix.clone()) {
+                    self.open(bucket, prefix, cx);
+                }
+            }
+            Command::GoUp => self.go_up(cx),
+            Command::Filter => self.start_prompt(Prompt::Filter, cx),
+            Command::NewFolder => self.start_prompt(Prompt::NewFolder, cx),
+            Command::NewBucket => self.start_prompt(Prompt::NewBucket, cx),
+            Command::Rename => self.start_rename(cx),
+            Command::Share => self.start_share(cx),
+            Command::Inspect => self.toggle_inspector(cx),
+            Command::Preview => self.quick_look(cx),
+            Command::OpenExternally => {
+                // Needs the inspector's loaded head to know the size, so open it
+                // first if the user came straight from the palette.
+                if self.inspector.is_none() {
+                    self.open_inspector(cx);
+                } else {
+                    self.open_externally(cx);
+                }
+            }
+            Command::Download => self.download_selection(cx),
+            Command::Delete => self.ask_delete_selection(cx),
+            Command::ToggleQueue => {
+                self.drawer_open = !self.drawer_open;
+            }
+            Command::ScanOrphans => self.scan_orphans(cx),
+            Command::EmptyBucket => self.ask_empty_bucket(cx),
+        }
         cx.notify();
     }
 
@@ -1631,6 +1688,54 @@ impl Browser {
         let keystroke = &event.keystroke;
         let primary = is_primary(&keystroke.modifiers);
 
+        if let Some(query) = self.palette.clone() {
+            let matches = self.palette_matches();
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.palette = None;
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    if let Some(command) = matches.get(self.palette_selected).copied() {
+                        self.run_command(command, cx);
+                    }
+                    return;
+                }
+                "down" => {
+                    // Clamped rather than wrapping: the list is short and
+                    // wrapping past the end reads as the selection vanishing.
+                    self.palette_selected =
+                        (self.palette_selected + 1).min(matches.len().saturating_sub(1));
+                    cx.notify();
+                    return;
+                }
+                "up" => {
+                    self.palette_selected = self.palette_selected.saturating_sub(1);
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    let mut query = query;
+                    query.pop();
+                    self.palette = Some(query);
+                    self.palette_selected = 0;
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    if let Some(text) = keystroke.key_char.as_deref() {
+                        if !text.is_empty() && !text.chars().any(char::is_control) {
+                            self.palette = Some(format!("{query}{text}"));
+                            self.palette_selected = 0;
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         // A confirmation takes the keyboard entirely: ⌘⌫ while it is up must not
         // queue up a second delete behind the one being asked about.
         if self.confirm.is_some() {
@@ -1657,6 +1762,7 @@ impl Browser {
                 "d" => return self.download_selection(cx),
                 "enter" => return self.start_rename(cx),
                 "i" => return self.toggle_inspector(cx),
+                "k" => return self.open_palette(cx),
                 "j" => {
                     self.drawer_open = !self.drawer_open;
                     cx.notify();
@@ -2650,6 +2756,99 @@ impl Browser {
         )
     }
 
+    fn render_palette(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let query = self.palette.as_ref()?;
+        let theme = self.theme;
+        let matches = self.palette_matches();
+        let selected = self.palette_selected;
+
+        Some(
+            div()
+                .id("palette-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.35))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.palette = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("palette")
+                        .mt(px(90.))
+                        .w(px(440.))
+                        .h(px(320.))
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .h(px(34.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .text_color(theme.text)
+                                .child(SharedString::from(if query.is_empty() {
+                                    "Gõ để tìm lệnh…".to_string()
+                                } else {
+                                    query.clone()
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .children(matches.iter().enumerate().map(|(ix, command)| {
+                                    let (label, shortcut) = command.label();
+                                    let command = *command;
+                                    div()
+                                        .id(("cmd", ix))
+                                        .h(px(26.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_xs()
+                                        .when(ix == selected, |row| row.bg(theme.selected))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_color(theme.text)
+                                                .child(label),
+                                        )
+                                        .child(
+                                            div().text_color(theme.text_faint).child(shortcut),
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, _event, _window, cx| {
+                                                this.run_command(command, cx)
+                                            },
+                                        ))
+                                }))
+                                .when(matches.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .p_3()
+                                            .text_xs()
+                                            .text_color(theme.text_faint)
+                                            .child("Không có lệnh nào khớp"),
+                                    )
+                                }),
+                        ),
+                ),
+        )
+    }
+
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let confirm = self.confirm.as_ref()?;
         let theme = self.theme;
@@ -3009,6 +3208,7 @@ impl Render for Browser {
             .child(self.render_status(cx))
             .children(self.render_confirm(cx))
             .children(self.render_share(cx))
+            .children(self.render_palette(cx))
     }
 }
 
@@ -3356,6 +3556,101 @@ fn parse_tag(text: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.trim().to_string()))
 }
 
+/// Everything the palette can run. One list so the palette, the shortcut hints
+/// and the keyboard handler cannot drift apart — adding a command in one place
+/// adds it everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Refresh,
+    GoUp,
+    Filter,
+    NewFolder,
+    NewBucket,
+    Rename,
+    Share,
+    Inspect,
+    Preview,
+    OpenExternally,
+    Download,
+    Delete,
+    ToggleQueue,
+    ScanOrphans,
+    EmptyBucket,
+}
+
+impl Command {
+    /// Name, and the shortcut that also runs it. `⌘` is spelled out because the
+    /// palette is read, not pressed.
+    fn label(self) -> (&'static str, &'static str) {
+        match self {
+            Command::Refresh => ("Tải lại", "⌘R"),
+            Command::GoUp => ("Lên một cấp", "⌘↑"),
+            Command::Filter => ("Lọc", "⌘F"),
+            Command::NewFolder => ("Thư mục mới", "⌘N"),
+            Command::NewBucket => ("Bucket mới", "⌘⇧N"),
+            Command::Rename => ("Đổi tên", "⌘⏎"),
+            Command::Share => ("Chia sẻ / presigned URL", ""),
+            Command::Inspect => ("Chi tiết", "⌘I"),
+            Command::Preview => ("Xem trước", "Space"),
+            Command::OpenExternally => ("Mở bằng app ngoài", ""),
+            Command::Download => ("Tải xuống", "⌘D"),
+            Command::Delete => ("Xoá mục đã chọn", "⌘⌫"),
+            Command::ToggleQueue => ("Hàng đợi truyền tải", "⌘J"),
+            Command::ScanOrphans => ("Dọn upload dở", ""),
+            Command::EmptyBucket => ("Dọn sạch bucket", ""),
+        }
+    }
+
+    fn all() -> [Command; 15] {
+        [
+            Command::Refresh,
+            Command::GoUp,
+            Command::Filter,
+            Command::NewFolder,
+            Command::NewBucket,
+            Command::Rename,
+            Command::Share,
+            Command::Inspect,
+            Command::Preview,
+            Command::OpenExternally,
+            Command::Download,
+            Command::Delete,
+            Command::ToggleQueue,
+            Command::ScanOrphans,
+            Command::EmptyBucket,
+        ]
+    }
+}
+
+/// Case- and accent-tolerant match. Vietnamese command names are typed without
+/// diacritics as often as with them, so "doi ten" has to find "Đổi tên".
+fn command_matches(label: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    fold(label).contains(&fold(query))
+}
+
+/// Lowercases and strips Vietnamese diacritics, so a query typed on a plain
+/// keyboard still matches.
+fn fold(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| c.to_lowercase())
+        .map(|c| match c {
+            'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ'
+            | 'ẩ' | 'ẫ' | 'ậ' => 'a',
+            'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => 'e',
+            'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' => 'i',
+            'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ'
+            | 'ở' | 'ỡ' | 'ợ' => 'o',
+            'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => 'u',
+            'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' => 'y',
+            'đ' => 'd',
+            other => other,
+        })
+        .collect()
+}
+
 /// Headline for the delete dialog. Names the single victim when there is one,
 /// because "Xoá 1 mục" tells the user nothing about what they are about to lose.
 fn delete_title(doomed: &[Entry]) -> String {
@@ -3554,6 +3849,8 @@ mod tests {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            palette: None,
+            palette_selected: 0,
             share: None,
             inspector: None,
             bucket_versioned: false,
@@ -3700,6 +3997,44 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn palette_finds_commands_typed_without_diacritics() {
+        // The point of folding: a plain keyboard must still reach "Đổi tên".
+        assert!(command_matches("Đổi tên", "doi ten"));
+        assert!(command_matches("Đổi tên", "Đổi"));
+        assert!(command_matches("Xem trước", "xem truoc"));
+        assert!(command_matches("Dọn sạch bucket", "don sach"));
+        assert!(command_matches("Hàng đợi truyền tải", "hang doi"));
+
+        // Case is ignored in both directions.
+        assert!(command_matches("Tải lại", "TAI"));
+
+        // An empty query matches everything, so the palette opens full.
+        assert!(command_matches("bất kỳ", ""));
+
+        // Not a substring is not a match.
+        assert!(!command_matches("Đổi tên", "xoa"));
+    }
+
+    #[test]
+    fn every_command_has_a_label_and_the_list_is_complete() {
+        let all = Command::all();
+        // A command missing from `all()` would be unreachable from the palette
+        // while still looking implemented.
+        assert_eq!(all.len(), 15);
+        for command in all {
+            let (label, _) = command.label();
+            assert!(!label.is_empty(), "{command:?} has no label");
+        }
+
+        // Labels must be distinct, or two rows look like the same command.
+        let mut labels: Vec<&str> = all.iter().map(|c| c.label().0).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "duplicate command labels");
     }
 
     #[test]
