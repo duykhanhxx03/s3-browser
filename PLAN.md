@@ -159,8 +159,18 @@ Drag-drop upload (đệ quy thư mục) + overlay; download; transfer drawer v�
 2. **Resume hỏi server, không tin sổ sách của mình**: mỗi part server nhận là ghi ngay vào journal SQLite, nhưng khi tiếp tục thì `ListParts()` mới là nguồn sự thật — tránh trường hợp crash giữa lúc ghi journal làm gửi lại part đã có.
 3. **Throttle ở mức một part**, không bọc body stream của SDK: tốc độ trung bình đúng giới hạn nhưng từng part vẫn đi thành cụm. Bọc stream sẽ chính xác hơn nhưng phải can thiệp sâu vào SDK, không đáng cho một cái cap.
 
-### M3 — Object ops + chia sẻ (2–3 tuần)
-Rename/copy/move (gồm >5 GB), batch delete có confirm; presigned URL UI (cảnh báo theo loại credential); copy public URL; metadata/tags editor; storage class + Glacier restore; preview ảnh/text trong inspector, Space để preview nhanh; mở bằng app ngoài (`opener`).
+### M3 — Object ops + chia sẻ ✅ **XONG (19/08/2026)**
+Rename/copy/move (gồm >5 GB), batch delete có confirm; presigned URL UI (cảnh báo theo loại credential); copy public URL; metadata/tags editor; storage class + Glacier restore; preview ảnh/text trong inspector, Space để preview nhanh; mở bằng app ngoài (`opener`). 80 test pass (13 integration MinIO).
+
+**Một lỗi có sẵn lộ ra khi làm presigned URL:** phần import `~/.aws/credentials` bỏ qua `aws_session_token`, nên mọi profile sinh từ STS/SSO nhập vào đều hỏng xác thực với lỗi chữ ký khó hiểu. Đã sửa; token lưu ở keychain entry riêng để secret cũ vẫn đọc được.
+
+**Bốn chỗ S3 không cư xử như trực giác, đều đã có test chặn:**
+1. **CopyObject không giữ storage class** — mặc định đưa bản sao về STANDARD bất kể nguồn, nên copy một object Glacier là âm thầm đẩy nó sang tầng đắt hơn nhiều. Phải HEAD nguồn rồi set lại.
+2. **`x-amz-copy-source` gửi nguyên văn** — key có dấu cách hay `+` mà không percent-encode thì server đọc ra key khác: sao chép nhầm object hoặc 404 khó hiểu.
+3. **Xoá trong bucket versioning không xoá gì cả** — chỉ tạo delete marker, bản cũ vẫn còn và vẫn tính tiền. Nói "không hoàn tác được" ở đó là sai.
+4. **`x-amz-restore` vắng mặt ở hai ca khác hẳn nhau** — chưa bao giờ lưu trữ, và đã lưu trữ mà chưa ai yêu cầu khôi phục. Chỉ storage class mới tách được, và chúng cần hai giao diện khác nhau. `GLACIER_IR` không cần khôi phục dù tên nghe giống Glacier.
+
+**Metadata chỉ nạp khi mở inspector**, không HEAD từng dòng lúc listing — đúng như §4 đã cảnh báo, đó là lỗi khiến client S3 khác vừa chậm vừa tốn tiền.
 
 ### M4 — Pro (3–4 tuần)
 Versioning UI đầy đủ; SSE-S3/KMS; ACL editor; STS AssumeRole + MFA; AWS SSO device flow; empty-bucket flow; command palette ⌘K; keyboard shortcuts hoàn chỉnh.

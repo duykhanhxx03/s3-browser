@@ -15,6 +15,7 @@ s3core.workspace = true
 transfer.workspace = true
 vault.workspace = true
 anyhow.workspace = true
+opener.workspace = true
 dirs = "6"
 
 [dev-dependencies]

@@ -15,6 +15,7 @@ transfer = { path = "crates/transfer" }
 vault = { path = "crates/vault" }
 
 anyhow = "1"
+opener = "0.7"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 
 aws-config = { version = "1", features = ["behavior-version-latest", "sso"] }

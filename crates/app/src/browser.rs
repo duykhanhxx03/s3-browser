@@ -91,6 +91,17 @@ pub struct Inspection {
     head: Option<ObjectHead>,
     tags: Vec<(String, String)>,
     loading: bool,
+    preview: Option<Preview>,
+}
+
+/// What the inspector can show of an object's contents. Only ever holds the
+/// first `PREVIEW_LIMIT` bytes: a preview must never turn into an accidental
+/// download of a multi-gigabyte object.
+pub enum Preview {
+    Image(std::sync::Arc<gpui::Image>),
+    Text(SharedString),
+    /// Fetched, but not something worth rendering as either.
+    Unsupported,
 }
 
 pub struct Browser {
@@ -839,6 +850,7 @@ impl Browser {
             head: None,
             tags: Vec::new(),
             loading: true,
+            preview: None,
         });
         self.load_inspection(key, cx);
         cx.notify();
@@ -874,6 +886,124 @@ impl Browser {
                 cx.notify();
             });
         }));
+    }
+
+    /// Fetches the first slice of the object and decides what it is. Runs only
+    /// on demand: a preview of every selected row would be a download per click.
+    fn load_preview(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let key = inspector.key.clone();
+        let key_for_format = key.clone();
+        let size = inspector.head.as_ref().map(|head| head.size).unwrap_or(0);
+        let kind = preview_kind(&key, inspector.head.as_ref().and_then(|h| h.content_type.as_deref()));
+
+        if kind == PreviewKind::None {
+            if let Some(inspector) = self.inspector.as_mut() {
+                inspector.preview = Some(Preview::Unsupported);
+            }
+            cx.notify();
+            return;
+        }
+
+        // An image has to arrive whole to decode, so an oversized one is refused
+        // rather than fetched and shown broken. Text is fine truncated.
+        if kind == PreviewKind::Image && size > PREVIEW_LIMIT as i64 {
+            if let Some(inspector) = self.inspector.as_mut() {
+                inspector.preview = Some(Preview::Unsupported);
+            }
+            self.status = "Ảnh quá lớn để xem trước".into();
+            cx.notify();
+            return;
+        }
+
+        let wanted = (size.max(0) as u64).min(PREVIEW_LIMIT);
+        if wanted == 0 {
+            if let Some(inspector) = self.inspector.as_mut() {
+                inspector.preview = Some(Preview::Unsupported);
+            }
+            cx.notify();
+            return;
+        }
+
+        let fetching = Tokio::spawn(cx, async move {
+            client.get_range(&bucket, &key, 0..wanted, None).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = fetching.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(bytes)) => {
+                        if let Some(inspector) = this.inspector.as_mut() {
+                            inspector.preview = Some(build_preview(kind, &key_for_format, bytes));
+                        }
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Downloads the object to a temporary file and hands it to whatever the OS
+    /// opens that file type with.
+    fn open_externally(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let key = inspector.key.clone();
+        let size = inspector.head.as_ref().map(|head| head.size).unwrap_or(0).max(0) as u64;
+        let name = entry_name_of(&key);
+
+        self.status = format!("Đang tải {name} để mở…").into();
+
+        let fetching = Tokio::spawn(cx, async move {
+            let bytes = client.get_range(&bucket, &key, 0..size, None).await?;
+            // A per-run subdirectory keeps two objects with the same name from
+            // overwriting each other.
+            let dir = std::env::temp_dir().join(format!("s3browser-{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(&name);
+            std::fs::write(&path, bytes)?;
+            anyhow::Ok(path)
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = fetching.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(path)) => match opener::open(&path) {
+                        Ok(()) => this.status = format!("Đã mở {}", path.display()).into(),
+                        Err(error) => this.report(format!("Không mở được: {error}")),
+                    },
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Space opens the inspector on the selection and previews it in one go —
+    /// the Finder gesture, which is what people reach for.
+    fn quick_look(&mut self, cx: &mut Context<Self>) {
+        if self.inspector.is_none() {
+            self.open_inspector(cx);
+        }
+        if self.inspector.is_some() {
+            self.load_preview(cx);
+        }
     }
 
     fn restore_inspected(&mut self, cx: &mut Context<Self>) {
@@ -1372,6 +1502,10 @@ impl Browser {
                 "up" => return self.go_up(cx),
                 _ => {}
             }
+        }
+
+        if self.prompt.is_none() && keystroke.key == "space" && !self.selection.is_empty() {
+            return self.quick_look(cx);
         }
 
         if self.prompt.is_some() {
@@ -2008,6 +2142,46 @@ impl Browser {
                                 )
                             }),
                     )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                action_button("preview", "Xem trước", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.load_preview(cx)
+                                    }),
+                                ),
+                            )
+                            .child(
+                                action_button("open-external", "Mở bằng app", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.open_externally(cx)
+                                    }),
+                                ),
+                            ),
+                    )
+                    .children(inspector.preview.as_ref().map(|preview| match preview {
+                        Preview::Image(image) => gpui::img(image.clone())
+                            .max_w_full()
+                            .max_h(px(220.))
+                            .into_any_element(),
+                        Preview::Text(text) => div()
+                            .id("preview-text")
+                            .max_h(px(220.))
+                            .overflow_hidden()
+                            .p_2()
+                            .rounded_md()
+                            .bg(theme.hover)
+                            .font_family("monospace")
+                            .text_color(theme.text_muted)
+                            .child(text.clone())
+                            .into_any_element(),
+                        Preview::Unsupported => div()
+                            .text_color(theme.text_faint)
+                            .child("Không xem trước được kiểu này")
+                            .into_any_element(),
+                    }))
                     .when(!head.metadata.is_empty(), |this| {
                         this.child(
                             div()
@@ -2765,6 +2939,94 @@ const PRESIGN_PRESETS: [(&str, Duration); 4] = [
     ("15 phút", Duration::from_secs(900)),
 ];
 
+/// Turns fetched bytes into something renderable. Text that is not valid UTF-8
+/// is treated as unsupported rather than shown as replacement characters —
+/// mojibake looks like corruption of the object itself.
+fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
+    match kind {
+        PreviewKind::Image => match image_format_for_key(key) {
+            Some(format) => {
+                Preview::Image(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
+            }
+            None => Preview::Unsupported,
+        },
+        PreviewKind::Text => match String::from_utf8(bytes) {
+            Ok(text) => Preview::Text(text.into()),
+            Err(_) => Preview::Unsupported,
+        },
+        PreviewKind::None => Preview::Unsupported,
+    }
+}
+
+/// How much of an object a preview is allowed to fetch. Big enough for a photo,
+/// small enough that previewing a huge object is never a surprise download.
+const PREVIEW_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// What a preview should try to render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewKind {
+    Image,
+    Text,
+    None,
+}
+
+/// Decides from the content type first and the extension second. The type is
+/// what the object claims to be; the extension is a fallback for the many
+/// objects uploaded as `application/octet-stream`.
+fn preview_kind(key: &str, content_type: Option<&str>) -> PreviewKind {
+    if let Some(mime) = content_type {
+        let mime = mime.split(';').next().unwrap_or(mime).trim();
+        if image_format_for_mime(mime).is_some() {
+            return PreviewKind::Image;
+        }
+        // Structured text is still text: JSON and XML are worth reading inline.
+        if mime.starts_with("text/")
+            || matches!(mime, "application/json" | "application/xml" | "application/yaml")
+        {
+            return PreviewKind::Text;
+        }
+        // A specific, non-text type is a real answer — don't let the extension
+        // override it.
+        if mime != "application/octet-stream" && mime != "binary/octet-stream" {
+            return PreviewKind::None;
+        }
+    }
+
+    let extension = key.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => PreviewKind::Image,
+        "txt" | "md" | "json" | "xml" | "yaml" | "yml" | "toml" | "csv" | "log" | "rs" | "py"
+        | "js" | "ts" | "html" | "css" | "sh" | "sql" => PreviewKind::Text,
+        _ => PreviewKind::None,
+    }
+}
+
+/// Maps a MIME type to the format gpui needs to decode the bytes.
+fn image_format_for_mime(mime: &str) -> Option<gpui::ImageFormat> {
+    Some(match mime {
+        "image/png" => gpui::ImageFormat::Png,
+        "image/jpeg" | "image/jpg" => gpui::ImageFormat::Jpeg,
+        "image/gif" => gpui::ImageFormat::Gif,
+        "image/webp" => gpui::ImageFormat::Webp,
+        "image/bmp" => gpui::ImageFormat::Bmp,
+        "image/svg+xml" => gpui::ImageFormat::Svg,
+        _ => return None,
+    })
+}
+
+/// The format implied by a filename, for objects whose content type is unhelpful.
+fn image_format_for_key(key: &str) -> Option<gpui::ImageFormat> {
+    match key.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => Some(gpui::ImageFormat::Png),
+        "jpg" | "jpeg" => Some(gpui::ImageFormat::Jpeg),
+        "gif" => Some(gpui::ImageFormat::Gif),
+        "webp" => Some(gpui::ImageFormat::Webp),
+        "bmp" => Some(gpui::ImageFormat::Bmp),
+        "svg" => Some(gpui::ImageFormat::Svg),
+        _ => None,
+    }
+}
+
 /// Splits `khoá=giá trị`. Only the first `=` separates, because an S3 tag value
 /// may legitimately contain one. Returns `None` for input that would produce an
 /// empty key, which S3 rejects anyway.
@@ -3121,6 +3383,56 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn preview_kind_trusts_the_content_type_over_the_extension() {
+        // A declared type wins: an image served as .dat is still an image.
+        assert_eq!(preview_kind("blob.dat", Some("image/png")), PreviewKind::Image);
+        assert_eq!(preview_kind("notes.png", Some("text/plain")), PreviewKind::Text);
+
+        // Charset parameters must not defeat the match.
+        assert_eq!(
+            preview_kind("a.bin", Some("text/plain; charset=utf-8")),
+            PreviewKind::Text
+        );
+
+        // Structured text is worth reading inline.
+        assert_eq!(preview_kind("a.bin", Some("application/json")), PreviewKind::Text);
+
+        // A specific non-text type is a real answer — the extension must not
+        // override it into something we would then fail to render.
+        assert_eq!(preview_kind("report.txt", Some("application/pdf")), PreviewKind::None);
+
+        // octet-stream says nothing, so fall through to the extension. This is
+        // the common case: most uploads carry no useful type at all.
+        assert_eq!(
+            preview_kind("photo.JPEG", Some("application/octet-stream")),
+            PreviewKind::Image
+        );
+        assert_eq!(preview_kind("readme.md", None), PreviewKind::Text);
+        assert_eq!(preview_kind("archive.zip", None), PreviewKind::None);
+        assert_eq!(preview_kind("no-extension", None), PreviewKind::None);
+    }
+
+    #[test]
+    fn undecodable_text_is_not_shown_as_mojibake() {
+        // Invalid UTF-8 rendered with replacement characters looks like the
+        // object itself is corrupt, which is a worse lie than declining.
+        let preview = build_preview(PreviewKind::Text, "a.txt", vec![0xff, 0xfe, 0x00]);
+        assert!(matches!(preview, Preview::Unsupported));
+
+        let preview = build_preview(PreviewKind::Text, "a.txt", "xin chào".as_bytes().to_vec());
+        match preview {
+            Preview::Text(text) => assert_eq!(text.to_string(), "xin chào"),
+            _ => panic!("valid UTF-8 should preview as text"),
+        }
+
+        // An image whose extension gives no format cannot be decoded.
+        assert!(matches!(
+            build_preview(PreviewKind::Image, "mystery", vec![1, 2, 3]),
+            Preview::Unsupported
+        ));
     }
 
     #[test]
