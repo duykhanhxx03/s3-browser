@@ -6,6 +6,7 @@
 // Hide the console window that Windows would otherwise open alongside the GUI.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+mod assets;
 mod browser;
 #[cfg(target_os = "macos")]
 mod glass_check;
@@ -20,7 +21,9 @@ use browser::Browser;
 use platform::Chrome;
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(|cx: &mut App| {
         gpui_tokio::init(cx);
         // Brings the component library's key bindings and theme with it. The
         // Input widget's editing keys (word-wise delete, select-all, paste) are

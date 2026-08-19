@@ -2386,7 +2386,7 @@ impl Browser {
                             .child(
                                 icon_button_dyn(
                                     SharedString::from(format!("rm-profile-{}", profile.id)),
-                                    "✕",
+                                    "trash",
                                     theme,
                                 )
                                 .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -2464,11 +2464,11 @@ impl Browser {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                icon_button("up", "↑", theme)
+                icon_button("up", "arrow-up", theme)
                     .on_click(cx.listener(|this, _event, _window, cx| this.go_up(cx))),
             )
             .child(
-                icon_button("refresh", "⟳", theme).on_click(cx.listener(
+                icon_button("refresh", "refresh", theme).on_click(cx.listener(
                     |this, _event, _window, cx| {
                         if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
                             this.open(bucket, prefix, cx);
@@ -3026,7 +3026,7 @@ impl Browser {
                                     .child(
                                         icon_button_dyn(
                                             SharedString::from(format!("rm-tag-{name}")),
-                                            "✕",
+                                            "close",
                                             theme,
                                         )
                                         .on_click(cx.listener(
@@ -3162,7 +3162,7 @@ impl Browser {
                                                     "rm-ver-{}",
                                                     for_delete.version_id
                                                 )),
-                                                "✕",
+                                                "trash",
                                                 theme,
                                             )
                                             .on_click(cx.listener(
@@ -3218,7 +3218,7 @@ impl Browser {
                                 .overflow_hidden()
                                 .child(SharedString::from(entry_name_of(&inspector.key))),
                         )
-                        .child(icon_button("close-inspector", "✕", theme).on_click(cx.listener(
+                        .child(icon_button("close-inspector", "close", theme).on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.inspector = None;
                                 cx.notify();
@@ -3912,9 +3912,9 @@ impl Browser {
         let theme = self.theme;
         let id = job.id;
         let fraction = job.fraction();
-        let arrow = match job.direction {
-            transfer::Direction::Upload => "↑",
-            transfer::Direction::Download => "↓",
+        let direction = match job.direction {
+            transfer::Direction::Upload => "upload",
+            transfer::Direction::Download => "download",
         };
         let (state_label, state_color) = match job.state {
             JobState::Queued => ("chờ", theme.text_faint),
@@ -3933,7 +3933,7 @@ impl Browser {
             .items_center()
             .gap_2()
             .text_xs()
-            .child(div().w(px(14.)).text_color(theme.text_faint).child(arrow))
+            .child(div().w(px(18.)).child(icon(direction, theme.text_faint)))
             .child(
                 div()
                     .flex_1()
@@ -4007,7 +4007,7 @@ impl Browser {
                 _ => div().into_any_element(),
             })
             .child(
-                icon_button("remove", "✕", theme).on_click(cx.listener(
+                icon_button("remove", "close", theme).on_click(cx.listener(
                     move |this, _event, _window, cx| {
                         this.transfers.remove_job(id);
                         cx.notify();
@@ -4145,7 +4145,7 @@ fn section_header(
                 .text_color(theme.text_faint)
                 .child(text),
         )
-        .child(div().text_xs().text_color(theme.text_muted).child("+"))
+        .child(icon("plus", theme.text_muted))
 }
 
 fn sidebar_row(
@@ -4196,23 +4196,32 @@ fn detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElem
         )
 }
 
+/// One icon, tinted to `color` and sized to the row it sits in.
+///
+/// 16px is the size the set is drawn for; scaling a 24-grid stroke much beyond
+/// that makes the line weight visibly different from its neighbours.
+fn icon(name: &'static str, color: gpui::Hsla) -> impl IntoElement {
+    gpui::svg()
+        .path(SharedString::from(format!("icons/{name}.svg")))
+        .size(px(16.))
+        .text_color(color)
+}
+
 /// `icon_button` for ids built from data.
 fn icon_button_dyn(
     id: SharedString,
-    glyph: &'static str,
+    name: &'static str,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .size(px(18.))
+        .size(px(22.))
         .flex()
         .items_center()
         .justify_center()
         .rounded_md()
-        .text_xs()
-        .text_color(theme.text_muted)
         .hover(|style| style.bg(theme.hover))
-        .child(glyph)
+        .child(icon(name, theme.text_muted))
 }
 
 /// `action_button` for labels that come from data rather than a literal.
@@ -4246,20 +4255,18 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
         .child(label)
 }
 
-fn icon_button(id: &'static str, glyph: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
+fn icon_button(id: &'static str, name: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .w(px(24.))
-        .h(px(24.))
+        .w(px(26.))
+        .h(px(26.))
         .flex()
         .items_center()
         .justify_center()
         .rounded_md()
-        .text_sm()
         .cursor_pointer()
-        .text_color(theme.text_muted)
-        .hover(|this| this.bg(theme.hover).text_color(theme.text))
-        .child(glyph)
+        .hover(|this| this.bg(theme.hover))
+        .child(icon(name, theme.text_muted))
 }
 
 fn crumb(id: SharedString, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
@@ -4306,11 +4313,18 @@ fn object_row(
         .cursor_pointer()
         .when(selected, |this| this.bg(theme.selected))
         .hover(|this| this.bg(theme.hover))
-        .child(div().w(px(22.)).child(if entry.is_folder {
-            "📁"
-        } else {
-            "📄"
-        }))
+        .child(
+            div()
+                .w(px(22.))
+                .flex()
+                .items_center()
+                // Folders lead, so they carry the accent; files stay quiet.
+                .child(if entry.is_folder {
+                    icon("folder", theme.accent)
+                } else {
+                    icon("file", theme.text_faint)
+                }),
+        )
         .child(
             div()
                 .flex_1()
