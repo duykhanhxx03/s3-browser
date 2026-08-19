@@ -3013,6 +3013,110 @@ impl Browser {
         )
     }
 
+    /// The first-run screen. Without it a fresh install shows an empty list and
+    /// a status line, with nothing saying what to do next — the three ways in
+    /// exist but are invisible until a profile already exists.
+    fn render_onboarding(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.profiles.is_empty() {
+            return None;
+        }
+        let theme = self.theme;
+
+        let step = |title: &'static str, detail: &'static str, button: &'static str, id: &'static str| {
+            (title, detail, button, id)
+        };
+
+        Some(
+            div()
+                .id("onboarding")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.ground)
+                .child(
+                    div()
+                        .w(px(460.))
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_color(theme.text).child("s3browser"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child(
+                                            "Cần một profile để bắt đầu. Khoá bí mật lưu trong Keychain của máy, không nằm trong file cấu hình.",
+                                        ),
+                                ),
+                        )
+                        .children(
+                            [
+                                step(
+                                    "Nhập từ ~/.aws",
+                                    "Đọc credentials và config có sẵn. Profile SSO hoặc assume-role cần đăng nhập riêng.",
+                                    "Nhập",
+                                    "onboard-import",
+                                ),
+                                step(
+                                    "MinIO trên máy",
+                                    "Dành cho thử nghiệm: http://127.0.0.1:9000 với minioadmin/minioadmin.",
+                                    "Tạo",
+                                    "onboard-minio",
+                                ),
+                                step(
+                                    "Đăng nhập AWS SSO",
+                                    "Mở trình duyệt để duyệt, rồi chọn account và role.",
+                                    "Đăng nhập",
+                                    "onboard-sso",
+                                ),
+                            ]
+                            .map(|(title, detail, button, id)| {
+                                div()
+                                    .p_3()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .rounded_lg()
+                                    .bg(theme.panel)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_color(theme.text).child(title))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.text_muted)
+                                                    .child(detail),
+                                            ),
+                                    )
+                                    .child(action_button(id, button, theme).on_click(cx.listener(
+                                        move |this, _event, _window, cx| match id {
+                                            "onboard-import" => this.import_from_aws(cx),
+                                            "onboard-minio" => this.add_minio_dev_profile(cx),
+                                            _ => this.start_prompt(Prompt::SsoStart, cx),
+                                        },
+                                    )))
+                            }),
+                        )
+                        .when_some(self.error.clone(), |this, error| {
+                            this.child(div().text_xs().text_color(theme.danger).child(error))
+                        }),
+                ),
+        )
+    }
+
     fn render_sso(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let flow = self.sso.as_ref()?;
         let theme = self.theme;
@@ -3572,6 +3676,7 @@ impl Render for Browser {
             .children(self.render_share(cx))
             .children(self.render_palette(cx))
             .children(self.render_sso(cx))
+            .children(self.render_onboarding(cx))
     }
 }
 

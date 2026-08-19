@@ -58,6 +58,13 @@ fn schedule_glass_check(cx: &mut App) {
                 .expect("glass check must run on the main thread");
             let report = glass_check::inspect(mtm);
             println!("--- glass check ---");
+            // Which inputs produced the mode, so a surprising result can be
+            // traced to the setting responsible rather than guessed at.
+            println!(
+                "reduce transparency: {} | chế độ: {:?}",
+                platform::reduce_transparency(),
+                platform::Chrome::detect()
+            );
             for line in &report.lines {
                 println!("{line}");
             }

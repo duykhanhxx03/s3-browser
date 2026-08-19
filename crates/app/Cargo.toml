@@ -25,5 +25,5 @@ gpui = { workspace = true, features = ["test-support"] }
 # Used by the `--verify-glass` self-check to inspect the real NSWindow.
 # Versions match what gpui 0.2.2 already links.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSApplication", "NSVisualEffectView", "NSColor", "NSGraphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSApplication", "NSVisualEffectView", "NSColor", "NSGraphics", "NSWorkspace"] }
 objc2-foundation = "0.3"
