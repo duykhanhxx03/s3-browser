@@ -133,6 +133,9 @@ pub struct Confirm {
 /// panel opens.
 pub struct Share {
     key: String,
+    /// Which preset is showing, so the buttons say which one is active rather
+    /// than leaving the user to remember what they clicked.
+    chosen: &'static str,
     url: Option<SharedString>,
     /// Set when the profile signs with a session token, which caps how long any
     /// URL can really last.
@@ -1941,14 +1944,15 @@ impl Browser {
 
         self.share = Some(Share {
             key: key.clone(),
+            chosen: PRESIGN_PRESETS[1].0,
             url: None,
             temporary_credentials,
         });
-        self.presign(PRESIGN_PRESETS[0].1, cx);
+        self.presign(PRESIGN_PRESETS[1].0, PRESIGN_PRESETS[1].1, cx);
         cx.notify();
     }
 
-    fn presign(&mut self, expires: Duration, cx: &mut Context<Self>) {
+    fn presign(&mut self, label: &'static str, expires: Duration, cx: &mut Context<Self>) {
         let (Some(client), Some(bucket), Some(share)) =
             (self.client.clone(), self.bucket.clone(), self.share.as_ref())
         else {
@@ -1957,6 +1961,10 @@ impl Browser {
         // Never sign for longer than the credentials can actually honour.
         let capped = expires.min(s3core::presign_limit_for(share.temporary_credentials));
         let key = share.key.clone();
+        if let Some(share) = self.share.as_mut() {
+            share.chosen = label;
+            share.url = None;
+        }
 
         let signing = Tokio::spawn(cx, async move {
             client.presign_get(&bucket, &key, capped).await
@@ -2631,12 +2639,12 @@ impl Browser {
                     )),
                 )
                 .child(
-                    action_button("share", "Chia sẻ", theme).on_click(cx.listener(
+                    icon_button("share", "link", theme).on_click(cx.listener(
                         |this, _event, _window, cx| this.start_share(cx),
                     )),
                 )
                 .child(
-                    action_button("inspect", "Chi tiết", theme).on_click(cx.listener(
+                    icon_button("inspect", "info", theme).on_click(cx.listener(
                         |this, _event, _window, cx| this.toggle_inspector(cx),
                     )),
                 )
@@ -2644,7 +2652,7 @@ impl Browser {
             .when(!self.selection.is_empty(), |this| {
                 let count = self.selection.len();
                 this.child(
-                    action_button("download", "Tải xuống", theme).on_click(cx.listener(
+                    icon_button("download", "download", theme).on_click(cx.listener(
                         |this, _event, _window, cx| this.download_selection(cx),
                     )),
                 )
@@ -3046,7 +3054,7 @@ impl Browser {
                             ))
                             .child(detail_row(
                                 "ETag",
-                                head.etag.clone().unwrap_or_default().replace('"', ""),
+                                elide_middle(&head.etag.clone().unwrap_or_default().replace('"', ""), 28),
                                 theme,
                             )),
                     )
@@ -3354,13 +3362,18 @@ impl Browser {
                                 .gap_2()
                                 .children(PRESIGN_PRESETS.iter().map(|(label, expires)| {
                                     let expires = *expires;
+                                    let label = *label;
+                                    let active = share.chosen == label;
                                     action_button_dyn(
                                         SharedString::from(format!("presign-{label}")),
-                                        SharedString::from(*label),
+                                        SharedString::from(label),
                                         theme,
                                     )
+                                    // The active preset has to look chosen, or
+                                    // the row is four buttons with no state.
+                                    .when(active, |this| this.bg(theme.selected))
                                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.presign(expires, cx)
+                                        this.presign(label, expires, cx)
                                     }))
                                 })),
                         )
@@ -3383,7 +3396,9 @@ impl Browser {
                                 .bg(theme.hover)
                                 .text_xs()
                                 .text_color(theme.text_muted)
-                                .child(url.clone())
+                                // Elided: it is copied, not read, and the full
+                                // signature would push the buttons off screen.
+                                .child(SharedString::from(elide_middle(url, 52)))
                                 .into_any_element(),
                             None => div()
                                 .text_xs()
@@ -3724,7 +3739,7 @@ impl Browser {
                         .id("palette")
                         .mt(px(90.))
                         .w(px(440.))
-                        .h(px(320.))
+                        .h(px(452.))
                         .flex()
                         .flex_col()
                         .rounded_lg()
@@ -3749,8 +3764,12 @@ impl Browser {
                         )
                         .child(
                             div()
+                                .id("palette-list")
                                 .flex_1()
-                                .overflow_hidden()
+                                // Scrollable: without it the commands past the
+                                // fold were unreachable, and the last visible
+                                // row was sliced through the middle.
+                                .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
                                 .children(matches.iter().enumerate().map(|(ix, command)| {
@@ -4241,10 +4260,31 @@ fn detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElem
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .overflow_hidden()
                 .text_color(theme.text)
                 .child(SharedString::from(value)),
         )
+}
+
+/// Shortens an opaque token so it stays on one line.
+///
+/// An ETag or key id has no word boundaries, so letting it wrap splits a hex
+/// string across two lines and reads as corrupted data rather than as a long
+/// value. The middle is dropped because both ends are what people compare.
+fn elide_middle(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars || max_chars < 5 {
+        return value.to_string();
+    }
+    let keep = max_chars - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
 }
 
 /// One icon, tinted to `color` and sized to the row it sits in.
@@ -4425,10 +4465,10 @@ fn next_bandwidth_limit(current: u64) -> u64 {
 /// Expiry choices for a presigned URL. Capped per-credential-type at sign time,
 /// so a temporary-credential profile silently gets the shorter of the two.
 const PRESIGN_PRESETS: [(&str, Duration); 4] = [
+    ("15 phút", Duration::from_secs(900)),
     ("1 giờ", Duration::from_secs(3600)),
     ("24 giờ", Duration::from_secs(24 * 3600)),
     ("7 ngày", Duration::from_secs(7 * 24 * 3600)),
-    ("15 phút", Duration::from_secs(900)),
 ];
 
 /// Turns fetched bytes into something renderable. Text that is not valid UTF-8
@@ -5145,6 +5185,30 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn opaque_tokens_are_elided_not_wrapped() {
+        let etag = "529e9abf98dd6f2d15f4f69461565329";
+        let short = elide_middle(etag, 28);
+        assert_eq!(short.chars().count(), 28);
+        // Both ends survive: they are what people compare against a checksum.
+        assert!(short.starts_with("529e9abf"), "{short}");
+        assert!(short.ends_with("565329"), "{short}");
+        assert!(short.contains('…'));
+
+        // Short enough already: untouched, no stray ellipsis.
+        assert_eq!(elide_middle("abc", 28), "abc");
+        assert_eq!(elide_middle(etag, 32), etag);
+
+        // A budget too small to be meaningful returns the value rather than
+        // producing something unreadable.
+        assert_eq!(elide_middle(etag, 3), etag);
+
+        // Multi-byte input must not be cut mid-character.
+        let viet = "khoá-bí-mật-rất-dài-không-nên-xuống-dòng";
+        let cut = elide_middle(viet, 12);
+        assert_eq!(cut.chars().count(), 12);
     }
 
     #[test]
