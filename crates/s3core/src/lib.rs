@@ -13,7 +13,7 @@ use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation}
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective, ObjectIdentifier,
-    RestoreRequest, StorageClass, Tag, Tagging, Tier,
+    RestoreRequest, ServerSideEncryption, StorageClass, Tag, Tagging, Tier,
 };
 use aws_sdk_s3::Client;
 
@@ -145,6 +145,9 @@ pub struct ObjectHead {
     /// `None` means STANDARD; S3 omits the header for it.
     pub storage_class: Option<String>,
     pub content_type: Option<String>,
+    /// `AES256` or `aws:kms`, absent when the object is not encrypted.
+    pub encryption: Option<String>,
+    pub kms_key_id: Option<String>,
     pub modified_epoch: Option<i64>,
     /// User metadata (the `x-amz-meta-` headers), without the prefix.
     pub metadata: Vec<(String, String)>,
@@ -214,9 +217,28 @@ pub struct MoveReport {
     pub errors: Vec<String>,
 }
 
+/// Server-side encryption to ask for when uploading. S3 applies this at write
+/// time only — an object already stored cannot be re-encrypted without copying
+/// it over itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Encryption {
+    /// Whatever the bucket's default encryption says, which is often AES256
+    /// anyway. Asking for nothing is not the same as asking for none.
+    #[default]
+    BucketDefault,
+    /// SSE-S3: keys managed by S3, no configuration and no extra cost.
+    Aes256,
+    /// SSE-KMS with a specific key. Costs a KMS request per operation, which is
+    /// worth knowing before turning it on for a bulk upload.
+    Kms(String),
+}
+
 #[derive(Clone)]
 pub struct S3Client {
     inner: Client,
+    /// Shared across clones on purpose: the transfer engine holds its own clone,
+    /// and changing the setting in the UI has to reach the uploads it runs.
+    encryption: std::sync::Arc<std::sync::Mutex<Encryption>>,
 }
 
 impl S3Client {
@@ -263,6 +285,7 @@ impl S3Client {
 
         Ok(Self {
             inner: Client::from_conf(builder.build()),
+            encryption: std::sync::Arc::new(std::sync::Mutex::new(Encryption::BucketDefault)),
         })
     }
 
@@ -448,6 +471,10 @@ impl S3Client {
             etag: out.e_tag().map(str::to_owned),
             storage_class: out.storage_class().map(|class| class.as_str().to_owned()),
             content_type: out.content_type().map(str::to_owned),
+            encryption: out
+                .server_side_encryption()
+                .map(|sse| sse.as_str().to_owned()),
+            kms_key_id: out.ssekms_key_id().map(str::to_owned),
             modified_epoch: out.last_modified().map(|t| t.secs()),
             metadata: out
                 .metadata()
@@ -467,13 +494,26 @@ impl S3Client {
     }
 
     /// Single-request upload, for objects below the multipart threshold.
+    pub fn encryption(&self) -> Encryption {
+        self.encryption.lock().unwrap().clone()
+    }
+
+    pub fn set_encryption(&self, encryption: Encryption) {
+        *self.encryption.lock().unwrap() = encryption;
+    }
+
     pub async fn put_object(&self, bucket: &str, key: &str, body: Vec<u8>) -> Result<()> {
-        self.inner
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body.into())
-            .send()
+        let mut req = self.inner.put_object().bucket(bucket).key(key).body(body.into());
+        match self.encryption() {
+            Encryption::BucketDefault => {}
+            Encryption::Aes256 => req = req.server_side_encryption(ServerSideEncryption::Aes256),
+            Encryption::Kms(key_id) => {
+                req = req
+                    .server_side_encryption(ServerSideEncryption::AwsKms)
+                    .ssekms_key_id(key_id)
+            }
+        }
+        req.send()
             .await
             .with_context(|| format!("PutObject failed for s3://{bucket}/{key}"))?;
         Ok(())
@@ -515,11 +555,19 @@ impl S3Client {
     }
 
     pub async fn create_multipart_upload(&self, bucket: &str, key: &str) -> Result<String> {
-        let out = self
-            .inner
-            .create_multipart_upload()
-            .bucket(bucket)
-            .key(key)
+        // Encryption is decided here, once. Setting it per part is not a thing
+        // S3 supports — the parts inherit whatever the upload was created with.
+        let mut req = self.inner.create_multipart_upload().bucket(bucket).key(key);
+        match self.encryption() {
+            Encryption::BucketDefault => {}
+            Encryption::Aes256 => req = req.server_side_encryption(ServerSideEncryption::Aes256),
+            Encryption::Kms(key_id) => {
+                req = req
+                    .server_side_encryption(ServerSideEncryption::AwsKms)
+                    .ssekms_key_id(key_id)
+            }
+        }
+        let out = req
             .send()
             .await
             .with_context(|| format!("CreateMultipartUpload failed for s3://{bucket}/{key}"))?;

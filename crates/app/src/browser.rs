@@ -13,7 +13,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
-    ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
+    Encryption, ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{ImportedProfile, ProfileStore, StoredProfile};
@@ -50,6 +50,8 @@ pub enum Prompt {
     Rename(String),
     /// Adding a tag to the inspected object, typed as `khoá=giá trị`.
     AddTag,
+    /// The KMS key id to encrypt uploads with.
+    KmsKey,
 }
 
 impl Prompt {
@@ -60,6 +62,7 @@ impl Prompt {
             Prompt::NewBucket => "Tên bucket mới",
             Prompt::Rename(_) => "Tên mới",
             Prompt::AddTag => "Thẻ mới (khoá=giá trị)",
+            Prompt::KmsKey => "KMS key id",
         }
     }
 }
@@ -1602,6 +1605,12 @@ impl Browser {
                 self.rename_entry(key, text.trim().to_string(), cx)
             }
             Prompt::AddTag if !text.trim().is_empty() => self.add_tag(text, cx),
+            Prompt::KmsKey if !text.trim().is_empty() => {
+                if let Some(client) = self.client.as_ref() {
+                    client.set_encryption(Encryption::Kms(text.trim().to_string()));
+                    self.status = "Mã hoá: SSE-KMS".into();
+                }
+            }
             _ => {}
         }
         cx.notify();
@@ -2139,6 +2148,29 @@ impl Browser {
                                     cx.notify();
                                 })),
                         )
+                        .when_some(self.client.clone(), |this, client| {
+                            let current = client.encryption();
+                            this.child(
+                                action_button("encryption", "", theme)
+                                    .child(SharedString::from(format!(
+                                        "Mã hoá: {}",
+                                        encryption_label(&current)
+                                    )))
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        match next_encryption(&current) {
+                                            // KMS needs a key id, so it asks
+                                            // rather than silently picking one.
+                                            None => this.start_prompt(Prompt::KmsKey, cx),
+                                            Some(next) => {
+                                                if let Some(client) = this.client.as_ref() {
+                                                    client.set_encryption(next);
+                                                }
+                                                cx.notify();
+                                            }
+                                        }
+                                    })),
+                            )
+                        })
                         .child(
                             action_button("clear-finished", "Xoá mục đã xong", theme).on_click(
                                 cx.listener(|this, _event, _window, cx| {
@@ -2223,6 +2255,17 @@ impl Browser {
                                 theme,
                             ))
                             .child(detail_row("Lớp lưu trữ", class.to_string(), theme))
+                            .child(detail_row(
+                                "Mã hoá",
+                                match (&head.encryption, &head.kms_key_id) {
+                                    (Some(kind), Some(key)) => format!("{kind} · {key}"),
+                                    (Some(kind), None) => kind.clone(),
+                                    // Not the same as "unknown": S3 omits the
+                                    // header exactly when nothing encrypts it.
+                                    (None, _) => "không".into(),
+                                },
+                                theme,
+                            ))
                             .child(detail_row(
                                 "ETag",
                                 head.etag.clone().unwrap_or_default().replace('"', ""),
@@ -3212,6 +3255,26 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
     }
 }
 
+fn encryption_label(encryption: &Encryption) -> String {
+    match encryption {
+        Encryption::BucketDefault => "theo bucket".into(),
+        Encryption::Aes256 => "SSE-S3".into(),
+        // The key id can be a full ARN, which would push everything else off the
+        // row; the tail is the part that identifies it to a human.
+        Encryption::Kms(key) => format!("KMS · {}", key.rsplit('/').next().unwrap_or(key)),
+    }
+}
+
+/// The next setting when the button is clicked. `None` means the next one needs
+/// input first, so the caller has to ask instead of applying it.
+fn next_encryption(current: &Encryption) -> Option<Encryption> {
+    match current {
+        Encryption::BucketDefault => Some(Encryption::Aes256),
+        Encryption::Aes256 => None,
+        Encryption::Kms(_) => Some(Encryption::BucketDefault),
+    }
+}
+
 /// How much of an object a preview is allowed to fetch. Big enough for a photo,
 /// small enough that previewing a huge object is never a surprise download.
 const PREVIEW_LIMIT: u64 = 8 * 1024 * 1024;
@@ -3637,6 +3700,39 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn encryption_cycle_asks_before_it_needs_a_key() {
+        assert_eq!(encryption_label(&Encryption::BucketDefault), "theo bucket");
+        assert_eq!(encryption_label(&Encryption::Aes256), "SSE-S3");
+
+        // A full ARN would push the rest of the row off screen; the tail is what
+        // identifies the key to a person.
+        assert_eq!(
+            encryption_label(&Encryption::Kms(
+                "arn:aws:kms:ap-southeast-1:1234:key/abcd-1234".into()
+            )),
+            "KMS · abcd-1234"
+        );
+        // A bare id has no slash to split on and must survive intact.
+        assert_eq!(
+            encryption_label(&Encryption::Kms("abcd-1234".into())),
+            "KMS · abcd-1234"
+        );
+
+        // Default → SSE-S3 applies directly.
+        assert_eq!(
+            next_encryption(&Encryption::BucketDefault),
+            Some(Encryption::Aes256)
+        );
+        // SSE-S3 → KMS cannot be applied without asking for a key id first.
+        assert_eq!(next_encryption(&Encryption::Aes256), None);
+        // KMS → back to the default, so the cycle always has a way out.
+        assert_eq!(
+            next_encryption(&Encryption::Kms("k".into())),
+            Some(Encryption::BucketDefault)
+        );
     }
 
     #[test]

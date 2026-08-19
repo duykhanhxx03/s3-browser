@@ -600,3 +600,83 @@ async fn emptying_a_versioned_bucket_clears_hidden_versions_too() {
         .await
         .expect("DeleteBucket should succeed once every version is gone");
 }
+
+#[tokio::test]
+async fn sse_headers_reach_the_server_on_both_upload_paths() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+
+    // Baseline: no encryption asked for, none reported.
+    let plain = "sse-tests/plain.txt";
+    client.put_object(bucket, plain, b"x".to_vec()).await.unwrap();
+    let head = client.head_object(bucket, plain).await.unwrap();
+    assert_eq!(head.encryption, None, "baseline should be unencrypted");
+    client.delete_object(bucket, plain).await.unwrap();
+
+    client.set_encryption(s3core::Encryption::Aes256);
+    let small = "sse-tests/small.txt";
+    let outcome = client.put_object(bucket, small, b"secret".to_vec()).await;
+
+    // A stock MinIO has no KMS backend and refuses server-side encryption. That
+    // refusal is itself the evidence this test can get here: the server could
+    // not complain about encryption it was never asked for. What stays
+    // unverified locally is whether the stored object really comes back
+    // encrypted — that needs a KMS-configured server.
+    if let Err(error) = &outcome {
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("NotImplemented") || message.contains("KMS"),
+            "expected an encryption-specific refusal, got: {message}"
+        );
+        eprintln!(
+            "skipping end-to-end SSE check: this server has no KMS configured \
+             (the header was sent and specifically rejected)"
+        );
+        client.set_encryption(s3core::Encryption::BucketDefault);
+        return;
+    }
+
+    // A server that does support it must report the encryption back.
+    let head = client.head_object(bucket, small).await.unwrap();
+    assert_eq!(
+        head.encryption.as_deref(),
+        Some("AES256"),
+        "PutObject should carry SSE-S3"
+    );
+
+    // Multipart sets encryption once at create time; the parts inherit it.
+    // Getting this wrong is silent — the upload succeeds, just unencrypted.
+    let large = "sse-tests/large.bin";
+    let upload_id = client.create_multipart_upload(bucket, large).await.unwrap();
+    let etag = client
+        .upload_part(bucket, large, &upload_id, 1, vec![9u8; 5 * 1024 * 1024])
+        .await
+        .unwrap();
+    client
+        .complete_multipart_upload(
+            bucket,
+            large,
+            &upload_id,
+            vec![s3core::CompletedPart {
+                part_number: 1,
+                etag,
+                size: 5 * 1024 * 1024,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let head = client.head_object(bucket, large).await.unwrap();
+    assert_eq!(
+        head.encryption.as_deref(),
+        Some("AES256"),
+        "multipart parts inherit the upload's encryption"
+    );
+
+    client.set_encryption(s3core::Encryption::BucketDefault);
+    for key in [small, large] {
+        client.delete_object(bucket, key).await.unwrap();
+    }
+}
