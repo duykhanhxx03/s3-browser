@@ -16,7 +16,7 @@ use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
     capability::{Capabilities, CapabilityCache, Support},
-    Encryption, ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
+    Encryption, ObjectAcl, ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{ImportedProfile, ProfileStore, StoredProfile};
@@ -179,6 +179,8 @@ pub struct Inspection {
     key: String,
     head: Option<ObjectHead>,
     tags: Vec<(String, String)>,
+    /// Only fetched where the bucket actually has ACLs enabled.
+    acl: Option<ObjectAcl>,
     loading: bool,
     preview: Option<Preview>,
     /// Only populated for versioned buckets — asking elsewhere is a request that
@@ -1639,6 +1641,7 @@ impl Browser {
             key: key.clone(),
             head: None,
             tags: Vec::new(),
+            acl: None,
             loading: true,
             preview: None,
             versions: Vec::new(),
@@ -1653,6 +1656,7 @@ impl Browser {
         };
 
         let versioned = self.bucket_versioned;
+        let acl_supported = self.supports(|caps| caps.acl);
         let loading = Tokio::spawn(cx, async move {
             let head = client.head_object(&bucket, &key).await;
             // Tagging is a separate request, and a provider that does not
@@ -1663,7 +1667,14 @@ impl Browser {
             } else {
                 Vec::new()
             };
-            head.map(|head| (head, tags, versions))
+            // Skipped where ACLs are off, which is the default for buckets made
+            // since 2023 — asking there is a request that can only fail.
+            let acl = if acl_supported {
+                client.object_acl(&bucket, &key).await.ok()
+            } else {
+                None
+            };
+            head.map(|head| (head, tags, versions, acl))
         });
 
         self.op_task = Some(cx.spawn(async move |this, cx| {
@@ -1672,10 +1683,11 @@ impl Browser {
                 if let Some(inspector) = this.inspector.as_mut() {
                     inspector.loading = false;
                     match outcome {
-                        Ok(Ok((head, tags, versions))) => {
+                        Ok(Ok((head, tags, versions, acl))) => {
                             inspector.head = Some(head);
                             inspector.tags = tags;
                             inspector.versions = versions;
+                            inspector.acl = acl;
                         }
                         Ok(Err(error)) => this.report(format!("{error}")),
                         Err(error) => this.report(format!("Task lỗi: {error}")),
@@ -1961,6 +1973,37 @@ impl Browser {
                 match outcome {
                     Ok(Ok(())) => {
                         this.status = "Đã yêu cầu khôi phục, có thể mất vài giờ".into();
+                        this.load_inspection(reload, cx);
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn set_acl(&mut self, canned: &'static str, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let key = inspector.key.clone();
+        let reload = key.clone();
+
+        let setting = Tokio::spawn(cx, async move {
+            client.set_object_acl(&bucket, &key, canned).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = setting.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.status = "Đã đổi quyền truy cập".into();
                         this.load_inspection(reload, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error}")),
@@ -3365,6 +3408,60 @@ impl Browser {
                                 .child("Đã khôi phục, đọc được tạm thời")
                                 .into_any_element(),
                         })
+                    })
+                    .when_some(inspector.acl.clone(), |this, acl| {
+                        let public = acl.grants.iter().any(|grant| grant.public);
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_color(theme.text_faint).child("QUYỀN TRUY CẬP"))
+                                // Public is the one state worth colouring: it
+                                // means anyone on the internet can read this.
+                                .child(div().text_color(if public {
+                                    theme.danger
+                                } else {
+                                    theme.text
+                                }).child(SharedString::from(if public {
+                                    "Công khai".to_string()
+                                } else {
+                                    format!("Riêng tư ({})", acl.owner)
+                                })))
+                                .children(acl.grants.iter().map(|grant| {
+                                    div()
+                                        .text_color(if grant.public {
+                                            theme.danger
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(SharedString::from(format!(
+                                            "{} {}",
+                                            grant.grantee, grant.permission
+                                        )))
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .children(s3core::CANNED_ACLS.iter().map(
+                                            |(canned, label)| {
+                                                let canned = *canned;
+                                                action_button_dyn(
+                                                    SharedString::from(format!("acl-{canned}")),
+                                                    SharedString::from(*label),
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        this.set_acl(canned, cx)
+                                                    },
+                                                ))
+                                            },
+                                        )),
+                                ),
+                        )
                     })
                     .when(self.supports(|caps| caps.tagging), |this| this
                     .child(

@@ -16,7 +16,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
-    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective,
+    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, ObjectCannedAcl, Delete, GlacierJobParameters, MetadataDirective,
     ObjectIdentifier, RestoreRequest, ServerSideEncryption, StorageClass, Tag, Tagging, Tier,
 };
 use aws_sdk_s3::Client;
@@ -230,6 +230,45 @@ pub struct ObjectVersion {
     pub size: i64,
     pub modified_epoch: Option<i64>,
 }
+
+/// A present-but-blank field is as useless as an absent one, and S3-compatible
+/// providers differ on which they send.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.trim().is_empty())
+}
+
+/// Who can do what to an object, flattened out of the grant list.
+///
+/// The XML form nests a grantee inside each grant and repeats the owner in
+/// every one; nobody reading a permissions panel wants that shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectAcl {
+    /// Display name if the provider gives one, otherwise the canonical id.
+    pub owner: String,
+    pub grants: Vec<AclGrant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AclGrant {
+    /// `Mọi người`, `Người dùng đã xác thực`, a display name, or an id.
+    pub grantee: String,
+    /// READ, WRITE, FULL_CONTROL…
+    pub permission: String,
+    /// True for the two AWS predefined groups that make an object reachable by
+    /// anyone. Worth flagging: it is the difference between a private object
+    /// and one the whole internet can read.
+    pub public: bool,
+}
+
+/// The canned ACLs worth offering. The full grant syntax exists, but hand-built
+/// grants are how buckets end up accidentally world-readable — a short list of
+/// named intents is safer and covers what people actually want.
+pub const CANNED_ACLS: [(&str, &str); 4] = [
+    ("private", "Riêng tư"),
+    ("public-read", "Ai cũng đọc được"),
+    ("bucket-owner-read", "Chủ bucket đọc được"),
+    ("bucket-owner-full-control", "Chủ bucket toàn quyền"),
+];
 
 /// Result of moving a whole prefix. A partial move is a real outcome, not an
 /// error: whatever succeeded stays moved, so the caller has to be able to say
@@ -999,6 +1038,78 @@ impl S3Client {
             .send()
             .await
             .with_context(|| format!("Xoá version {version_id} của s3://{bucket}/{key} thất bại"))?;
+        Ok(())
+    }
+
+    pub async fn object_acl(&self, bucket: &str, key: &str) -> Result<ObjectAcl> {
+        let out = self
+            .inner
+            .get_object_acl()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("GetObjectAcl failed for s3://{bucket}/{key}"))?;
+
+        // Filtering empties, not just `None`: MinIO returns an owner whose
+        // display name is present and blank, so `.or(id)` never fired and the
+        // panel showed nothing at all.
+        let owner = out
+            .owner()
+            .and_then(|owner| {
+                non_empty(owner.display_name()).or_else(|| non_empty(owner.id()))
+            })
+            .unwrap_or("không rõ")
+            .to_string();
+
+        let grants = out
+            .grants()
+            .iter()
+            .filter_map(|grant| {
+                let grantee = grant.grantee()?;
+                let uri = grantee.uri().unwrap_or_default();
+                // The two predefined groups that make an object readable
+                // outside the account. Matching on the URI rather than a name
+                // because the name is absent for groups.
+                let public = uri.ends_with("/groups/global/AllUsers")
+                    || uri.ends_with("/groups/global/AuthenticatedUsers");
+
+                let name = if uri.ends_with("/groups/global/AllUsers") {
+                    "Mọi người".to_string()
+                } else if uri.ends_with("/groups/global/AuthenticatedUsers") {
+                    "Người dùng đã xác thực".to_string()
+                } else {
+                    non_empty(grantee.display_name())
+                        .or_else(|| non_empty(grantee.id()))
+                        .unwrap_or("không rõ")
+                        .to_string()
+                };
+
+                Some(AclGrant {
+                    grantee: name,
+                    permission: grant.permission()?.as_str().to_string(),
+                    public,
+                })
+            })
+            .collect();
+
+        Ok(ObjectAcl { owner, grants })
+    }
+
+    /// Applies a canned ACL.
+    ///
+    /// Fails with `AccessControlListNotSupported` on a bucket whose Object
+    /// Ownership is BucketOwnerEnforced — the default for buckets created since
+    /// 2023. Capability detection is what keeps the UI from offering this there.
+    pub async fn set_object_acl(&self, bucket: &str, key: &str, canned: &str) -> Result<()> {
+        self.inner
+            .put_object_acl()
+            .bucket(bucket)
+            .key(key)
+            .acl(ObjectCannedAcl::from(canned))
+            .send()
+            .await
+            .with_context(|| format!("PutObjectAcl failed for s3://{bucket}/{key}"))?;
         Ok(())
     }
 

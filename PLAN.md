@@ -315,8 +315,10 @@ tập trung. Làm khi có khách hàng thật yêu cầu, không làm trước.
 
 - **Mount S3 như ổ đĩa.** Cần FUSE/kernel extension trên macOS, ký riêng, và là
   một sản phẩm khác chứ không phải một tính năng.
-- **ACL editor.** AWS khuyến nghị tắt ACL từ 2023, bucket mới mặc định đã tắt.
-  Bucket policy ở M8 hữu ích hơn nhiều.
+- ~~**ACL editor**~~ — đã làm theo yêu cầu (19/08/2026). Nhận định cũ vẫn giữ:
+  AWS khuyến nghị tắt ACL từ 2023 và bucket mới mặc định đã tắt, nên bucket
+  policy ở M8 vẫn hữu ích hơn. Bù lại nó là ca dùng tốt cho M7: panel tự ẩn ở
+  bucket không bật ACL thay vì hiện ra rồi báo `AccessControlListNotSupported`.
 - **Scheduled sync** cho tới khi M9 chạy ổn định — lên lịch cho một thứ chưa
   đáng tin là nhân bản lỗi lên.
 

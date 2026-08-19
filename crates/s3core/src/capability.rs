@@ -41,6 +41,15 @@ pub struct Capabilities {
     pub tagging: Support,
     pub lifecycle: Support,
     pub object_lock: Support,
+    /// Whether ACLs can be *read*. Writing them is a separate permission that
+    /// no read-only probe can establish — MinIO answers `GetBucketAcl` and then
+    /// refuses `PutObjectAcl`. So this gates showing the panel, and a failed
+    /// write still has to be reported rather than assumed impossible.
+    ///
+    /// ACLs are off by default on buckets created since 2023 (Object Ownership
+    /// set to BucketOwnerEnforced), and some providers never had them. Both
+    /// answer `AccessControlListNotSupported`.
+    pub acl: Support,
 }
 
 /// Classifies the error from a probe.
@@ -54,7 +63,12 @@ fn classify(error: &str) -> Support {
     if error.contains("NoSuch") || error.contains("NotFound") {
         return Support::Yes;
     }
-    if error.contains("NotImplemented") || error.contains("MethodNotAllowed") {
+    if error.contains("NotImplemented")
+        || error.contains("MethodNotAllowed")
+        // What a bucket with Object Ownership set to BucketOwnerEnforced says,
+        // and what providers without ACLs say. Both mean the same to the UI.
+        || error.contains("AccessControlListNotSupported")
+    {
         return Support::No;
     }
     if error.contains("AccessDenied") || error.contains("Forbidden") {
@@ -99,6 +113,7 @@ impl S3Client {
             tagging: self.probe_tagging(bucket).await,
             lifecycle: self.probe_lifecycle(bucket).await,
             object_lock: self.probe_object_lock(bucket).await,
+            acl: self.probe_acl(bucket).await,
         }
     }
 
@@ -124,6 +139,13 @@ impl S3Client {
             .send()
             .await
         {
+            Ok(_) => Support::Yes,
+            Err(error) => classify(&format!("{error:?}")),
+        }
+    }
+
+    async fn probe_acl(&self, bucket: &str) -> Support {
+        match self.inner().get_bucket_acl().bucket(bucket).send().await {
             Ok(_) => Support::Yes,
             Err(error) => classify(&format!("{error:?}")),
         }
@@ -161,6 +183,9 @@ mod tests {
         // The provider does not have it: nobody can use it, grey it out.
         assert_eq!(classify("NotImplemented"), Support::No);
         assert_eq!(classify("MethodNotAllowed"), Support::No);
+        // A bucket with ACLs switched off answers this, and so does a provider
+        // that never had them; the control disappears either way.
+        assert_eq!(classify("AccessControlListNotSupported"), Support::No);
         assert!(!Support::No.is_usable());
 
         // The token may not ask: the feature may be fine, the fix is a wider
@@ -190,6 +215,7 @@ mod tests {
                 tagging: Support::No,
                 lifecycle: Support::Yes,
                 object_lock: Support::No,
+                acl: Support::No,
             },
         );
         assert_eq!(cache.get("a").unwrap().tagging, Support::No);

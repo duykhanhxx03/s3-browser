@@ -741,3 +741,52 @@ async fn assume_role_yields_working_temporary_credentials() {
         "a URL signed with temporary credentials must include the token: {signed}"
     );
 }
+
+#[tokio::test]
+async fn acl_reads_grants_and_flags_public_ones() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let key = "acl-tests/doc.txt";
+    client.put_object(bucket, key, b"acl".to_vec()).await.unwrap();
+
+    let caps = client.detect_capabilities(bucket).await;
+    if !caps.acl.is_usable() {
+        eprintln!("skipping: bucket này không bật ACL ({:?})", caps.acl);
+        client.delete_object(bucket, key).await.unwrap();
+        return;
+    }
+
+    // A fresh object is private: an owner, and no grant to a public group.
+    let acl = client.object_acl(bucket, key).await.unwrap();
+    assert!(!acl.owner.is_empty(), "owner should be reported");
+    assert!(
+        !acl.grants.iter().any(|grant| grant.public),
+        "a new object must not be world-readable: {acl:?}"
+    );
+
+    // Reading ACLs and writing them are separate permissions, and a provider
+    // can offer one without the other — MinIO answers GetBucketAcl but refuses
+    // PutObjectAcl. Say which case ran rather than passing silently either way.
+    if let Err(error) = client.set_object_acl(bucket, key, "public-read").await {
+        eprintln!("skipping the write path: server từ chối PutObjectAcl ({error})");
+        client.delete_object(bucket, key).await.unwrap();
+        return;
+    }
+
+    let acl = client.object_acl(bucket, key).await.unwrap();
+    // The whole point of the `public` flag: spotting this without the caller
+    // having to know the AWS group URIs by heart.
+    assert!(
+        acl.grants.iter().any(|grant| grant.public),
+        "public-read should show a public grant: {acl:?}"
+    );
+
+    // And back, so the flag tracks the change rather than latching.
+    client.set_object_acl(bucket, key, "private").await.unwrap();
+    let acl = client.object_acl(bucket, key).await.unwrap();
+    assert!(!acl.grants.iter().any(|grant| grant.public), "{acl:?}");
+
+    client.delete_object(bucket, key).await.unwrap();
+}
