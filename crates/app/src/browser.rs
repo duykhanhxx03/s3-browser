@@ -1669,8 +1669,14 @@ impl Browser {
             };
             // Skipped where ACLs are off, which is the default for buckets made
             // since 2023 — asking there is a request that can only fail.
+            // Kept only if it says something: a provider that stubs ACL reads
+            // would otherwise fill the panel with placeholders.
             let acl = if acl_supported {
-                client.object_acl(&bucket, &key).await.ok()
+                client
+                    .object_acl(&bucket, &key)
+                    .await
+                    .ok()
+                    .filter(|acl| acl.is_meaningful())
             } else {
                 None
             };

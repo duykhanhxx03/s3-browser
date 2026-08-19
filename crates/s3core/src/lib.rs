@@ -248,6 +248,24 @@ pub struct ObjectAcl {
     pub grants: Vec<AclGrant>,
 }
 
+/// What a provider returns when it answers ACL reads without implementing them.
+const UNKNOWN: &str = "không rõ";
+
+impl ObjectAcl {
+    /// Whether this says anything at all.
+    ///
+    /// MinIO answers `GetObjectAcl` successfully and returns a stub: no owner,
+    /// one grant whose grantee is unidentified. Then `PutObjectAcl` fails with
+    /// `NotImplemented`. A probe that only asks "did the read succeed?" calls
+    /// that support and shows a panel of placeholders whose every button fails.
+    ///
+    /// So the test is whether the answer carries information, not whether the
+    /// call returned — and it costs no extra request.
+    pub fn is_meaningful(&self) -> bool {
+        self.owner != UNKNOWN || self.grants.iter().any(|grant| grant.grantee != UNKNOWN)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclGrant {
     /// `Mọi người`, `Người dùng đã xác thực`, a display name, or an id.
@@ -1059,7 +1077,7 @@ impl S3Client {
             .and_then(|owner| {
                 non_empty(owner.display_name()).or_else(|| non_empty(owner.id()))
             })
-            .unwrap_or("không rõ")
+            .unwrap_or(UNKNOWN)
             .to_string();
 
         let grants = out
@@ -1081,7 +1099,7 @@ impl S3Client {
                 } else {
                     non_empty(grantee.display_name())
                         .or_else(|| non_empty(grantee.id()))
-                        .unwrap_or("không rõ")
+                        .unwrap_or(UNKNOWN)
                         .to_string()
                 };
 

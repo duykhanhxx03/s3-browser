@@ -758,8 +758,14 @@ async fn acl_reads_grants_and_flags_public_ones() {
         return;
     }
 
-    // A fresh object is private: an owner, and no grant to a public group.
     let acl = client.object_acl(bucket, key).await.unwrap();
+    if !acl.is_meaningful() {
+        // MinIO answers the read with a stub and then refuses the write. Saying
+        // so beats asserting against placeholder data.
+        eprintln!("skipping: server trả ACL rỗng nghĩa, không thực sự hỗ trợ ({acl:?})");
+        client.delete_object(bucket, key).await.unwrap();
+        return;
+    }
     assert!(!acl.owner.is_empty(), "owner should be reported");
     assert!(
         !acl.grants.iter().any(|grant| grant.public),
