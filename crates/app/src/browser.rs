@@ -70,6 +70,16 @@ pub struct Confirm {
     doomed: Vec<Entry>,
 }
 
+/// The share panel's state. Signing is a request, so the URL arrives after the
+/// panel opens.
+pub struct Share {
+    key: String,
+    url: Option<SharedString>,
+    /// Set when the profile signs with a session token, which caps how long any
+    /// URL can really last.
+    temporary_credentials: bool,
+}
+
 pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
@@ -112,6 +122,8 @@ pub struct Browser {
     orphans_open: bool,
 
     confirm: Option<Confirm>,
+    /// The share panel: which key it is for, and the URL once it exists.
+    share: Option<Share>,
     /// Whether the open bucket keeps versions, so a delete confirmation can say
     /// whether it removes data or only hides it. Refreshed when the bucket
     /// changes, not on every navigation within one.
@@ -190,6 +202,7 @@ impl Browser {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            share: None,
             bucket_versioned: false,
             ticking: false,
             connect_task: None,
@@ -263,6 +276,7 @@ impl Browser {
         for ImportedProfile {
             mut profile,
             secret_key,
+            session_token,
         } in imported
         {
             if self.profiles.iter().any(|p| p.name == profile.name) {
@@ -271,6 +285,11 @@ impl Browser {
             profile.id = vault::new_profile_id(&profile.name, &self.profiles);
             if let Err(error) = vault::set_secret_key(&profile.id, &secret_key) {
                 self.error = Some(format!("Không lưu được khoá cho {}: {error}", profile.name).into());
+                continue;
+            }
+            // An STS/SSO profile without its token authenticates nowhere.
+            if let Err(error) = vault::set_session_token(&profile.id, session_token.as_deref()) {
+                self.error = Some(format!("Không lưu được session token cho {}: {error}", profile.name).into());
                 continue;
             }
             self.profiles.push(profile);
@@ -315,6 +334,7 @@ impl Browser {
             path_style: stored.path_style,
             access_key: stored.access_key.clone(),
             secret_key: secret,
+            session_token: vault::session_token(&stored.id),
             relaxed_checksums: stored.relaxed_checksums,
         };
 
@@ -774,6 +794,99 @@ impl Browser {
         });
         self.op_task = Some(task);
         cx.notify();
+    }
+
+    /// Opens the share panel for the one selected object. Folders are excluded:
+    /// a prefix is not a thing that can be signed.
+    fn start_share(&mut self, cx: &mut Context<Self>) {
+        let mut selected = self.selection.iter();
+        let (Some(key), None) = (selected.next(), selected.next()) else {
+            return;
+        };
+        if key.ends_with('/') {
+            self.report("Không tạo được link cho thư mục".into());
+            return;
+        }
+
+        let temporary_credentials = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .is_some_and(|stored| vault::session_token(&stored.id).is_some());
+
+        self.share = Some(Share {
+            key: key.clone(),
+            url: None,
+            temporary_credentials,
+        });
+        self.presign(PRESIGN_PRESETS[0].1, cx);
+        cx.notify();
+    }
+
+    fn presign(&mut self, expires: Duration, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(share)) =
+            (self.client.clone(), self.bucket.clone(), self.share.as_ref())
+        else {
+            return;
+        };
+        // Never sign for longer than the credentials can actually honour.
+        let capped = expires.min(s3core::presign_limit_for(share.temporary_credentials));
+        let key = share.key.clone();
+
+        let signing = Tokio::spawn(cx, async move {
+            client.presign_get(&bucket, &key, capped).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = signing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(url)) => {
+                        if let Some(share) = this.share.as_mut() {
+                            share.url = Some(url.into());
+                        }
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn copy_to_clipboard(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = format!("Đã chép {what}").into();
+        cx.notify();
+    }
+
+    /// The unsigned URL. Only useful when the object is public, which the app
+    /// cannot know without reading the bucket policy — so the panel says so
+    /// rather than implying the link works for anyone.
+    fn copy_public_url(&mut self, cx: &mut Context<Self>) {
+        let (Some(bucket), Some(share)) = (self.bucket.clone(), self.share.as_ref()) else {
+            return;
+        };
+        let Some(profile) = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .cloned()
+        else {
+            return;
+        };
+
+        let profile = Profile {
+            name: profile.name,
+            endpoint: profile.endpoint,
+            region: profile.region,
+            path_style: profile.path_style,
+            access_key: profile.access_key,
+            // Only the addressing style matters here; nothing is signed.
+            secret_key: String::new(),
+            session_token: None,
+            relaxed_checksums: profile.relaxed_checksums,
+        };
+        let url = s3core::public_url(&profile, &bucket, &share.key);
+        self.copy_to_clipboard(url, "URL công khai", cx);
     }
 
     /// Opens the rename prompt, but only for a single entry: renaming several
@@ -1300,6 +1413,11 @@ impl Browser {
                         |this, _event, _window, cx| this.start_rename(cx),
                     )),
                 )
+                .child(
+                    action_button("share", "Chia sẻ", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.start_share(cx),
+                    )),
+                )
             })
             .when(!self.selection.is_empty(), |this| {
                 let count = self.selection.len();
@@ -1567,6 +1685,122 @@ impl Browser {
                     .flex_1()
                     .into_any_element()
                 }),
+        )
+    }
+
+    fn render_share(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let share = self.share.as_ref()?;
+        let theme = self.theme;
+        let name = entry_name_of(&share.key);
+
+        Some(
+            div()
+                .id("share-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.share = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("share-dialog")
+                        .w(px(460.))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .text_color(theme.text)
+                                .child(SharedString::from(format!("Chia sẻ {name}"))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .children(PRESIGN_PRESETS.iter().map(|(label, expires)| {
+                                    let expires = *expires;
+                                    action_button_dyn(
+                                        SharedString::from(format!("presign-{label}")),
+                                        SharedString::from(*label),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.presign(expires, cx)
+                                    }))
+                                })),
+                        )
+                        // The credential warning is the whole point of the panel:
+                        // a link that dies with the session looks identical to one
+                        // that lasts a week.
+                        .when(share.temporary_credentials, |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.danger)
+                                    .child(
+                                        "Profile này dùng credential tạm thời (STS/SSO): link sẽ chết khi session hết hạn, dù chọn thời hạn dài hơn.",
+                                    ),
+                            )
+                        })
+                        .child(match &share.url {
+                            Some(url) => div()
+                                .id("share-url")
+                                .p_2()
+                                .rounded_md()
+                                .bg(theme.hover)
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child(url.clone())
+                                .into_any_element(),
+                            None => div()
+                                .text_xs()
+                                .text_color(theme.text_faint)
+                                .child("Đang ký…")
+                                .into_any_element(),
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    action_button("copy-public", "Chép URL công khai", theme)
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.copy_public_url(cx)
+                                        })),
+                                )
+                                .when_some(share.url.clone(), |this, url| {
+                                    this.child(
+                                        action_button("copy-signed", "Chép link", theme).on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.copy_to_clipboard(
+                                                    url.to_string(),
+                                                    "link",
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(action_button("share-close", "Đóng", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.share = None;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                ),
         )
     }
 
@@ -1927,6 +2161,7 @@ impl Render for Browser {
             .children(self.render_orphans(cx))
             .child(self.render_status(cx))
             .children(self.render_confirm(cx))
+            .children(self.render_share(cx))
     }
 }
 
@@ -1971,6 +2206,24 @@ fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::S
         .bg(theme.hover)
         .text_color(theme.text)
         .hover(|this| this.bg(theme.selected))
+        .child(label)
+}
+
+/// `action_button` for labels that come from data rather than a literal.
+fn action_button_dyn(
+    id: SharedString,
+    label: SharedString,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .text_xs()
+        .text_color(theme.text)
+        .bg(theme.hover)
+        .hover(|style| style.bg(theme.selected))
         .child(label)
 }
 
@@ -2092,6 +2345,15 @@ fn next_bandwidth_limit(current: u64) -> u64 {
         None => BANDWIDTH_PRESETS[0],
     }
 }
+
+/// Expiry choices for a presigned URL. Capped per-credential-type at sign time,
+/// so a temporary-credential profile silently gets the shorter of the two.
+const PRESIGN_PRESETS: [(&str, Duration); 4] = [
+    ("1 giờ", Duration::from_secs(3600)),
+    ("24 giờ", Duration::from_secs(24 * 3600)),
+    ("7 ngày", Duration::from_secs(7 * 24 * 3600)),
+    ("15 phút", Duration::from_secs(900)),
+];
 
 /// Headline for the delete dialog. Names the single victim when there is one,
 /// because "Xoá 1 mục" tells the user nothing about what they are about to lose.
@@ -2291,6 +2553,7 @@ mod tests {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            share: None,
             bucket_versioned: false,
             ticking: false,
             connect_task: None,

@@ -8,6 +8,8 @@
 //! Tests skip themselves when nothing is listening, so `cargo test` stays green
 //! on a machine without Docker.
 
+use std::time::Duration;
+
 use s3core::{Profile, S3Client};
 
 /// Returns a client only when MinIO is reachable *and* seeded. Three outcomes
@@ -338,4 +340,89 @@ async fn refuses_to_move_a_prefix_into_itself() {
         .await
         .expect_err("moving a prefix inside itself must be refused");
     assert!(error.to_string().contains("chính nó"), "{error}");
+}
+
+/// Fetches a URL with a raw HTTP/1.1 GET. Enough to prove a presigned URL works
+/// without credentials, and avoids pulling an HTTP client in just for one test.
+fn http_get(url: &str) -> (u16, Vec<u8>) {
+    use std::io::{Read, Write};
+
+    let rest = url.strip_prefix("http://").expect("presigned URL over http");
+    let (authority, path) = rest.split_once('/').expect("URL has a path");
+    let path = format!("/{path}");
+
+    let mut stream = std::net::TcpStream::connect(authority).expect("connect to MinIO");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+
+    let head_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response has a header block");
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+
+    (status, raw[head_end + 4..].to_vec())
+}
+
+#[tokio::test]
+async fn presigned_url_downloads_without_credentials() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let key = "presign-tests/secret.txt";
+    let body = b"only reachable with a signature".to_vec();
+    client.put_object(bucket, key, body.clone()).await.unwrap();
+
+    // Unsigned, the object must not be readable — otherwise this test would
+    // pass even if signing were broken.
+    let public = s3core::public_url(&Profile::minio_local(), bucket, key);
+    let (status, _) = http_get(&public);
+    assert_eq!(status, 403, "the fixture bucket must not be public");
+
+    let signed = client
+        .presign_get(bucket, key, Duration::from_secs(300))
+        .await
+        .unwrap();
+    let (status, fetched) = http_get(&signed);
+    assert_eq!(status, 200, "presigned URL should serve the object");
+    assert_eq!(fetched, body, "presigned URL returned different bytes");
+
+    client.delete_object(bucket, key).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_expired_signature_is_refused() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let key = "presign-tests/short-lived.txt";
+    client
+        .put_object(bucket, key, b"blink".to_vec())
+        .await
+        .unwrap();
+
+    // One second, then wait it out: proves the expiry is real and not decorative.
+    let signed = client
+        .presign_get(bucket, key, Duration::from_secs(1))
+        .await
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+
+    let (status, _) = http_get(&signed);
+    assert_eq!(status, 403, "an expired signature must stop working");
+
+    client.delete_object(bucket, key).await.unwrap();
 }

@@ -19,6 +19,9 @@ use crate::StoredProfile;
 pub struct ImportedProfile {
     pub profile: StoredProfile,
     pub secret_key: String,
+    /// Present for profiles derived from STS or SSO. Dropping it would leave the
+    /// credentials incomplete and every request failing on a signature error.
+    pub session_token: Option<String>,
 }
 
 /// Reads `~/.aws/credentials` and `~/.aws/config`, honouring the standard
@@ -88,6 +91,7 @@ pub fn parse_aws_files(credentials: &str, config: &str) -> Vec<ImportedProfile> 
         .with_provider_defaults();
 
         imported.push(ImportedProfile {
+            session_token: settings.get("aws_session_token").cloned(),
             profile,
             secret_key: secret_key.clone(),
         });

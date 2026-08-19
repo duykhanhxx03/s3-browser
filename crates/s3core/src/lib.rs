@@ -10,6 +10,7 @@ use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, Delete, MetadataDirective, ObjectIdentifier, StorageClass,
 };
@@ -30,6 +31,10 @@ pub struct Profile {
     pub path_style: bool,
     pub access_key: String,
     pub secret_key: String,
+    /// Set for STS/SSO-derived credentials. Its presence is what makes a
+    /// presigned URL outlive-able: the URL dies with the session regardless of
+    /// the expiry asked for.
+    pub session_token: Option<String>,
     /// aws-sdk-s3 >= 1.69 sends CRC32 checksum headers by default, which several
     /// S3-compatible providers reject. Relaxing them to "when required" is the
     /// documented workaround, so it defaults on for anything that isn't AWS.
@@ -46,6 +51,7 @@ impl Profile {
             path_style: true,
             access_key: "minioadmin".into(),
             secret_key: "minioadmin".into(),
+            session_token: None,
             relaxed_checksums: true,
         }
     }
@@ -184,7 +190,7 @@ impl S3Client {
         let creds = Credentials::new(
             profile.access_key.clone(),
             profile.secret_key.clone(),
-            None,
+            profile.session_token.clone(),
             None,
             "s3browser-profile",
         );
@@ -622,6 +628,29 @@ impl S3Client {
             .collect())
     }
 
+    /// A time-limited URL anyone can GET without credentials.
+    ///
+    /// SigV4 caps a presigned URL at 7 days, and temporary credentials cap it
+    /// far lower — the URL stops working the moment the session behind it ends,
+    /// whatever expiry was requested. `presign_limit_for` works out the honest
+    /// ceiling; this method clamps to it rather than handing back a URL that
+    /// claims a week and dies in an hour.
+    pub async fn presign_get(&self, bucket: &str, key: &str, expires: Duration) -> Result<String> {
+        let config = PresigningConfig::expires_in(expires)
+            .context("thời hạn presigned URL không hợp lệ")?;
+
+        let request = self
+            .inner
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(config)
+            .await
+            .with_context(|| format!("Presign failed for s3://{bucket}/{key}"))?;
+
+        Ok(request.uri().to_string())
+    }
+
     /// Whether the bucket keeps versions. Deleting in a versioned bucket writes
     /// a delete marker instead of removing data, which is a different promise to
     /// make to someone about to confirm a delete.
@@ -917,6 +946,48 @@ impl S3Client {
     }
 }
 
+/// SigV4's hard ceiling for a presigned URL.
+pub const PRESIGN_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The longest expiry worth offering. Temporary credentials make a longer URL a
+/// promise that cannot be kept: it stops working when the session ends, so the
+/// UI should say so instead of handing over a link that quietly dies.
+pub fn presign_limit_for(temporary_credentials: bool) -> Duration {
+    if temporary_credentials {
+        // An STS session is typically an hour and rarely more than twelve, so
+        // offering a week would be theatre.
+        Duration::from_secs(60 * 60)
+    } else {
+        PRESIGN_MAX
+    }
+}
+
+/// The plain, unsigned URL of an object — useful only when the object is public.
+/// Path-style for providers that need it, virtual-hosted otherwise, matching how
+/// the client itself addresses the bucket.
+pub fn public_url(profile: &Profile, bucket: &str, key: &str) -> String {
+    let encoded = encode_copy_source("", key).trim_start_matches('/').to_string();
+
+    match &profile.endpoint {
+        Some(endpoint) => {
+            let base = endpoint.trim_end_matches('/');
+            if profile.path_style {
+                format!("{base}/{bucket}/{encoded}")
+            } else {
+                match base.split_once("://") {
+                    Some((scheme, host)) => format!("{scheme}://{bucket}.{host}/{encoded}"),
+                    None => format!("{base}/{bucket}/{encoded}"),
+                }
+            }
+        }
+        // Real AWS: virtual-hosted style, region in the host.
+        None => format!(
+            "https://{bucket}.s3.{}.amazonaws.com/{encoded}",
+            profile.region
+        ),
+    }
+}
+
 /// CopyObject refuses anything larger; past this a copy has to go through
 /// UploadPartCopy instead.
 pub const COPY_OBJECT_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
@@ -1010,6 +1081,68 @@ mod tests {
             modified_epoch: modified,
             storage_class: None,
         }
+    }
+
+    fn profile_for(endpoint: Option<&str>, path_style: bool) -> Profile {
+        Profile {
+            name: "t".into(),
+            endpoint: endpoint.map(str::to_owned),
+            region: "ap-southeast-1".into(),
+            path_style,
+            access_key: "a".into(),
+            secret_key: "s".into(),
+            session_token: None,
+            relaxed_checksums: false,
+        }
+    }
+
+    #[test]
+    fn presign_ceiling_shrinks_for_temporary_credentials() {
+        // Long-lived keys can genuinely sign a week.
+        assert_eq!(presign_limit_for(false), PRESIGN_MAX);
+
+        // A session-backed URL dies with the session, so promising a week would
+        // be a promise the app cannot keep.
+        let temporary = presign_limit_for(true);
+        assert!(temporary < PRESIGN_MAX);
+        assert_eq!(temporary, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn public_url_matches_how_the_bucket_is_addressed() {
+        // Real AWS: virtual-hosted, region in the host.
+        assert_eq!(
+            public_url(&profile_for(None, false), "my-bucket", "a/b.txt"),
+            "https://my-bucket.s3.ap-southeast-1.amazonaws.com/a/b.txt"
+        );
+
+        // MinIO and friends: path-style keeps the bucket in the path.
+        assert_eq!(
+            public_url(
+                &profile_for(Some("http://127.0.0.1:9000"), true),
+                "demo",
+                "a/b.txt"
+            ),
+            "http://127.0.0.1:9000/demo/a/b.txt"
+        );
+
+        // A custom endpoint that does virtual-hosted addressing.
+        assert_eq!(
+            public_url(&profile_for(Some("https://s3.example.com"), false), "b", "k.txt"),
+            "https://b.s3.example.com/k.txt"
+        );
+
+        // A key needing encoding must not produce a URL that points elsewhere.
+        assert_eq!(
+            public_url(&profile_for(Some("http://h:9000"), true), "b", "a file?.txt"),
+            "http://h:9000/b/a%20file%3F.txt"
+        );
+
+        // A trailing slash on the endpoint must not double up.
+        assert_eq!(
+            public_url(&profile_for(Some("http://h:9000/"), true), "b", "k"),
+            "http://h:9000/b/k"
+        );
     }
 
     #[test]

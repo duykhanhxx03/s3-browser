@@ -121,11 +121,40 @@ pub fn set_secret_key(profile_id: &str, secret: &str) -> Result<()> {
 }
 
 pub fn delete_secret_key(profile_id: &str) -> Result<()> {
+    // A deleted profile must not leave its token behind in the keychain.
+    _ = set_session_token(profile_id, None);
     match entry(profile_id)?.delete_credential() {
         Ok(()) => Ok(()),
         // Deleting a profile that never had a secret stored is not an error.
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(error).with_context(|| format!("deleting secret for {profile_id}")),
+    }
+}
+
+/// Session tokens live under their own keyring entry rather than being packed
+/// in with the secret: existing stored secrets stay readable as-is, and a
+/// profile that has no token simply has no entry.
+fn token_id(profile_id: &str) -> String {
+    format!("{profile_id}#session-token")
+}
+
+/// `None` when the profile uses long-lived keys, which is the common case.
+pub fn session_token(profile_id: &str) -> Option<String> {
+    entry(&token_id(profile_id)).ok()?.get_password().ok()
+}
+
+pub fn set_session_token(profile_id: &str, token: Option<&str>) -> Result<()> {
+    let entry = entry(&token_id(profile_id))?;
+    match token {
+        Some(token) => entry
+            .set_password(token)
+            .with_context(|| format!("storing session token for profile {profile_id}")),
+        None => match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("clearing session token for {profile_id}"))
+            }
+        },
     }
 }
 
