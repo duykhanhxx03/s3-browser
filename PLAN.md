@@ -277,7 +277,7 @@ Bốn thứ này nằm ở P0 trong tài liệu mà chưa có. Một trong số 
 4. **Copy/duplicate trong UI.** `copy_object` đã có và đã test (kể cả đường
    multipart >5 GB), chỉ thiếu lệnh trong giao diện.
 
-### M7 — Capability detection
+### M7 — Capability detection ✅ **XONG (19/08/2026)**
 
 Tài liệu gọi đây là **kiến trúc lõi chứ không phải checkbox marketing**, và
 phiên vừa rồi chứng minh điều đó: token R2 phạm vi một bucket bị `AccessDenied`

@@ -15,6 +15,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
+    capability::{Capabilities, CapabilityCache, Support},
     Encryption, ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
@@ -329,7 +330,14 @@ pub struct Browser {
     /// Whether the open bucket keeps versions, so a delete confirmation can say
     /// whether it removes data or only hides it. Refreshed when the bucket
     /// changes, not on every navigation within one.
+    ///
+    /// Distinct from the capability below: this is whether versioning is turned
+    /// on, that is whether the provider implements it at all.
     bucket_versioned: bool,
+    /// What the provider can do with the open bucket, so the UI can leave out
+    /// what it cannot rather than offering a button that returns 501.
+    capabilities: Option<Capabilities>,
+    caps_cache: CapabilityCache,
     /// True while a repaint loop is running to animate transfer progress.
     ticking: bool,
 
@@ -339,6 +347,9 @@ pub struct Browser {
     listing_task: Option<Task<()>>,
     paging_task: Option<Task<()>>,
     op_task: Option<Task<()>>,
+    /// Capability probing gets its own slot: it runs alongside whatever the user
+    /// is doing, and sharing `op_task` meant opening the inspector cancelled it.
+    caps_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
 }
@@ -412,11 +423,14 @@ impl Browser {
             share: None,
             inspector: None,
             bucket_versioned: false,
+            capabilities: None,
+            caps_cache: CapabilityCache::default(),
             ticking: false,
             connect_task: None,
             listing_task: None,
             paging_task: None,
             op_task: None,
+            caps_task: None,
             tick_task: None,
             _appearance: Some(appearance),
         };
@@ -839,18 +853,47 @@ impl Browser {
         self.op_task = Some(task);
     }
 
+    /// Learns what this bucket supports, and whether versioning is switched on.
+    ///
+    /// Cached per bucket: four probes is a real cost to pay once, and an absurd
+    /// one to pay on every navigation inside the same bucket.
     fn refresh_versioning(&mut self, bucket: SharedString, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let checking = Tokio::spawn(cx, async move { client.bucket_is_versioned(&bucket).await });
-        self.op_task = Some(cx.spawn(async move |this, cx| {
-            let versioned = checking.await.unwrap_or(false);
+        let cached = self.caps_cache.get(&bucket);
+        self.capabilities = cached;
+
+        let checking = Tokio::spawn(cx, async move {
+            let versioned = client.bucket_is_versioned(&bucket).await;
+            let capabilities = match cached {
+                Some(capabilities) => capabilities,
+                None => client.detect_capabilities(&bucket).await,
+            };
+            (bucket, versioned, capabilities)
+        });
+
+        self.caps_task = Some(cx.spawn(async move |this, cx| {
+            let Ok((bucket, versioned, capabilities)) = checking.await else {
+                return;
+            };
             _ = this.update(cx, |this, cx| {
                 this.bucket_versioned = versioned;
+                this.capabilities = Some(capabilities);
+                this.caps_cache.insert(&bucket, capabilities);
                 cx.notify();
             });
         }));
+    }
+
+    /// Whether a feature is worth showing. Unknown counts as yes: probing has
+    /// not finished, and hiding a working feature for a moment is worse than
+    /// showing one that turns out to be unavailable.
+    fn supports(&self, pick: fn(&Capabilities) -> Support) -> bool {
+        self.capabilities
+            .as_ref()
+            .map(|caps| pick(caps).is_usable())
+            .unwrap_or(true)
     }
 
     /// Asks before deleting. Everything here is irreversible in a way the user
@@ -3323,6 +3366,7 @@ impl Browser {
                                 .into_any_element(),
                         })
                     })
+                    .when(self.supports(|caps| caps.tagging), |this| this
                     .child(
                         div()
                             .flex()
@@ -3376,7 +3420,7 @@ impl Browser {
                                     div().text_color(theme.text_faint).child("Chưa có thẻ nào"),
                                 )
                             }),
-                    )
+                    ))
                     .child(
                         div()
                             .flex()
@@ -3417,7 +3461,10 @@ impl Browser {
                             .child("Không xem trước được kiểu này")
                             .into_any_element(),
                     }))
-                    .when(!inspector.versions.is_empty(), |this| {
+                    .when(
+                        !inspector.versions.is_empty()
+                            && self.supports(|caps| caps.versioning),
+                        |this| {
                         this.child(
                             div()
                                 .flex()
@@ -5408,11 +5455,14 @@ mod tests {
             share: None,
             inspector: None,
             bucket_versioned: false,
+            capabilities: None,
+            caps_cache: CapabilityCache::default(),
             ticking: false,
             connect_task: None,
             listing_task: None,
             paging_task: None,
             op_task: None,
+            caps_task: None,
             tick_task: None,
             _appearance: None,
         };
