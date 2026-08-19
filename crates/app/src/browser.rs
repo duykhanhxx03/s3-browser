@@ -84,6 +84,9 @@ pub enum FormKind {
     /// Carries the key, so a rename still targets the right object if the
     /// selection changes while the dialog is open.
     Rename(String),
+    /// Duplicating the selected object; carries its key for the same reason as
+    /// `Rename`.
+    Duplicate(String),
     OpenBucket,
     AddTag,
     KmsKey,
@@ -98,6 +101,7 @@ impl FormKind {
             FormKind::NewFolder => "Thư mục mới",
             FormKind::NewBucket => "Bucket mới",
             FormKind::Rename(_) => "Đổi tên",
+            FormKind::Duplicate(_) => "Sao chép",
             FormKind::OpenBucket => "Mở bucket",
             FormKind::AddTag => "Thẻ mới",
             FormKind::KmsKey => "Mã hoá KMS",
@@ -120,6 +124,7 @@ impl FormKind {
             FormKind::NewFolder => vec![("Tên", "", false)],
             FormKind::NewBucket => vec![("Tên", "", false)],
             FormKind::Rename(_) => vec![("Tên mới", "", false)],
+            FormKind::Duplicate(_) => vec![("Tên bản sao", "", false)],
             FormKind::OpenBucket => vec![("Bucket", "", false)],
             FormKind::AddTag => vec![("Khoá", "", false), ("Giá trị", "", false)],
             FormKind::KmsKey => vec![("Key id", "", false)],
@@ -1141,6 +1146,10 @@ impl Browser {
                 self.form = None;
                 self.rename_entry(key, first, cx);
             }
+            FormKind::Duplicate(key) => {
+                self.form = None;
+                self.duplicate_entry(key, first, cx);
+            }
             FormKind::OpenBucket => {
                 self.form = None;
                 let bucket = SharedString::from(first);
@@ -1325,6 +1334,11 @@ impl Browser {
             Command::Rename => {
                 if let Some(window) = window {
                     self.start_rename(window, cx);
+                }
+            }
+            Command::Duplicate => {
+                if let Some(window) = window {
+                    self.start_duplicate(window, cx);
                 }
             }
             Command::Share => self.start_share(cx),
@@ -2093,6 +2107,65 @@ impl Browser {
         };
         let key = key.clone();
         self.open_form(FormKind::Rename(key), window, cx);
+    }
+
+    /// Copies one object beside itself under a new name. Server-side, so a
+    /// multi-gigabyte object never travels through this machine.
+    fn duplicate_entry(&mut self, key: String, new_name: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let Some(target) = renamed_key(&key, &new_name) else {
+            self.report("Tên không hợp lệ".into());
+            return;
+        };
+        if target == key {
+            self.report("Tên bản sao phải khác tên gốc".into());
+            return;
+        }
+
+        let bucket_name = bucket.to_string();
+        let source = key.clone();
+        let destination = target.clone();
+        self.status = format!("Đang sao chép {}…", entry_name_of(&key)).into();
+
+        let copying = Tokio::spawn(cx, async move {
+            client
+                .copy_object(&bucket_name, &source, &bucket_name, &destination)
+                .await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = copying.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => this.status = format!("Đã sao chép thành {new_name}").into(),
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
+                    this.open(bucket, prefix, cx);
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Opens the duplicate dialog for the one selected object. Folders are
+    /// excluded: copying a prefix is N copies, which belongs in the transfer
+    /// queue rather than behind a dialog that looks instant.
+    fn start_duplicate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut selected = self.selection.iter();
+        let (Some(key), None) = (selected.next(), selected.next()) else {
+            return;
+        };
+        if key.ends_with('/') {
+            self.report("Chưa hỗ trợ sao chép thư mục".into());
+            return;
+        }
+        let key = key.clone();
+        self.open_form(FormKind::Duplicate(key), window, cx);
     }
 
     /// Renames one entry. A folder is a prefix, so renaming it moves every key
@@ -2987,7 +3060,11 @@ impl Browser {
         let stats = self.transfers.stats();
         let queue_label = if stats.active + stats.queued > 0 {
             let speed = if stats.bytes_per_second > 0 {
-                format!("  {}/s", format_size(stats.bytes_per_second as i64))
+                let eta = stats
+                    .seconds_remaining()
+                    .map(|secs| format!("  còn {}", format_duration(secs)))
+                    .unwrap_or_default();
+                format!("  {}/s{eta}", format_size(stats.bytes_per_second as i64))
             } else {
                 String::new()
             };
@@ -4456,6 +4533,17 @@ fn detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElem
         )
 }
 
+/// A duration in the coarsest unit that still says something useful. Seconds
+/// past an hour are noise, and "3600 giây" makes the reader do the arithmetic.
+fn format_duration(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s} giây"),
+        s if s < 3600 => format!("{} phút", s / 60),
+        s if s < 86_400 => format!("{} giờ {} phút", s / 3600, (s % 3600) / 60),
+        s => format!("{} ngày", s / 86_400),
+    }
+}
+
 /// Shortens an opaque token so it stays on one line.
 ///
 /// An ETag or key id has no word boundaries, so letting it wrap splits a hex
@@ -4938,6 +5026,7 @@ pub enum Command {
     NewFolder,
     NewBucket,
     Rename,
+    Duplicate,
     Share,
     Inspect,
     Preview,
@@ -4963,6 +5052,7 @@ impl Command {
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
+            Command::Duplicate => ("Sao chép", ""),
             Command::Share => ("Chia sẻ / presigned URL", ""),
             Command::Inspect => ("Chi tiết", "⌘I"),
             Command::Preview => ("Xem trước", "Space"),
@@ -4978,7 +5068,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 18] {
+    fn all() -> [Command; 19] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -4986,6 +5076,7 @@ impl Command {
             Command::NewFolder,
             Command::NewBucket,
             Command::Rename,
+            Command::Duplicate,
             Command::Share,
             Command::Inspect,
             Command::Preview,
@@ -5383,6 +5474,20 @@ mod tests {
     }
 
     #[test]
+    fn durations_use_the_coarsest_unit_that_still_informs() {
+        assert_eq!(format_duration(0), "0 giây");
+        assert_eq!(format_duration(45), "45 giây");
+        // Past a minute the seconds are noise.
+        assert_eq!(format_duration(60), "1 phút");
+        assert_eq!(format_duration(3_599), "59 phút");
+        // Past an hour, minutes still matter but seconds do not.
+        assert_eq!(format_duration(3_600), "1 giờ 0 phút");
+        assert_eq!(format_duration(7_380), "2 giờ 3 phút");
+        // A transfer measured in days does not need the hours.
+        assert_eq!(format_duration(90_000), "1 ngày");
+    }
+
+    #[test]
     fn opaque_tokens_are_elided_not_wrapped() {
         let etag = "529e9abf98dd6f2d15f4f69461565329";
         let short = elide_middle(etag, 28);
@@ -5573,7 +5678,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), 19);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

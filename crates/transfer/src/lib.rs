@@ -149,6 +149,24 @@ pub struct Stats {
     pub failed: usize,
     pub done: usize,
     pub bytes_per_second: u64,
+    /// Bytes still to move across every unfinished job, so a caller can work
+    /// out a time remaining without walking the queue again.
+    pub bytes_remaining: u64,
+}
+
+impl Stats {
+    /// Seconds until the queue drains at the current rate, or `None` when that
+    /// cannot be answered: nothing moving, or nothing left to move.
+    ///
+    /// The rate is a short rolling average, so this jumps around early in a
+    /// transfer. That is honest — an estimate from two seconds of data is not
+    /// worth presenting as precise.
+    pub fn seconds_remaining(&self) -> Option<u64> {
+        if self.bytes_per_second == 0 || self.bytes_remaining == 0 {
+            return None;
+        }
+        Some(self.bytes_remaining / self.bytes_per_second)
+    }
 }
 
 /// Signals a running worker to stop between parts. Checked often enough that a
@@ -271,6 +289,11 @@ impl TransferEngine {
             }
             if job.state != JobState::Done {
                 moved += job.transferred;
+            }
+            // Only work that is actually going to happen: a paused or cancelled
+            // job would otherwise inflate the estimate forever.
+            if matches!(job.state, JobState::Running | JobState::Queued) {
+                stats.bytes_remaining += job.size.saturating_sub(job.transferred);
             }
         }
 
@@ -640,6 +663,26 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eta_is_none_when_it_cannot_be_answered() {
+        let mut stats = Stats {
+            bytes_per_second: 1_000_000,
+            bytes_remaining: 5_000_000,
+            ..Default::default()
+        };
+        assert_eq!(stats.seconds_remaining(), Some(5));
+
+        // Nothing moving: an estimate from a zero rate is a division by zero,
+        // and "∞ remaining" tells the user nothing.
+        stats.bytes_per_second = 0;
+        assert_eq!(stats.seconds_remaining(), None);
+
+        // Nothing left: the queue is done, not "0 seconds away".
+        stats.bytes_per_second = 1_000_000;
+        stats.bytes_remaining = 0;
+        assert_eq!(stats.seconds_remaining(), None);
+    }
 
     #[test]
     fn safe_join_refuses_anything_that_escapes_the_directory() {
