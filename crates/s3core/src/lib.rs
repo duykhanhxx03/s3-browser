@@ -3,6 +3,8 @@
 //! Everything here is plain async Rust with no GPUI types, so it can be unit
 //! tested without a window and reused by a future CLI.
 
+pub mod sts;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};

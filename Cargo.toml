@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 
 aws-config = { version = "1", features = ["behavior-version-latest", "sso"] }
 aws-sdk-s3 = "1"
+aws-sdk-sts = "1"
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 
 [profile.dev]

@@ -52,6 +52,8 @@ pub enum Prompt {
     AddTag,
     /// The KMS key id to encrypt uploads with.
     KmsKey,
+    /// Role ARN to assume, optionally followed by an MFA code.
+    AssumeRole,
 }
 
 impl Prompt {
@@ -63,6 +65,7 @@ impl Prompt {
             Prompt::Rename(_) => "Tên mới",
             Prompt::AddTag => "Thẻ mới (khoá=giá trị)",
             Prompt::KmsKey => "KMS key id",
+            Prompt::AssumeRole => "Role ARN (thêm ' mfa:<serial> <mã>' nếu cần)",
         }
     }
 }
@@ -690,6 +693,84 @@ impl Browser {
         cx.notify();
     }
 
+    /// Swaps the session for one under an assumed role. The base profile keeps
+    /// its long-lived keys — the temporary credentials live only in this
+    /// session, so quitting the app is enough to drop them.
+    fn assume_role(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(stored) = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(request) = parse_assume_role(&text) else {
+            self.report("Cần role ARN, ví dụ: arn:aws:iam::123:role/tên".into());
+            return;
+        };
+
+        let secret = match vault::secret_key(&stored.id) {
+            Ok(secret) => secret,
+            Err(error) => {
+                self.report(format!("Không đọc được khoá bí mật: {error}"));
+                return;
+            }
+        };
+
+        let base = Profile {
+            name: stored.name.clone(),
+            endpoint: stored.endpoint.clone(),
+            region: stored.region.clone(),
+            path_style: stored.path_style,
+            access_key: stored.access_key.clone(),
+            secret_key: secret,
+            session_token: vault::session_token(&stored.id),
+            relaxed_checksums: stored.relaxed_checksums,
+        };
+
+        self.status = format!("Đang nhận role {}…", request.role_arn).into();
+
+        let assuming = Tokio::spawn(cx, async move {
+            let credentials = s3core::sts::assume_role(&base, &request).await?;
+            let profile = s3core::sts::profile_with(&base, &credentials);
+            let client = S3Client::connect(&profile).await?;
+            let buckets = client.list_buckets().await?;
+            anyhow::Ok((client, buckets, credentials.expires_at))
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = assuming.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok((client, buckets, expires_at))) => {
+                        this.client = Some(client);
+                        this.buckets = buckets.into_iter().map(SharedString::from).collect();
+                        this.bucket = None;
+                        this.entries.clear();
+                        this.visible.clear();
+                        // Saying when it runs out matters: everything signed with
+                        // this session, presigned URLs included, dies with it.
+                        this.status = match expires_at {
+                            Some(at) => format!(
+                                "Đã nhận role — phiên hết hạn {}",
+                                s3core::format_timestamp(
+                                    at.duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0)
+                                )
+                            )
+                            .into(),
+                            None => "Đã nhận role".into(),
+                        };
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn open_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = Some(String::new());
         self.palette_selected = 0;
@@ -737,6 +818,7 @@ impl Browser {
             }
             Command::ScanOrphans => self.scan_orphans(cx),
             Command::EmptyBucket => self.ask_empty_bucket(cx),
+            Command::AssumeRole => self.start_prompt(Prompt::AssumeRole, cx),
         }
         cx.notify();
     }
@@ -1662,6 +1744,7 @@ impl Browser {
                 self.rename_entry(key, text.trim().to_string(), cx)
             }
             Prompt::AddTag if !text.trim().is_empty() => self.add_tag(text, cx),
+            Prompt::AssumeRole if !text.trim().is_empty() => self.assume_role(text, cx),
             Prompt::KmsKey if !text.trim().is_empty() => {
                 if let Some(client) = self.client.as_ref() {
                     client.set_encryption(Encryption::Kms(text.trim().to_string()));
@@ -3556,6 +3639,44 @@ fn parse_tag(text: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.trim().to_string()))
 }
 
+/// Parses the assume-role prompt: a role ARN, optionally followed by
+/// `mfa:<serial> <code>`.
+///
+/// One text field has to carry three values because the app has no multi-field
+/// form yet. Both MFA halves are required together — STS rejects a serial
+/// without a code with a message that never mentions the code.
+fn parse_assume_role(text: &str) -> Option<s3core::sts::AssumeRole> {
+    let text = text.trim();
+    let (arn, mfa) = match text.split_once(" mfa:") {
+        Some((arn, rest)) => (arn.trim(), Some(rest.trim())),
+        None => (text, None),
+    };
+    if arn.is_empty() || !arn.starts_with("arn:") {
+        return None;
+    }
+
+    let (mfa_serial, mfa_code) = match mfa {
+        Some(rest) => match rest.split_once(char::is_whitespace) {
+            Some((serial, code)) if !serial.is_empty() && !code.trim().is_empty() => {
+                (Some(serial.to_string()), Some(code.trim().to_string()))
+            }
+            // A serial with no code would fail server-side for reasons the user
+            // cannot guess, so refuse it here where the cause is obvious.
+            _ => return None,
+        },
+        None => (None, None),
+    };
+
+    Some(s3core::sts::AssumeRole {
+        role_arn: arn.to_string(),
+        session_name: "s3browser".into(),
+        external_id: None,
+        mfa_serial,
+        mfa_code,
+        duration: None,
+    })
+}
+
 /// Everything the palette can run. One list so the palette, the shortcut hints
 /// and the keyboard handler cannot drift apart — adding a command in one place
 /// adds it everywhere.
@@ -3576,6 +3697,7 @@ pub enum Command {
     ToggleQueue,
     ScanOrphans,
     EmptyBucket,
+    AssumeRole,
 }
 
 impl Command {
@@ -3598,10 +3720,11 @@ impl Command {
             Command::ToggleQueue => ("Hàng đợi truyền tải", "⌘J"),
             Command::ScanOrphans => ("Dọn upload dở", ""),
             Command::EmptyBucket => ("Dọn sạch bucket", ""),
+            Command::AssumeRole => ("Nhận role (STS AssumeRole)", ""),
         }
     }
 
-    fn all() -> [Command; 15] {
+    fn all() -> [Command; 16] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -3618,6 +3741,7 @@ impl Command {
             Command::ToggleQueue,
             Command::ScanOrphans,
             Command::EmptyBucket,
+            Command::AssumeRole,
         ]
     }
 }
@@ -4000,6 +4124,39 @@ mod tests {
     }
 
     #[test]
+    fn assume_role_prompt_requires_both_mfa_halves() {
+        let arn = "arn:aws:iam::123456789012:role/reader";
+
+        // Plain role, no MFA.
+        let parsed = parse_assume_role(arn).unwrap();
+        assert_eq!(parsed.role_arn, arn);
+        assert_eq!(parsed.mfa_serial, None);
+        assert_eq!(parsed.mfa_code, None);
+
+        // With MFA, both halves present.
+        let parsed =
+            parse_assume_role(&format!("{arn} mfa:arn:aws:iam::123:mfa/mai 123456")).unwrap();
+        assert_eq!(parsed.role_arn, arn);
+        assert_eq!(parsed.mfa_serial.as_deref(), Some("arn:aws:iam::123:mfa/mai"));
+        assert_eq!(parsed.mfa_code.as_deref(), Some("123456"));
+
+        // A serial with no code fails server-side with a message that never
+        // mentions the code, so it is refused here where the cause is visible.
+        assert!(parse_assume_role(&format!("{arn} mfa:arn:aws:iam::123:mfa/mai")).is_none());
+        assert!(parse_assume_role(&format!("{arn} mfa:")).is_none());
+
+        // Something that is not an ARN is not a role.
+        assert!(parse_assume_role("reader").is_none());
+        assert!(parse_assume_role("").is_none());
+
+        // Surrounding whitespace is formatting, not part of the ARN.
+        assert_eq!(
+            parse_assume_role(&format!("  {arn}  ")).unwrap().role_arn,
+            arn
+        );
+    }
+
+    #[test]
     fn palette_finds_commands_typed_without_diacritics() {
         // The point of folding: a plain keyboard must still reach "Đổi tên".
         assert!(command_matches("Đổi tên", "doi ten"));
@@ -4023,7 +4180,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 16);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

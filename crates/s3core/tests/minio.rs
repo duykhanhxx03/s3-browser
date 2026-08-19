@@ -680,3 +680,63 @@ async fn sse_headers_reach_the_server_on_both_upload_paths() {
         client.delete_object(bucket, key).await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn assume_role_yields_working_temporary_credentials() {
+    let Some(_) = client_or_skip().await else {
+        return;
+    };
+    let base = Profile::minio_local();
+
+    // MinIO implements AssumeRole at its own endpoint, and ignores the role ARN
+    // for root credentials — it returns a session for the caller instead. That
+    // is enough to prove the request is well-formed and the credentials it hands
+    // back actually work.
+    let request = s3core::sts::AssumeRole {
+        role_arn: "arn:aws:iam::000000000000:role/s3browser-test".into(),
+        session_name: "s3browser-test".into(),
+        duration: Some(Duration::from_secs(900)),
+        ..Default::default()
+    };
+
+    let credentials = match s3core::sts::assume_role(&base, &request).await {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            eprintln!("skipping: this server does not support AssumeRole: {error}");
+            return;
+        }
+    };
+
+    assert!(!credentials.session_token.is_empty(), "a session needs a token");
+    assert!(
+        !credentials.expires_within(Duration::from_secs(60)),
+        "a 15-minute session should not already be inside a 1-minute margin"
+    );
+
+    // The real test: the temporary credentials can actually talk to S3.
+    let assumed = s3core::sts::profile_with(&base, &credentials);
+    assert_eq!(
+        assumed.session_token.as_deref(),
+        Some(credentials.session_token.as_str())
+    );
+    let client = S3Client::connect(&assumed).await.unwrap();
+    let buckets = client
+        .list_buckets()
+        .await
+        .expect("assumed credentials should be able to list buckets");
+    assert!(
+        buckets.iter().any(|b| b == "demo-bucket"),
+        "assumed session sees the same buckets: {buckets:?}"
+    );
+
+    // And a presigned URL signed with them must carry the session token, or it
+    // would be rejected the moment anyone used it.
+    let signed = client
+        .presign_get("demo-bucket", "readme.txt", Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert!(
+        signed.contains("X-Amz-Security-Token"),
+        "a URL signed with temporary credentials must include the token: {signed}"
+    );
+}
