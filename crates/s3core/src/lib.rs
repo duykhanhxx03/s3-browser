@@ -3,7 +3,10 @@
 //! Everything here is plain async Rust with no GPUI types, so it can be unit
 //! tested without a window and reused by a future CLI.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use aws_config::retry::RetryConfig;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
@@ -173,9 +176,22 @@ impl S3Client {
             "s3browser-profile",
         );
 
+        // S3 answers 503 SlowDown once a prefix goes past roughly 3.500 writes or
+        // 5.500 reads per second, and a transfer queue with parts in flight is
+        // exactly the workload that trips it. Adaptive mode adds a client-side
+        // rate limiter on top of exponential backoff, so a throttled prefix slows
+        // the whole client down instead of each request retrying into the same
+        // wall. The default is 3 attempts, which is too few for a queue that can
+        // sit behind a throttled prefix for a while.
+        let retry = RetryConfig::adaptive()
+            .with_max_attempts(6)
+            .with_initial_backoff(Duration::from_millis(200))
+            .with_max_backoff(Duration::from_secs(20));
+
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(profile.region.clone()))
             .credentials_provider(creds)
+            .retry_config(retry)
             .load()
             .await;
 

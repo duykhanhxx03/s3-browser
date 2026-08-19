@@ -131,6 +131,10 @@ async fn upload(
         let offset = (number as u64 - 1) * part_size;
         let length = part_size.min(job.size - offset);
 
+        // Bandwidth cap is charged before the bytes move, so a queue-wide limit
+        // holds no matter how many parts are in flight.
+        engine.throttle().acquire(length).await;
+
         in_flight.spawn(async move {
             let _permit = permit;
             let body = read_chunk(&path, offset, length).await?;
@@ -292,6 +296,8 @@ async fn download(
         let temp = temp.clone();
         let offset = (number as u64 - 1) * part_size;
         let length = part_size.min(job.size - offset);
+
+        engine.throttle().acquire(length).await;
 
         in_flight.spawn(async move {
             let _permit = permit;

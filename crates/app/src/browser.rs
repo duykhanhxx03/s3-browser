@@ -1356,6 +1356,20 @@ impl Browser {
                         .child(SharedString::from(format!("HÀNG ĐỢI · {}", jobs.len())))
                         .child(div().flex_1())
                         .child(
+                            action_button("bandwidth", "", theme)
+                                .child(SharedString::from(format!(
+                                    "Băng thông: {}",
+                                    bandwidth_label(self.transfers.bandwidth_limit())
+                                )))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    let next = next_bandwidth_limit(
+                                        this.transfers.bandwidth_limit(),
+                                    );
+                                    this.transfers.set_bandwidth_limit(next);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
                             action_button("clear-finished", "Xoá mục đã xong", theme).on_click(
                                 cx.listener(|this, _event, _window, cx| {
                                     this.transfers.clear_finished();
@@ -1829,6 +1843,28 @@ fn object_row(
 
 // ------------------------------------------------------------------- helpers
 
+/// Bandwidth presets the drawer button cycles through, in bytes per second.
+/// Zero is unlimited and comes last, so one more click always gets back to it.
+const BANDWIDTH_PRESETS: [u64; 4] = [1_000_000, 5_000_000, 20_000_000, 0];
+
+fn bandwidth_label(limit: u64) -> String {
+    if limit == 0 {
+        "không giới hạn".into()
+    } else {
+        format!("{} MB/s", limit / 1_000_000)
+    }
+}
+
+/// The next preset after `current`. An unrecognised limit (set by something
+/// other than this button) falls through to the first preset.
+fn next_bandwidth_limit(current: u64) -> u64 {
+    let at = BANDWIDTH_PRESETS.iter().position(|&preset| preset == current);
+    match at {
+        Some(ix) => BANDWIDTH_PRESETS[(ix + 1) % BANDWIDTH_PRESETS.len()],
+        None => BANDWIDTH_PRESETS[0],
+    }
+}
+
 /// What to tell the user after a bulk abort. Pure because the partial-failure
 /// arithmetic is the easy thing to get backwards.
 fn abort_summary(total: usize, failures: usize) -> String {
@@ -2085,6 +2121,24 @@ mod tests {
         assert!(!should_prefetch(&(940..1000), rows, true, true));
         // A short listing that fits on screen still must not fetch when done.
         assert!(!should_prefetch(&(0..5), 5, false, false));
+    }
+
+    #[test]
+    fn bandwidth_presets_cycle_and_always_return_to_unlimited() {
+        assert_eq!(bandwidth_label(0), "không giới hạn");
+        assert_eq!(bandwidth_label(5_000_000), "5 MB/s");
+
+        // Starting from unlimited, cycling through every preset comes back.
+        let mut limit = 0;
+        let mut seen = vec![limit];
+        for _ in 0..BANDWIDTH_PRESETS.len() {
+            limit = next_bandwidth_limit(limit);
+            seen.push(limit);
+        }
+        assert_eq!(seen, vec![0, 1_000_000, 5_000_000, 20_000_000, 0]);
+
+        // A limit this button never sets must not strand the user.
+        assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
     }
 
     #[test]

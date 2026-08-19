@@ -9,6 +9,7 @@
 //! [`TransferEngine::snapshot`] and the control methods.
 
 mod journal;
+mod throttle;
 mod worker;
 
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ use s3core::S3Client;
 use tokio::sync::Semaphore;
 
 use journal::Journal;
+use throttle::Throttle;
 
 /// Objects at or above this size go up in parts.
 pub const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
@@ -201,6 +203,7 @@ struct Inner {
     controls: Mutex<HashMap<i64, Arc<AtomicU8>>>,
     job_slots: Arc<Semaphore>,
     part_concurrency: usize,
+    throttle: Throttle,
     rate: Mutex<Rate>,
 }
 
@@ -239,6 +242,7 @@ impl TransferEngine {
                 controls: Mutex::new(HashMap::new()),
                 job_slots: Arc::new(Semaphore::new(DEFAULT_JOB_CONCURRENCY)),
                 part_concurrency: DEFAULT_PART_CONCURRENCY,
+                throttle: Throttle::unlimited(),
                 rate: Mutex::new(Rate::default()),
             }),
         })
@@ -502,6 +506,21 @@ impl TransferEngine {
 
     fn part_concurrency(&self) -> usize {
         self.inner.part_concurrency
+    }
+
+    fn throttle(&self) -> &Throttle {
+        &self.inner.throttle
+    }
+
+    /// Current bandwidth cap in bytes per second; zero means unlimited.
+    pub fn bandwidth_limit(&self) -> u64 {
+        self.inner.throttle.limit()
+    }
+
+    /// Caps how fast the queue moves bytes. Takes effect on the next part, so a
+    /// part already in flight finishes at whatever rate it was going.
+    pub fn set_bandwidth_limit(&self, bytes_per_second: u64) {
+        self.inner.throttle.set_limit(bytes_per_second);
     }
 }
 

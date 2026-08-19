@@ -149,8 +149,15 @@ Profile manager + credential store OS + import `~/.aws`; sidebar profile/bucket;
 
 **Ba API thiếu ở gpui 0.2.2 đã phải tự xử lý:** không có ô text input (dùng cơ chế bắt phím chung cho filter + đặt tên), không có `on_double_click` (dùng `ClickEvent.click_count`), không có accessor "visible range" công khai trên `UniformListScrollHandle` (dùng chính range mà `uniform_list` truyền vào callback).
 
-### M2 — Transfers (3–4 tuần)
-Drag-drop upload (đệ quy thư mục) + overlay; download; transfer drawer với queue persist qua SQLite (pause/resume/cancel/retry, tốc độ, throttle); multipart engine đầy đủ như §4; xử lý 503/retry; dọn multipart mồ côi.
+### M2 — Transfers ✅ **XONG (19/08/2026)**
+Drag-drop upload (đệ quy thư mục) + overlay; download; transfer drawer với queue persist qua SQLite (pause/resume/cancel/retry, tốc độ, throttle); multipart engine đầy đủ như §4; xử lý 503/retry; dọn multipart mồ côi. 61 test pass (55 unit + 6 integration MinIO).
+
+**Đã kiểm chứng với MinIO thật:** upload multipart 23 MiB rồi tải về so khớp từng byte; hoàn tất một multipart dở từ lần chạy trước qua `ListParts`; cancel không để lại upload mồ côi; upload mồ côi tìm được và huỷ được.
+
+**Ba điều đáng ghi lại:**
+1. **Multipart tự viết** thay vì `aws-sdk-s3-transfer-manager` 0.2 — bản đó còn Developer Preview và chưa có pause/resume, đúng như dự đoán ở §4.
+2. **Resume hỏi server, không tin sổ sách của mình**: mỗi part server nhận là ghi ngay vào journal SQLite, nhưng khi tiếp tục thì `ListParts()` mới là nguồn sự thật — tránh trường hợp crash giữa lúc ghi journal làm gửi lại part đã có.
+3. **Throttle ở mức một part**, không bọc body stream của SDK: tốc độ trung bình đúng giới hạn nhưng từng part vẫn đi thành cụm. Bọc stream sẽ chính xác hơn nhưng phải can thiệp sâu vào SDK, không đáng cho một cái cap.
 
 ### M3 — Object ops + chia sẻ (2–3 tuần)
 Rename/copy/move (gồm >5 GB), batch delete có confirm; presigned URL UI (cảnh báo theo loại credential); copy public URL; metadata/tags editor; storage class + Glacier restore; preview ảnh/text trong inspector, Space để preview nhanh; mở bằng app ngoài (`opener`).
