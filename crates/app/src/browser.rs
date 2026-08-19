@@ -61,6 +61,15 @@ impl Prompt {
     }
 }
 
+/// A destructive action waiting for the user to say yes. Holding the entries
+/// rather than re-reading the selection means the dialog acts on exactly what
+/// it described, even if the listing refreshes underneath it.
+pub struct Confirm {
+    title: SharedString,
+    detail: SharedString,
+    doomed: Vec<Entry>,
+}
+
 pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
@@ -101,6 +110,12 @@ pub struct Browser {
 
     orphans: Vec<OrphanedUpload>,
     orphans_open: bool,
+
+    confirm: Option<Confirm>,
+    /// Whether the open bucket keeps versions, so a delete confirmation can say
+    /// whether it removes data or only hides it. Refreshed when the bucket
+    /// changes, not on every navigation within one.
+    bucket_versioned: bool,
     /// True while a repaint loop is running to animate transfer progress.
     ticking: bool,
 
@@ -174,6 +189,8 @@ impl Browser {
 
             orphans: Vec::new(),
             orphans_open: false,
+            confirm: None,
+            bucket_versioned: false,
             ticking: false,
             connect_task: None,
             listing_task: None,
@@ -354,6 +371,12 @@ impl Browser {
         self.generation += 1;
         let generation = self.generation;
 
+        // Only when the bucket actually changes: this costs a request, and it is
+        // the same answer for every prefix inside one bucket.
+        if self.bucket.as_ref() != Some(&bucket) {
+            self.bucket_versioned = false;
+            self.refresh_versioning(bucket.clone(), cx);
+        }
         self.bucket = Some(bucket.clone());
         self.prefix = prefix.clone();
         self.entries.clear();
@@ -566,16 +589,58 @@ impl Browser {
         self.op_task = Some(task);
     }
 
-    fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+    fn refresh_versioning(&mut self, bucket: SharedString, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
             return;
         };
+        let checking = Tokio::spawn(cx, async move { client.bucket_is_versioned(&bucket).await });
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let versioned = checking.await.unwrap_or(false);
+            _ = this.update(cx, |this, cx| {
+                this.bucket_versioned = versioned;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Asks before deleting. Everything here is irreversible in a way the user
+    /// cannot undo from the app, so the count and the consequence are spelled
+    /// out rather than left to a generic "are you sure".
+    fn ask_delete_selection(&mut self, cx: &mut Context<Self>) {
         let doomed: Vec<Entry> = self
             .entries
             .iter()
             .filter(|entry| self.selection.contains(&entry.key))
             .cloned()
             .collect();
+        if doomed.is_empty() {
+            return;
+        }
+
+        self.confirm = Some(Confirm {
+            title: delete_title(&doomed).into(),
+            detail: delete_detail(&doomed, self.bucket_versioned).into(),
+            doomed,
+        });
+        cx.notify();
+    }
+
+    fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        cx.notify();
+    }
+
+    fn commit_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
+        self.delete_entries(confirm.doomed, cx);
+    }
+
+    fn delete_entries(&mut self, doomed: Vec<Entry>, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
         if doomed.is_empty() {
             return;
         }
@@ -973,6 +1038,16 @@ impl Browser {
         let keystroke = &event.keystroke;
         let primary = is_primary(&keystroke.modifiers);
 
+        // A confirmation takes the keyboard entirely: ⌘⌫ while it is up must not
+        // queue up a second delete behind the one being asked about.
+        if self.confirm.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => return self.cancel_confirm(cx),
+                "enter" => return self.commit_confirm(cx),
+                _ => return,
+            }
+        }
+
         if primary {
             match keystroke.key.as_str() {
                 "f" => return self.start_prompt(Prompt::Filter, cx),
@@ -993,7 +1068,7 @@ impl Browser {
                     cx.notify();
                     return;
                 }
-                "backspace" | "delete" => return self.delete_selection(cx),
+                "backspace" | "delete" => return self.ask_delete_selection(cx),
                 "up" => return self.go_up(cx),
                 _ => {}
             }
@@ -1236,7 +1311,7 @@ impl Browser {
                 .child(
                     danger_button("delete", SharedString::from(format!("Xoá {count}")), theme)
                         .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.delete_selection(cx)
+                            this.ask_delete_selection(cx)
                         })),
                 )
             })
@@ -1492,6 +1567,69 @@ impl Browser {
                     .flex_1()
                     .into_any_element()
                 }),
+        )
+    }
+
+    fn render_confirm(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let confirm = self.confirm.as_ref()?;
+        let theme = self.theme;
+
+        Some(
+            // A full-bleed scrim: it dims the list and, more importantly, means
+            // a stray click lands here instead of on the thing behind it.
+            div()
+                .id("confirm-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| this.cancel_confirm(cx)))
+                .child(
+                    div()
+                        .id("confirm-dialog")
+                        .w(px(380.))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        // Clicks inside the dialog must not reach the scrim.
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .text_color(theme.text)
+                                .child(confirm.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child(confirm.detail.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(action_button("confirm-cancel", "Huỷ", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.cancel_confirm(cx)
+                                    }),
+                                ))
+                                .child(
+                                    danger_button("confirm-ok", "Xoá".into(), theme).on_click(
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.commit_confirm(cx)
+                                        }),
+                                    ),
+                                ),
+                        ),
+                ),
         )
     }
 
@@ -1788,6 +1926,7 @@ impl Render for Browser {
             .children(self.render_drawer(cx))
             .children(self.render_orphans(cx))
             .child(self.render_status(cx))
+            .children(self.render_confirm(cx))
     }
 }
 
@@ -1952,6 +2091,38 @@ fn next_bandwidth_limit(current: u64) -> u64 {
         Some(ix) => BANDWIDTH_PRESETS[(ix + 1) % BANDWIDTH_PRESETS.len()],
         None => BANDWIDTH_PRESETS[0],
     }
+}
+
+/// Headline for the delete dialog. Names the single victim when there is one,
+/// because "Xoá 1 mục" tells the user nothing about what they are about to lose.
+fn delete_title(doomed: &[Entry]) -> String {
+    match doomed {
+        [only] => format!("Xoá {}?", entry_name_of(&only.key)),
+        many => format!("Xoá {} mục?", many.len()),
+    }
+}
+
+/// The consequence, spelled out. Folders are called out separately because
+/// deleting one takes everything inside it — a listing showing three rows can
+/// stand for thousands of keys.
+fn delete_detail(doomed: &[Entry], versioned: bool) -> String {
+    let folders = doomed.iter().filter(|entry| entry.is_folder).count();
+
+    let mut detail = if folders > 0 {
+        let noun = if folders == 1 { "thư mục" } else { "thư mục" };
+        format!("Gồm {folders} {noun} — mọi thứ bên trong cũng bị xoá. ")
+    } else {
+        String::new()
+    };
+
+    detail.push_str(if versioned {
+        // A delete marker is not a deletion; saying "permanent" here would be a
+        // lie, and saying nothing would leave the user thinking data is gone.
+        "Bucket này bật versioning: thao tác tạo delete marker, bản cũ vẫn còn và vẫn tính tiền lưu trữ."
+    } else {
+        "Không hoàn tác được."
+    });
+    detail
 }
 
 /// The display name of a key: its last path segment. A folder key ends in `/`,
@@ -2119,6 +2290,8 @@ mod tests {
 
             orphans: Vec::new(),
             orphans_open: false,
+            confirm: None,
+            bucket_versioned: false,
             ticking: false,
             connect_task: None,
             listing_task: None,
@@ -2262,6 +2435,38 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn delete_dialog_names_a_single_victim_but_counts_a_crowd() {
+        assert_eq!(delete_title(&[entry("a/report.txt", false, 0)]), "Xoá report.txt?");
+        assert_eq!(delete_title(&[entry("a/logs", true, 0)]), "Xoá logs?");
+        assert_eq!(
+            delete_title(&[entry("a.txt", false, 0), entry("b.txt", false, 0)]),
+            "Xoá 2 mục?"
+        );
+    }
+
+    #[test]
+    fn delete_dialog_warns_about_folders_and_tells_the_truth_about_versioning() {
+        // Plain objects in a plain bucket: gone means gone.
+        let files = [entry("a.txt", false, 0)];
+        assert_eq!(delete_detail(&files, false), "Không hoàn tác được.");
+
+        // A folder stands for everything under it, which the listing does not show.
+        let with_folder = [entry("a.txt", false, 0), entry("logs", true, 0)];
+        let detail = delete_detail(&with_folder, false);
+        assert!(detail.starts_with("Gồm 1 thư mục"), "{detail}");
+        assert!(detail.contains("bên trong cũng bị xoá"), "{detail}");
+
+        // Versioned buckets must not be told "cannot be undone" — it is false,
+        // and it hides that the old versions keep costing money.
+        let versioned = delete_detail(&files, true);
+        assert!(versioned.contains("delete marker"), "{versioned}");
+        assert!(
+            !versioned.contains("Không hoàn tác được"),
+            "a versioned delete is reversible: {versioned}"
+        );
     }
 
     #[test]

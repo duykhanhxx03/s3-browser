@@ -622,6 +622,22 @@ impl S3Client {
             .collect())
     }
 
+    /// Whether the bucket keeps versions. Deleting in a versioned bucket writes
+    /// a delete marker instead of removing data, which is a different promise to
+    /// make to someone about to confirm a delete.
+    ///
+    /// Returns `false` when the answer cannot be had — some S3-compatible
+    /// providers do not implement GetBucketVersioning, and a missing answer must
+    /// not stop a delete. The cost of guessing wrong here is a warning that is
+    /// absent, never one that is falsely reassuring.
+    pub async fn bucket_is_versioned(&self, bucket: &str) -> bool {
+        let Ok(out) = self.inner.get_bucket_versioning().bucket(bucket).send().await else {
+            return false;
+        };
+        out.status()
+            .is_some_and(|status| status.as_str() == "Enabled")
+    }
+
     /// Server-side copy. Picks the strategy by size, because CopyObject refuses
     /// anything over 5 GiB and the caller should not have to know that.
     ///
