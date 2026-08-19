@@ -3,6 +3,7 @@
 //! Everything here is plain async Rust with no GPUI types, so it can be unit
 //! tested without a window and reused by a future CLI.
 
+pub mod capability;
 pub mod sso;
 pub mod sts;
 
@@ -504,6 +505,11 @@ impl S3Client {
     }
 
     /// Single-request upload, for objects below the multipart threshold.
+    /// The underlying SDK client, for probes that have no wrapper of their own.
+    pub(crate) fn inner(&self) -> &Client {
+        &self.inner
+    }
+
     pub fn encryption(&self) -> Encryption {
         self.encryption.lock().unwrap().clone()
     }
