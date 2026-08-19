@@ -54,6 +54,8 @@ pub enum Prompt {
     KmsKey,
     /// Role ARN to assume, optionally followed by an MFA code.
     AssumeRole,
+    /// The organisation's SSO portal URL, optionally with ` <region>`.
+    SsoStart,
 }
 
 impl Prompt {
@@ -66,6 +68,7 @@ impl Prompt {
             Prompt::AddTag => "Thẻ mới (khoá=giá trị)",
             Prompt::KmsKey => "KMS key id",
             Prompt::AssumeRole => "Role ARN (thêm ' mfa:<serial> <mã>' nếu cần)",
+            Prompt::SsoStart => "SSO start URL (thêm ' <region>' nếu khác us-east-1)",
         }
     }
 }
@@ -118,6 +121,18 @@ pub enum Preview {
     Unsupported,
 }
 
+/// An in-flight SSO sign-in. The device flow is two waits with a browser trip
+/// in between, so the panel has to survive both.
+pub struct SsoFlow {
+    region: String,
+    /// Shown while waiting, so the person can finish in the browser.
+    user_code: SharedString,
+    verification_uri: SharedString,
+    waiting: bool,
+    access_token: Option<String>,
+    roles: Vec<s3core::sso::SsoRole>,
+}
+
 pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
@@ -160,6 +175,8 @@ pub struct Browser {
     orphans_open: bool,
 
     confirm: Option<Confirm>,
+    /// An SSO sign-in in progress, and the roles it turned up once done.
+    sso: Option<SsoFlow>,
     /// The command palette: `Some` with the query typed so far.
     palette: Option<String>,
     /// Which row the palette has highlighted.
@@ -245,6 +262,7 @@ impl Browser {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            sso: None,
             palette: None,
             palette_selected: 0,
             share: None,
@@ -693,6 +711,160 @@ impl Browser {
         cx.notify();
     }
 
+    /// Starts the SSO device flow: register, get a code, open the browser, then
+    /// poll until the person approves.
+    fn start_sso(&mut self, text: String, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        let (start_url, region) = match text.split_once(char::is_whitespace) {
+            Some((url, region)) => (url.trim().to_string(), region.trim().to_string()),
+            // Identity Center lives in one region per organisation, and it is
+            // not necessarily where the buckets are.
+            None => (text, "us-east-1".to_string()),
+        };
+        if !start_url.starts_with("http") {
+            self.report("Cần URL portal, ví dụ: https://tên.awsapps.com/start".into());
+            return;
+        }
+
+        self.status = "Đang bắt đầu đăng nhập SSO…".into();
+        let region_for_flow = region.clone();
+
+        let beginning = Tokio::spawn(cx, async move {
+            s3core::sso::begin(&start_url, &region).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = beginning.await;
+            let authorization = match outcome {
+                Ok(Ok(authorization)) => authorization,
+                Ok(Err(error)) => {
+                    _ = this.update(cx, |this, cx| {
+                        this.report(format!("{error}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(error) => {
+                    _ = this.update(cx, |this, cx| {
+                        this.report(format!("Task lỗi: {error}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            // Open the browser for them, but keep showing the URL and code: the
+            // browser may be the wrong one, or may not open at all.
+            _ = opener::open(&authorization.verification_uri);
+            _ = this.update(cx, |this, cx| {
+                this.sso = Some(SsoFlow {
+                    region: region_for_flow.clone(),
+                    user_code: authorization.user_code.clone().into(),
+                    verification_uri: authorization.verification_uri.clone().into(),
+                    waiting: true,
+                    access_token: None,
+                    roles: Vec::new(),
+                });
+                cx.notify();
+            });
+
+            this.update(cx, |this, cx| this.poll_sso(authorization, cx)).ok();
+        }));
+    }
+
+    fn poll_sso(&mut self, authorization: s3core::sso::DeviceAuthorization, cx: &mut Context<Self>) {
+        let Some(flow) = self.sso.as_ref() else {
+            return;
+        };
+        let region = flow.region.clone();
+
+        let polling = Tokio::spawn(cx, async move {
+            let token = s3core::sso::wait_for_token(&authorization, &region).await?;
+            let roles = s3core::sso::list_roles(&token, &region).await?;
+            anyhow::Ok((token, roles))
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = polling.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok((token, roles))) => {
+                        if let Some(flow) = this.sso.as_mut() {
+                            flow.waiting = false;
+                            flow.access_token = Some(token);
+                            flow.roles = roles;
+                        }
+                        this.status = "Đã đăng nhập — chọn role".into();
+                    }
+                    Ok(Err(error)) => {
+                        this.sso = None;
+                        this.report(format!("{error}"));
+                    }
+                    Err(error) => {
+                        this.sso = None;
+                        this.report(format!("Task lỗi: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn use_sso_role(&mut self, role: s3core::sso::SsoRole, cx: &mut Context<Self>) {
+        let Some(flow) = self.sso.as_ref() else {
+            return;
+        };
+        let (Some(token), region) = (flow.access_token.clone(), flow.region.clone()) else {
+            return;
+        };
+        // Region for the buckets, which the profile already knows; the SSO
+        // region only governs the sign-in endpoints.
+        let base = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .map(|stored| (stored.region.clone(), stored.endpoint.clone()))
+            .unwrap_or_else(|| ("us-east-1".to_string(), None));
+
+        self.status = format!("Đang lấy credentials cho {}…", role.role_name).into();
+
+        let fetching = Tokio::spawn(cx, async move {
+            let credentials = s3core::sso::credentials_for(&token, &role, &region).await?;
+            let profile = Profile {
+                name: role.label(),
+                endpoint: base.1,
+                region: base.0,
+                path_style: false,
+                access_key: credentials.access_key.clone(),
+                secret_key: credentials.secret_key.clone(),
+                session_token: Some(credentials.session_token.clone()),
+                relaxed_checksums: false,
+            };
+            let client = S3Client::connect(&profile).await?;
+            let buckets = client.list_buckets().await?;
+            anyhow::Ok((client, buckets))
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = fetching.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok((client, buckets))) => {
+                        this.client = Some(client);
+                        this.buckets = buckets.into_iter().map(SharedString::from).collect();
+                        this.bucket = None;
+                        this.entries.clear();
+                        this.visible.clear();
+                        this.sso = None;
+                        this.status = "Đã đăng nhập bằng SSO".into();
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// Swaps the session for one under an assumed role. The base profile keeps
     /// its long-lived keys — the temporary credentials live only in this
     /// session, so quitting the app is enough to drop them.
@@ -819,6 +991,7 @@ impl Browser {
             Command::ScanOrphans => self.scan_orphans(cx),
             Command::EmptyBucket => self.ask_empty_bucket(cx),
             Command::AssumeRole => self.start_prompt(Prompt::AssumeRole, cx),
+            Command::SsoSignIn => self.start_prompt(Prompt::SsoStart, cx),
         }
         cx.notify();
     }
@@ -1745,6 +1918,7 @@ impl Browser {
             }
             Prompt::AddTag if !text.trim().is_empty() => self.add_tag(text, cx),
             Prompt::AssumeRole if !text.trim().is_empty() => self.assume_role(text, cx),
+            Prompt::SsoStart if !text.trim().is_empty() => self.start_sso(text, cx),
             Prompt::KmsKey if !text.trim().is_empty() => {
                 if let Some(client) = self.client.as_ref() {
                     client.set_encryption(Encryption::Kms(text.trim().to_string()));
@@ -2839,6 +3013,111 @@ impl Browser {
         )
     }
 
+    fn render_sso(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let flow = self.sso.as_ref()?;
+        let theme = self.theme;
+
+        Some(
+            div()
+                .id("sso-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .child(
+                    div()
+                        .id("sso-dialog")
+                        .w(px(460.))
+                        .max_h(px(420.))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .child(div().text_color(theme.text).child("Đăng nhập AWS SSO"))
+                        .when(flow.waiting, |this| {
+                            this
+                                // The browser may not have opened, or opened the
+                                // wrong one, so the code and URL stay visible.
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child("Duyệt trong trình duyệt, rồi quay lại đây."),
+                                )
+                                .child(
+                                    div()
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(theme.hover)
+                                        .text_color(theme.text)
+                                        .child(flow.user_code.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.text_faint)
+                                        .child(flow.verification_uri.clone()),
+                                )
+                        })
+                        .when(!flow.waiting, |this| {
+                            this.child(
+                                div()
+                                    .id("sso-roles")
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .max_h(px(260.))
+                                    .overflow_hidden()
+                                    .children(flow.roles.iter().map(|role| {
+                                        let chosen = role.clone();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "sso-{}-{}",
+                                                role.account_id, role.role_name
+                                            )))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(theme.text)
+                                            .hover(|style| style.bg(theme.hover))
+                                            .child(SharedString::from(role.label()))
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    this.use_sso_role(chosen.clone(), cx)
+                                                },
+                                            ))
+                                    }))
+                                    .when(flow.roles.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_faint)
+                                                .child("Tài khoản này không có role nào"),
+                                        )
+                                    }),
+                            )
+                        })
+                        .child(
+                            div().flex().justify_end().child(
+                                action_button("sso-cancel", "Huỷ", theme).on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.sso = None;
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                        ),
+                ),
+        )
+    }
+
     fn render_palette(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let query = self.palette.as_ref()?;
         let theme = self.theme;
@@ -3292,6 +3571,7 @@ impl Render for Browser {
             .children(self.render_confirm(cx))
             .children(self.render_share(cx))
             .children(self.render_palette(cx))
+            .children(self.render_sso(cx))
     }
 }
 
@@ -3698,6 +3978,7 @@ pub enum Command {
     ScanOrphans,
     EmptyBucket,
     AssumeRole,
+    SsoSignIn,
 }
 
 impl Command {
@@ -3721,10 +4002,11 @@ impl Command {
             Command::ScanOrphans => ("Dọn upload dở", ""),
             Command::EmptyBucket => ("Dọn sạch bucket", ""),
             Command::AssumeRole => ("Nhận role (STS AssumeRole)", ""),
+            Command::SsoSignIn => ("Đăng nhập AWS SSO", ""),
         }
     }
 
-    fn all() -> [Command; 16] {
+    fn all() -> [Command; 17] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -3742,6 +4024,7 @@ impl Command {
             Command::ScanOrphans,
             Command::EmptyBucket,
             Command::AssumeRole,
+            Command::SsoSignIn,
         ]
     }
 }
@@ -3973,6 +4256,7 @@ mod tests {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            sso: None,
             palette: None,
             palette_selected: 0,
             share: None,
@@ -4180,7 +4464,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 17);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

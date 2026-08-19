@@ -172,8 +172,18 @@ Rename/copy/move (gồm >5 GB), batch delete có confirm; presigned URL UI (cả
 
 **Metadata chỉ nạp khi mở inspector**, không HEAD từng dòng lúc listing — đúng như §4 đã cảnh báo, đó là lỗi khiến client S3 khác vừa chậm vừa tốn tiền.
 
-### M4 — Pro (3–4 tuần)
-Versioning UI đầy đủ; SSE-S3/KMS; ACL editor; STS AssumeRole + MFA; AWS SSO device flow; empty-bucket flow; command palette ⌘K; keyboard shortcuts hoàn chỉnh.
+### M4 — Pro (3–4 tuần) — **gần xong (19/08/2026)**
+Versioning UI đầy đủ ✅; SSE-S3/KMS ✅; **ACL editor — chưa làm**; STS AssumeRole + MFA ✅; AWS SSO device flow ✅ (chưa kiểm chứng); empty-bucket flow ✅; command palette ⌘K ✅; keyboard shortcuts hoàn chỉnh ✅. 93 test pass (16 integration MinIO).
+
+**Mức độ kiểm chứng — ba bậc khác nhau, cần phân biệt rõ:**
+
+| Phần | Kiểm chứng |
+|---|---|
+| Versioning, empty-bucket, AssumeRole | **Chạy thật với MinIO.** Empty-bucket được chứng minh bằng cách gọi `DeleteBucket` sau khi dọn — còn sót version nào là lệnh đó fail. AssumeRole được chứng minh bằng cách kết nối lại bằng credential tạm và liệt kê bucket. |
+| SSE-S3/KMS | **Một nửa.** MinIO tiêu chuẩn không có KMS backend nên từ chối mã hoá — nhưng chính lời từ chối đó chứng minh header đã gửi đi, vì server không thể phàn nàn về thứ nó chưa từng được yêu cầu. Việc object lưu xuống có thật sự được mã hoá thì chưa kiểm được. |
+| AWS SSO device flow | **Chưa kiểm chứng gì.** Nó nói chuyện với endpoint AWS thật, không giả lập được bằng MinIO. Chỉ phần logic thuần (nhịp poll, hạn hết hiệu lực, nhãn role) là có unit test. Cần chạy với một Identity Center thật trước khi tin. |
+
+**ACL editor chưa làm** — và nên cân nhắc có đáng làm không: AWS khuyến nghị tắt ACL (Object Ownership = bucket owner enforced) từ 2023, bucket mới mặc định đã tắt. Làm một editor cho cơ chế mà chính AWS khuyên đừng dùng thì giá trị thấp; bucket policy có ích hơn nhiều và đang nằm ở phần "sau 1.0".
 
 ### M5 — Ship (2–3 tuần)
 Onboarding lần đầu; polish theme/animation/reduced-transparency; crash reporting (sentry + minidump); đóng gói `cargo-packager` (.app + .dmg), ký Developer ID + notarize (`rcodesign` hoặc notarytool), auto-update (`cargo-packager-updater` hoặc Velopack). **Phân phối trực tiếp, không App Store** (App Sandbox siết drag-drop/bookmark; GPUI chưa có accessibility — rủi ro review).
