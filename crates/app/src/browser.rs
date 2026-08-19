@@ -85,6 +85,8 @@ pub struct Confirm {
     version: Option<(String, String)>,
     /// Set when the whole bucket is to be emptied.
     empty_bucket: Option<SharedString>,
+    /// Set when a profile is being removed, by index.
+    profile: Option<usize>,
 }
 
 /// The share panel's state. Signing is a request, so the URL arrives after the
@@ -133,6 +135,104 @@ pub struct SsoFlow {
     roles: Vec<s3core::sso::SsoRole>,
 }
 
+/// One field in a form.
+pub struct Field {
+    label: &'static str,
+    placeholder: &'static str,
+    value: String,
+    /// Shown as dots. Someone adding a profile may well be screen-sharing, and
+    /// a secret key on screen is a secret key leaked.
+    secret: bool,
+}
+
+/// A multi-field form.
+///
+/// gpui 0.2.2 has no text input widget, so this is the same hand-rolled key
+/// capture as the one-line prompt, extended to several fields. That limitation
+/// quietly shaped the app: with only one field to type into, anything needing a
+/// real form — adding a profile by hand, which is the only way to reach R2, B2,
+/// Wasabi or Spaces — simply never got built.
+///
+/// Paste is the part that cannot be skipped: nobody types a forty-character
+/// secret key by hand, so ⌘V has to work even though the cursor does not.
+pub struct Form {
+    fields: Vec<Field>,
+    focused: usize,
+    error: Option<SharedString>,
+}
+
+impl Form {
+    fn new_profile() -> Self {
+        Self {
+            fields: vec![
+                Field {
+                    label: "Tên",
+                    placeholder: "R2 của tôi",
+                    value: String::new(),
+                    secret: false,
+                },
+                Field {
+                    label: "Endpoint",
+                    // The one field that decides everything else: leaving it
+                    // empty means real AWS.
+                    placeholder: "để trống nếu là AWS thật",
+                    value: String::new(),
+                    secret: false,
+                },
+                Field {
+                    label: "Region",
+                    placeholder: "us-east-1",
+                    value: String::new(),
+                    secret: false,
+                },
+                Field {
+                    label: "Access key",
+                    placeholder: "",
+                    value: String::new(),
+                    secret: false,
+                },
+                Field {
+                    label: "Secret key",
+                    placeholder: "dán bằng ⌘V",
+                    value: String::new(),
+                    secret: true,
+                },
+            ],
+            focused: 0,
+            error: None,
+        }
+    }
+
+    fn value(&self, label: &str) -> &str {
+        self.fields
+            .iter()
+            .find(|field| field.label == label)
+            .map(|field| field.value.trim())
+            .unwrap_or("")
+    }
+
+    fn focus_next(&mut self, backwards: bool) {
+        let count = self.fields.len();
+        self.focused = if backwards {
+            (self.focused + count - 1) % count
+        } else {
+            (self.focused + 1) % count
+        };
+    }
+
+    fn insert(&mut self, text: &str) {
+        if let Some(field) = self.fields.get_mut(self.focused) {
+            field.value.push_str(text);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if let Some(field) = self.fields.get_mut(self.focused) {
+            field.value.pop();
+        }
+    }
+}
+
 pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
@@ -177,6 +277,8 @@ pub struct Browser {
     confirm: Option<Confirm>,
     /// An SSO sign-in in progress, and the roles it turned up once done.
     sso: Option<SsoFlow>,
+    /// The add-profile form, when open.
+    form: Option<Form>,
     /// The command palette: `Some` with the query typed so far.
     palette: Option<String>,
     /// Which row the palette has highlighted.
@@ -262,6 +364,7 @@ impl Browser {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            form: None,
             sso: None,
             palette: None,
             palette_selected: 0,
@@ -707,6 +810,7 @@ impl Browser {
             doomed,
             version: None,
             empty_bucket: None,
+            profile: None,
         });
         cx.notify();
     }
@@ -943,6 +1047,110 @@ impl Browser {
         }));
     }
 
+    fn open_profile_form(&mut self, cx: &mut Context<Self>) {
+        self.form = Some(Form::new_profile());
+        cx.notify();
+    }
+
+    fn submit_profile_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let name = form.value("Tên").to_string();
+        let endpoint = form.value("Endpoint").to_string();
+        let region = form.value("Region").to_string();
+        let access_key = form.value("Access key").to_string();
+        let secret_key = form.value("Secret key").to_string();
+
+        // Check everything before touching the keychain, so a rejected form
+        // never leaves a half-made profile behind.
+        let missing = if name.is_empty() {
+            Some("Cần tên profile")
+        } else if access_key.is_empty() {
+            Some("Cần access key")
+        } else if secret_key.is_empty() {
+            Some("Cần secret key")
+        } else if self.profiles.iter().any(|p| p.name == name) {
+            Some("Đã có profile trùng tên")
+        } else {
+            None
+        };
+        if let Some(message) = missing {
+            if let Some(form) = self.form.as_mut() {
+                form.error = Some(message.into());
+            }
+            cx.notify();
+            return;
+        }
+
+        let stored = StoredProfile {
+            id: vault::new_profile_id(&name, &self.profiles),
+            name,
+            endpoint: (!endpoint.is_empty()).then_some(endpoint),
+            region: if region.is_empty() {
+                "us-east-1".into()
+            } else {
+                region
+            },
+            path_style: false,
+            relaxed_checksums: false,
+            access_key,
+        }
+        // Reads the endpoint and sets the provider quirks: R2 wants region
+        // `auto`, self-hosted stores want path-style, non-AWS wants relaxed
+        // checksums. Getting these wrong looks like a credentials problem.
+        .with_provider_defaults();
+
+        self.form = None;
+        self.add_profile(stored, &secret_key, cx);
+    }
+
+    /// Removes a profile and the secret behind it. Asking first because the
+    /// secret cannot be recovered from the app once the keychain entry is gone.
+    fn ask_remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        self.confirm = Some(Confirm {
+            title: format!("Xoá profile {}?", profile.name).into(),
+            detail: "Khoá bí mật trong Keychain cũng bị xoá. Dữ liệu trên S3 không bị đụng tới."
+                .into(),
+            doomed: Vec::new(),
+            version: None,
+            empty_bucket: None,
+            profile: Some(index),
+        });
+        cx.notify();
+    }
+
+    fn remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.profiles.len() {
+            return;
+        }
+        let profile = self.profiles.remove(index);
+        if let Err(error) = vault::delete_secret_key(&profile.id) {
+            self.report(format!("Không xoá được khoá: {error}"));
+        }
+        self.save_profiles();
+
+        // Disconnect if the profile being used is the one that just went away.
+        if self.active_profile == Some(index) {
+            self.client = None;
+            self.buckets.clear();
+            self.bucket = None;
+            self.entries.clear();
+            self.visible.clear();
+            self.active_profile = None;
+            self.status = "Đã xoá profile đang dùng".into();
+        } else if let Some(active) = self.active_profile {
+            // Indices after the removed one shift down by one.
+            if active > index {
+                self.active_profile = Some(active - 1);
+            }
+        }
+        cx.notify();
+    }
+
     fn open_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = Some(String::new());
         self.palette_selected = 0;
@@ -992,6 +1200,7 @@ impl Browser {
             Command::EmptyBucket => self.ask_empty_bucket(cx),
             Command::AssumeRole => self.start_prompt(Prompt::AssumeRole, cx),
             Command::SsoSignIn => self.start_prompt(Prompt::SsoStart, cx),
+            Command::NewProfile => self.open_profile_form(cx),
         }
         cx.notify();
     }
@@ -1005,9 +1214,10 @@ impl Browser {
         let Some(confirm) = self.confirm.take() else {
             return;
         };
-        match (confirm.version, confirm.empty_bucket) {
-            (Some((key, version_id)), _) => self.delete_version(key, version_id, cx),
-            (_, Some(bucket)) => self.empty_bucket(bucket, cx),
+        match (confirm.version, confirm.empty_bucket, confirm.profile) {
+            (Some((key, version_id)), _, _) => self.delete_version(key, version_id, cx),
+            (_, Some(bucket), _) => self.empty_bucket(bucket, cx),
+            (_, _, Some(index)) => self.remove_profile(index, cx),
             _ => self.delete_entries(confirm.doomed, cx),
         }
     }
@@ -1360,6 +1570,7 @@ impl Browser {
             doomed: Vec::new(),
             version: None,
             empty_bucket: Some(bucket),
+            profile: None,
         });
         cx.notify();
     }
@@ -1446,6 +1657,7 @@ impl Browser {
             doomed: Vec::new(),
             version: Some((version.key, version.version_id)),
             empty_bucket: None,
+            profile: None,
         });
         cx.notify();
     }
@@ -1945,6 +2157,80 @@ impl Browser {
         let keystroke = &event.keystroke;
         let primary = is_primary(&keystroke.modifiers);
 
+        // The form owns the keyboard while it is up.
+        if self.form.is_some() {
+            // Paste first: a secret key is never typed by hand, so ⌘V has to
+            // work even though this input has no cursor or selection.
+            if primary && keystroke.key == "v" {
+                if let Some(text) = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                {
+                    if let Some(form) = self.form.as_mut() {
+                        // Newlines would be invisible in a single-line field and
+                        // silently corrupt a pasted key.
+                        form.insert(text.trim());
+                        form.error = None;
+                    }
+                    cx.notify();
+                }
+                return;
+            }
+
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.form = None;
+                    cx.notify();
+                    return;
+                }
+                "enter" => return self.submit_profile_form(cx),
+                "tab" => {
+                    if let Some(form) = self.form.as_mut() {
+                        form.focus_next(keystroke.modifiers.shift);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    if let Some(form) = self.form.as_mut() {
+                        form.focus_next(false);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "up" => {
+                    if let Some(form) = self.form.as_mut() {
+                        form.focus_next(true);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    if let Some(form) = self.form.as_mut() {
+                        form.backspace();
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    // Modifier combinations are shortcuts, not text.
+                    if primary {
+                        return;
+                    }
+                    if let Some(text) = keystroke.key_char.as_deref() {
+                        if !text.is_empty() && !text.chars().any(char::is_control) {
+                            if let Some(form) = self.form.as_mut() {
+                                form.insert(text);
+                                form.error = None;
+                            }
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         if let Some(query) = self.palette.clone() {
             let matches = self.palette_matches();
             match keystroke.key.as_str() {
@@ -2105,47 +2391,80 @@ impl Browser {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .child(section_label("PROFILES", theme))
+            .child(
+                section_header("PROFILES", "add-profile", theme).on_click(cx.listener(
+                    |this, _event, _window, cx| this.open_profile_form(cx),
+                )),
+            )
             .children(
                 self.profiles
                     .iter()
                     .enumerate()
                     .map(|(index, profile)| {
                         let selected = active_profile == Some(index);
-                        sidebar_row(
-                            SharedString::from(format!("profile-{}", profile.id)),
-                            SharedString::from(profile.name.clone()),
-                            selected,
-                            theme,
-                        )
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.connect(index, cx);
-                        }))
+                        // The remove button lives on the row rather than behind a
+                        // menu: gpui 0.2.2 has no context menu, and a profile you
+                        // cannot delete is worse than one that is easy to delete
+                        // by accident — the confirmation covers that.
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                sidebar_row(
+                                    SharedString::from(format!("profile-{}", profile.id)),
+                                    SharedString::from(profile.name.clone()),
+                                    selected,
+                                    theme,
+                                )
+                                .flex_1()
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.connect(index, cx);
+                                })),
+                            )
+                            .child(
+                                icon_button_dyn(
+                                    SharedString::from(format!("rm-profile-{}", profile.id)),
+                                    "✕",
+                                    theme,
+                                )
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.ask_remove_profile(index, cx)
+                                })),
+                            )
                     })
                     .collect::<Vec<_>>(),
             )
-            .when(self.profiles.is_empty(), |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            action_button("import-aws", "Nhập từ ~/.aws", theme).on_click(
-                                cx.listener(|this, _event, _window, cx| this.import_from_aws(cx)),
-                            ),
-                        )
-                        .child(
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        action_button("import-aws", "Nhập từ ~/.aws", theme).on_click(
+                            cx.listener(|this, _event, _window, cx| this.import_from_aws(cx)),
+                        ),
+                    )
+                    .when(self.profiles.is_empty(), |this| {
+                        this.child(
                             action_button("add-minio", "Thêm MinIO local", theme).on_click(
                                 cx.listener(|this, _event, _window, cx| {
                                     this.add_minio_dev_profile(cx)
                                 }),
                             ),
-                        ),
-                )
-            })
+                        )
+                    }),
+            )
             .child(div().h(px(8.)))
-            .child(section_label("BUCKETS", theme))
+            .child(
+                section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
+                    |this, _event, _window, cx| {
+                        if this.client.is_some() {
+                            this.start_prompt(Prompt::NewBucket, cx);
+                        }
+                    },
+                )),
+            )
             .children(
                 self.buckets
                     .iter()
@@ -3065,6 +3384,12 @@ impl Browser {
                                     "onboard-import",
                                 ),
                                 step(
+                                    "Nhập thủ công",
+                                    "Cho R2, B2, Wasabi, Spaces, MinIO tự dựng — bất cứ thứ gì có endpoint riêng.",
+                                    "Tạo",
+                                    "onboard-manual",
+                                ),
+                                step(
                                     "MinIO trên máy",
                                     "Dành cho thử nghiệm: http://127.0.0.1:9000 với minioadmin/minioadmin.",
                                     "Tạo",
@@ -3104,6 +3429,7 @@ impl Browser {
                                     .child(action_button(id, button, theme).on_click(cx.listener(
                                         move |this, _event, _window, cx| match id {
                                             "onboard-import" => this.import_from_aws(cx),
+                                            "onboard-manual" => this.open_profile_form(cx),
                                             "onboard-minio" => this.add_minio_dev_profile(cx),
                                             _ => this.start_prompt(Prompt::SsoStart, cx),
                                         },
@@ -3113,6 +3439,132 @@ impl Browser {
                         .when_some(self.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         }),
+                ),
+        )
+    }
+
+    fn render_form(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let form = self.form.as_ref()?;
+        let theme = self.theme;
+        let focused = form.focused;
+
+        Some(
+            div()
+                .id("form-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.form = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("form")
+                        .w(px(460.))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(div().text_color(theme.text).child("Profile mới"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child("Tab để chuyển ô · ⌘V để dán · Enter để lưu"),
+                        )
+                        .children(form.fields.iter().enumerate().map(|(ix, field)| {
+                            let active = ix == focused;
+                            let shown = if field.value.is_empty() {
+                                field.placeholder.to_string()
+                            } else if field.secret {
+                                "•".repeat(field.value.chars().count())
+                            } else {
+                                field.value.clone()
+                            };
+                            let empty = field.value.is_empty();
+
+                            div()
+                                .id(("field", ix))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(88.))
+                                        .text_xs()
+                                        .text_color(theme.text_faint)
+                                        .child(field.label),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme.hover)
+                                        .border_1()
+                                        // The border is the only cursor this
+                                        // input has, so the focused field has to
+                                        // be unmistakable.
+                                        .border_color(if active {
+                                            theme.accent
+                                        } else {
+                                            theme.border
+                                        })
+                                        .text_xs()
+                                        .text_color(if empty {
+                                            theme.text_faint
+                                        } else {
+                                            theme.text
+                                        })
+                                        .child(SharedString::from(if active && !empty {
+                                            format!("{shown}▌")
+                                        } else {
+                                            shown
+                                        })),
+                                )
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    if let Some(form) = this.form.as_mut() {
+                                        form.focused = ix;
+                                    }
+                                    cx.notify();
+                                }))
+                        }))
+                        .when_some(form.error.clone(), |this, error| {
+                            this.child(div().text_xs().text_color(theme.danger).child(error))
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_faint)
+                                .child("Endpoint để trống là AWS thật. R2, B2, Wasabi, Spaces và MinIO được nhận diện từ endpoint để tự đặt region và kiểu địa chỉ."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(action_button("form-cancel", "Huỷ", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.form = None;
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(action_button("form-save", "Lưu", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.submit_profile_form(cx)
+                                    }),
+                                )),
+                        ),
                 ),
         )
     }
@@ -3676,6 +4128,7 @@ impl Render for Browser {
             .children(self.render_share(cx))
             .children(self.render_palette(cx))
             .children(self.render_sso(cx))
+            .children(self.render_form(cx))
             .children(self.render_onboarding(cx))
     }
 }
@@ -3689,6 +4142,32 @@ fn section_label(text: &'static str, theme: Theme) -> impl IntoElement {
         .text_xs()
         .text_color(theme.text_faint)
         .child(text)
+}
+
+/// A section label with an add button. The button was the missing half: every
+/// way to create a profile or bucket existed only as a keyboard shortcut or as
+/// buttons that appeared when the list was empty and vanished once it was not.
+fn section_header(
+    text: &'static str,
+    id: &'static str,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .hover(|style| style.bg(theme.hover))
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child(text),
+        )
+        .child(div().text_xs().text_color(theme.text_muted).child("+"))
 }
 
 fn sidebar_row(
@@ -4084,6 +4563,7 @@ pub enum Command {
     EmptyBucket,
     AssumeRole,
     SsoSignIn,
+    NewProfile,
 }
 
 impl Command {
@@ -4108,10 +4588,11 @@ impl Command {
             Command::EmptyBucket => ("Dọn sạch bucket", ""),
             Command::AssumeRole => ("Nhận role (STS AssumeRole)", ""),
             Command::SsoSignIn => ("Đăng nhập AWS SSO", ""),
+            Command::NewProfile => ("Profile mới", ""),
         }
     }
 
-    fn all() -> [Command; 17] {
+    fn all() -> [Command; 18] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -4130,6 +4611,7 @@ impl Command {
             Command::EmptyBucket,
             Command::AssumeRole,
             Command::SsoSignIn,
+            Command::NewProfile,
         ]
     }
 }
@@ -4361,6 +4843,7 @@ mod tests {
             orphans: Vec::new(),
             orphans_open: false,
             confirm: None,
+            form: None,
             sso: None,
             palette: None,
             palette_selected: 0,
@@ -4513,6 +4996,55 @@ mod tests {
     }
 
     #[test]
+    fn profile_form_reads_fields_by_label_and_trims() {
+        let mut form = Form::new_profile();
+        form.focused = 0;
+        form.insert("  R2 của tôi  ");
+        assert_eq!(form.value("Tên"), "R2 của tôi");
+
+        // An untouched field is empty, not missing — the caller decides what an
+        // empty endpoint means (real AWS).
+        assert_eq!(form.value("Endpoint"), "");
+        // A label that does not exist must not panic the form.
+        assert_eq!(form.value("Không có"), "");
+    }
+
+    #[test]
+    fn form_focus_wraps_in_both_directions() {
+        let mut form = Form::new_profile();
+        let last = form.fields.len() - 1;
+
+        // Forward off the end comes back to the first field, so Tab always does
+        // something rather than getting stuck.
+        form.focused = last;
+        form.focus_next(false);
+        assert_eq!(form.focused, 0);
+
+        // Backwards off the front reaches the last, which is what Shift-Tab
+        // from the first field has to do.
+        form.focus_next(true);
+        assert_eq!(form.focused, last);
+    }
+
+    #[test]
+    fn typing_and_backspace_only_touch_the_focused_field() {
+        let mut form = Form::new_profile();
+        form.focused = 3;
+        form.insert("AKIA");
+        form.backspace();
+        assert_eq!(form.value("Access key"), "AKI");
+
+        // Every other field is untouched.
+        assert_eq!(form.value("Tên"), "");
+        assert_eq!(form.value("Secret key"), "");
+
+        // Backspacing an empty field is a no-op, not a panic.
+        form.focused = 0;
+        form.backspace();
+        assert_eq!(form.value("Tên"), "");
+    }
+
+    #[test]
     fn assume_role_prompt_requires_both_mfa_halves() {
         let arn = "arn:aws:iam::123456789012:role/reader";
 
@@ -4569,7 +5101,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 17);
+        assert_eq!(all.len(), 18);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
