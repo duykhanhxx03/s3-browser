@@ -3216,7 +3216,12 @@ impl Browser {
                         .child("Kéo tệp vào danh sách để tải lên")
                         .into_any_element()
                 } else {
-                    uniform_list(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(self.render_job_header())
+                        .child(uniform_list(
                         "transfers",
                         jobs.len(),
                         cx.processor(move |this, range: Range<usize>, _window, cx| {
@@ -3225,10 +3230,10 @@ impl Browser {
                                 .filter_map(|ix| jobs.get(ix).cloned())
                                 .map(|job| this.render_job(job, cx))
                                 .collect::<Vec<_>>()
-                        }),
-                    )
-                    .flex_1()
-                    .into_any_element()
+                            }),
+                        )
+                        .flex_1())
+                        .into_any_element()
                 }),
         )
     }
@@ -4217,10 +4222,52 @@ impl Browser {
             )))
     }
 
+    /// Column widths for the transfer table. Shared by the header and the rows
+    /// so they line up — the object list taught that lesson the hard way.
+    const JOB_COLS: (f32, f32, f32, f32) = (18., 150., 130., 78.);
+
+    fn render_job_header(&self) -> impl IntoElement {
+        let theme = self.theme;
+        let (icon_w, size_w, progress_w, state_w) = Self::JOB_COLS;
+
+        let cell = move |label: &'static str, width: f32| {
+            div()
+                .w(px(width))
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child(label)
+        };
+
+        div()
+            .h(px(HEADER_HEIGHT))
+            .w_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().w(px(icon_w)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("Tên"),
+            )
+            .child(cell("Kích thước", size_w))
+            .child(cell("Tiến trình", progress_w))
+            .child(cell("Trạng thái", state_w))
+            // Matches the two action buttons on a row.
+            .child(div().w(px(112.)))
+    }
+
     fn render_job(&self, job: Job, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let id = job.id;
         let fraction = job.fraction();
+        let (icon_w, size_w, progress_w, state_w) = Self::JOB_COLS;
         let direction = match job.direction {
             transfer::Direction::Upload => "upload",
             transfer::Direction::Download => "download",
@@ -4237,45 +4284,47 @@ impl Browser {
         div()
             .id(("job", id as usize))
             .h(px(JOB_ROW_HEIGHT))
+            // Same reason as the object rows: inside a uniform_list a row gets
+            // no width from its parent, so flex_1 has nothing to expand into
+            // and every column bunches up against the name.
+            .w_full()
             .px_3()
             .flex()
             .items_center()
             .gap_2()
             .text_xs()
-            .child(div().w(px(18.)).child(icon(direction, theme.text_faint)))
+            .child(div().w(px(icon_w)).child(icon(direction, theme.text_faint)))
             .child(
                 div()
                     .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                    .min_w(px(0.))
                     .overflow_hidden()
+                    .text_color(theme.text)
+                    .child(SharedString::from(job.display_name())),
+            )
+            .child(
+                div()
+                    .w(px(size_w))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "{} / {}",
+                        format_size(job.transferred as i64),
+                        format_size(job.size as i64)
+                    ))),
+            )
+            // Progress: a track with a fill, plus the percentage beside it so
+            // the number is readable when the bar is only a few pixels along.
+            .child(
+                div()
+                    .w(px(progress_w))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .child(
                         div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(job.display_name())),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(format!(
-                                        "{} / {}",
-                                        format_size(job.transferred as i64),
-                                        format_size(job.size as i64)
-                                    ))),
-                            ),
-                    )
-                    // Progress bar: an outer track with an inner fill sized by
-                    // the completed fraction.
-                    .child(
-                        div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .h(px(PROGRESS_HEIGHT))
-                            .w_full()
                             .rounded_sm()
                             .bg(theme.hover)
                             .child(
@@ -4289,39 +4338,70 @@ impl Browser {
                                         theme.accent
                                     }),
                             ),
+                    )
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!(
+                                "{}%",
+                                (fraction * 100.0).round() as u32
+                            ))),
                     ),
             )
             .child(
                 div()
-                    .w(px(64.))
+                    .w(px(state_w))
                     .text_color(state_color)
                     .child(state_label),
             )
-            .child(match job.state {
-                JobState::Running | JobState::Queued => action_button("pause", "Tạm dừng", theme)
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.transfers.pause(id);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                JobState::Paused | JobState::Failed => action_button("resume", "Tiếp tục", theme)
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if let Some(client) = this.client.clone() {
-                            this.transfers.resume(id, client);
-                            this.start_ticking(cx);
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                _ => div().into_any_element(),
-            })
             .child(
-                icon_button("remove", "close", theme).on_click(cx.listener(
-                    move |this, _event, _window, cx| {
-                        this.transfers.remove_job(id);
-                        cx.notify();
-                    },
-                )),
+                div()
+                    .w(px(112.))
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(match job.state {
+                        JobState::Running | JobState::Queued => {
+                            icon_button_dyn(
+                                SharedString::from(format!("pause-{id}")),
+                                "pause",
+                                theme,
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.transfers.pause(id);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                        }
+                        JobState::Paused | JobState::Failed => {
+                            icon_button_dyn(
+                                SharedString::from(format!("resume-{id}")),
+                                "play",
+                                theme,
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                if let Some(client) = this.client.clone() {
+                                    this.transfers.resume(id, client);
+                                    this.start_ticking(cx);
+                                }
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                        }
+                        _ => div().into_any_element(),
+                    })
+                    .child(
+                        icon_button_dyn(
+                            SharedString::from(format!("remove-{id}")),
+                            "close",
+                            theme,
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.transfers.remove_job(id);
+                            cx.notify();
+                        })),
+                    ),
             )
     }
 
