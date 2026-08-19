@@ -195,7 +195,7 @@ Xong: reduced-transparency (glass tự tắt khi bật cài đặt trợ năng),
 2. Bundle vừa dựng xong có chữ ký **không hợp lệ** (`code has no resources but signature indicates they must be present`) — linker ký cho file binary đơn lẻ, không ký cho cấu trúc bundle bọc quanh nó sau đó. Phải `codesign --force --deep --sign -` lại kể cả để chạy thử.
 3. Ký ad-hoc xong `codesign --verify` báo hợp lệ nhưng `spctl` **vẫn từ chối** — chữ ký hợp lệ về cấu trúc không đồng nghĩa với được phép phân phối.
 
-Còn lại: crash reporting (sentry + minidump).
+**Crash reporting:** phần bắt lỗi cục bộ đã xong và có kiểm chứng bằng crash thật — panic hook ghi báo cáo (phiên bản, nền tảng, vị trí, thông điệp, backtrace) vào `~/Library/Application Support/s3browser/crashes/`. Phần gửi lên Sentry **cố tình chưa nối**: nó cần DSN thuộc về người vận hành dự án, mà code viết cho một endpoint không ai gọi được thì không kiểm chứng được — nó sẽ trông như đã xong trong khi chưa hề chạy thử.
 
 ### Chi tiết M5 gốc
 Onboarding lần đầu; polish theme/animation/reduced-transparency; crash reporting (sentry + minidump); đóng gói `cargo-packager` (.app + .dmg), ký Developer ID + notarize (`rcodesign` hoặc notarytool), auto-update (`cargo-packager-updater` hoặc Velopack). **Phân phối trực tiếp, không App Store** (App Sandbox siết drag-drop/bookmark; GPUI chưa có accessibility — rủi ro review).

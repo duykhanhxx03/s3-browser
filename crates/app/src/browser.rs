@@ -35,6 +35,27 @@ macro_rules! debug_log {
 }
 
 const ROW_HEIGHT: f32 = 28.;
+/// One scale for every bar and panel, so nothing is a few pixels off its
+/// neighbour for no reason. Before this there were six different bar heights
+/// and three widths for what is visually the same dialog.
+const TOOLBAR_HEIGHT: f32 = 40.;
+/// Label-only bars: column headers.
+const HEADER_HEIGHT: f32 = 28.;
+/// Bars that hold buttons. Taller than a plain header because a button with
+/// padding does not fit in 28px — collapsing both into one height made the
+/// drawer controls overflow their own bar.
+const CONTROL_BAR_HEIGHT: f32 = 34.;
+/// A transfer row carries two lines (name and progress), so it is taller.
+const JOB_ROW_HEIGHT: f32 = 38.;
+/// The drawer and the orphan list.
+const PANEL_HEIGHT: f32 = 200.;
+const DIALOG_WIDTH: f32 = 460.;
+/// Right-hand inspector.
+const INSPECTOR_WIDTH: f32 = 320.;
+/// Tall enough for every command without scrolling; it scrolls anyway once a
+/// filter is typed and more rows appear than fit.
+const PALETTE_HEIGHT: f32 = 452.;
+const PROGRESS_HEIGHT: f32 = 4.;
 const SIDEBAR_WIDTH: f32 = 214.;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
@@ -2546,7 +2567,7 @@ impl Browser {
         let bucket = self.bucket.clone();
 
         div()
-            .h(px(40.))
+            .h(px(TOOLBAR_HEIGHT))
             .flex()
             .items_center()
             .gap_1()
@@ -2746,7 +2767,7 @@ impl Browser {
         };
 
         div()
-            .h(px(26.))
+            .h(px(HEADER_HEIGHT))
             .flex()
             .items_center()
             .gap_2()
@@ -2844,7 +2865,7 @@ impl Browser {
         };
 
         div()
-            .h(px(26.))
+            .h(px(HEADER_HEIGHT))
             .flex()
             .items_center()
             .gap_2()
@@ -2903,7 +2924,7 @@ impl Browser {
 
         Some(
             div()
-                .h(px(168.))
+                .h(px(PANEL_HEIGHT))
                 .flex()
                 .flex_col()
                 .bg(theme.panel)
@@ -2911,7 +2932,7 @@ impl Browser {
                 .border_color(theme.border_strong)
                 .child(
                     div()
-                        .h(px(26.))
+                        .h(px(CONTROL_BAR_HEIGHT))
                         .flex()
                         .items_center()
                         .gap_2()
@@ -3285,7 +3306,7 @@ impl Browser {
 
         Some(
             div()
-                .w(px(300.))
+                .w(px(INSPECTOR_WIDTH))
                 .h_full()
                 .flex()
                 .flex_col()
@@ -3294,7 +3315,7 @@ impl Browser {
                 .border_color(theme.border)
                 .child(
                     div()
-                        .h(px(28.))
+                        .h(px(CONTROL_BAR_HEIGHT))
                         .px_3()
                         .flex()
                         .items_center()
@@ -3341,7 +3362,7 @@ impl Browser {
                 .child(
                     div()
                         .id("share-dialog")
-                        .w(px(460.))
+                        .w(px(DIALOG_WIDTH))
                         .p_4()
                         .flex()
                         .flex_col()
@@ -3463,7 +3484,7 @@ impl Browser {
                 .justify_center()
                 .child(
                     div()
-                        .w(px(460.))
+                        .w(px(DIALOG_WIDTH))
                         .flex()
                         .flex_col()
                         .gap_4()
@@ -3555,7 +3576,7 @@ impl Browser {
                 .child(
                     div()
                         .id("form")
-                        .w(px(460.))
+                        .w(px(DIALOG_WIDTH))
                         .p_4()
                         .flex()
                         .flex_col()
@@ -3573,7 +3594,7 @@ impl Browser {
                                 .gap_2()
                                 .child(
                                     div()
-                                        .w(px(88.))
+                                        .w(px(84.))
                                         .text_xs()
                                         .text_color(theme.text_faint)
                                         .child(field.label),
@@ -3627,7 +3648,7 @@ impl Browser {
                 .child(
                     div()
                         .id("sso-dialog")
-                        .w(px(460.))
+                        .w(px(DIALOG_WIDTH))
                         .max_h(px(420.))
                         .p_4()
                         .flex()
@@ -3738,8 +3759,8 @@ impl Browser {
                     div()
                         .id("palette")
                         .mt(px(90.))
-                        .w(px(440.))
-                        .h(px(452.))
+                        .w(px(DIALOG_WIDTH))
+                        .h(px(PALETTE_HEIGHT))
                         .flex()
                         .flex_col()
                         .rounded_lg()
@@ -3749,7 +3770,7 @@ impl Browser {
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .h(px(34.))
+                                .h(px(HEADER_HEIGHT))
                                 .px_3()
                                 .flex()
                                 .items_center()
@@ -3777,7 +3798,7 @@ impl Browser {
                                     let command = *command;
                                     div()
                                         .id(("cmd", ix))
-                                        .h(px(26.))
+                                        .h(px(HEADER_HEIGHT))
                                         .px_3()
                                         .flex()
                                         .items_center()
@@ -3832,7 +3853,7 @@ impl Browser {
                 .child(
                     div()
                         .id("confirm-dialog")
-                        .w(px(380.))
+                        .w(px(DIALOG_WIDTH))
                         .p_4()
                         .flex()
                         .flex_col()
@@ -3885,7 +3906,7 @@ impl Browser {
 
         Some(
             div()
-                .h(px(168.))
+                .h(px(PANEL_HEIGHT))
                 .flex()
                 .flex_col()
                 .bg(theme.panel)
@@ -3893,7 +3914,7 @@ impl Browser {
                 .border_color(theme.border_strong)
                 .child(
                     div()
-                        .h(px(26.))
+                        .h(px(CONTROL_BAR_HEIGHT))
                         .flex()
                         .items_center()
                         .gap_2()
@@ -3959,7 +3980,7 @@ impl Browser {
 
         div()
             .id(upload_id.clone())
-            .h(px(32.))
+            .h(px(HEADER_HEIGHT))
             .px_3()
             .flex()
             .items_center()
@@ -3997,7 +4018,7 @@ impl Browser {
 
         div()
             .id(("job", id as usize))
-            .h(px(38.))
+            .h(px(JOB_ROW_HEIGHT))
             .px_3()
             .flex()
             .items_center()
@@ -4035,7 +4056,7 @@ impl Browser {
                     // the completed fraction.
                     .child(
                         div()
-                            .h(px(4.))
+                            .h(px(PROGRESS_HEIGHT))
                             .w_full()
                             .rounded_sm()
                             .bg(theme.hover)
@@ -4092,7 +4113,7 @@ impl Browser {
 
         Some(
             div()
-                .h(px(32.))
+                .h(px(CONTROL_BAR_HEIGHT))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -4350,7 +4371,7 @@ fn icon_button(id: &'static str, name: &'static str, theme: Theme) -> gpui::Stat
     div()
         .id(id)
         .w(px(26.))
-        .h(px(26.))
+        .h(px(HEADER_HEIGHT))
         .flex()
         .items_center()
         .justify_center()

@@ -8,6 +8,7 @@
 
 mod assets;
 mod browser;
+mod crash;
 #[cfg(target_os = "macos")]
 mod glass_check;
 mod platform;
@@ -21,6 +22,9 @@ use browser::Browser;
 use platform::Chrome;
 
 fn main() {
+    // Before anything else: a panic during setup should still leave a report.
+    crash::install();
+
     Application::new()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
