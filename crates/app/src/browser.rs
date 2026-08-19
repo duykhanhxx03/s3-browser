@@ -54,6 +54,8 @@ pub enum Prompt {
     AddTag,
     /// The KMS key id to encrypt uploads with.
     KmsKey,
+    /// A bucket name to open directly, for tokens that cannot list buckets.
+    OpenBucket,
     /// Role ARN to assume, optionally followed by an MFA code.
     AssumeRole,
     /// The organisation's SSO portal URL, optionally with ` <region>`.
@@ -69,6 +71,7 @@ impl Prompt {
             Prompt::Rename(_) => "Tên mới",
             Prompt::AddTag => "Thẻ mới (khoá=giá trị)",
             Prompt::KmsKey => "KMS key id",
+            Prompt::OpenBucket => "Tên bucket cần mở",
             Prompt::AssumeRole => "Role ARN (thêm ' mfa:<serial> <mã>' nếu cần)",
             Prompt::SsoStart => "SSO start URL (thêm ' <region>' nếu khác us-east-1)",
         }
@@ -474,7 +477,11 @@ impl Browser {
 
         let connecting = Tokio::spawn(cx, async move {
             let client = S3Client::connect(&profile).await?;
-            let buckets = client.list_buckets().await?;
+            // Not `?`: a token scoped to one bucket — the normal, recommended
+            // setup on R2 — is denied ListBuckets while the bucket itself works
+            // fine. Failing the whole connection here left those users with no
+            // way in at all.
+            let buckets = client.list_buckets().await;
             anyhow::Ok((client, buckets))
         });
 
@@ -482,9 +489,22 @@ impl Browser {
             let outcome = connecting.await;
             _ = this.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok((client, buckets))) => {
+                    Ok(Ok((client, listed))) => {
+                        let buckets = match listed {
+                            Ok(buckets) => {
+                                this.status = format!("{} bucket", buckets.len()).into();
+                                buckets
+                            }
+                            Err(error) => {
+                                debug_log!("ListBuckets failed: {error}");
+                                // Say what to do next, not just what broke.
+                                this.status =
+                                    "Không liệt kê được bucket — token có thể chỉ có quyền trên một bucket. Bấm + ở BUCKETS để mở theo tên."
+                                        .into();
+                                Vec::new()
+                            }
+                        };
                         debug_log!("connected: {} buckets {:?}", buckets.len(), buckets);
-                        this.status = format!("{} bucket", buckets.len()).into();
                         this.buckets = buckets.into_iter().map(SharedString::from).collect();
                         this.client = Some(client);
                         // `--open bucket/prefix/` jumps straight to a location,
@@ -1040,6 +1060,14 @@ impl Browser {
             return;
         }
 
+        // A pasted endpoint often carries the bucket; keep it to open later
+        // rather than letting it break the connection.
+        let (endpoint, bucket_hint) = if endpoint.is_empty() {
+            (String::new(), None)
+        } else {
+            split_endpoint(&endpoint)
+        };
+
         let stored = StoredProfile {
             id: vault::new_profile_id(&name, &self.profiles),
             name,
@@ -1060,6 +1088,14 @@ impl Browser {
 
         self.form = None;
         self.add_profile(stored, &secret_key, cx);
+        if let Some(bucket) = bucket_hint {
+            // The connection is still in flight; remembering it here means the
+            // sidebar has something even when ListBuckets is denied.
+            let bucket = SharedString::from(bucket);
+            if !self.buckets.contains(&bucket) {
+                self.buckets.push(bucket);
+            }
+        }
     }
 
     /// Removes a profile and the secret behind it. Asking first because the
@@ -2097,6 +2133,15 @@ impl Browser {
                 self.rename_entry(key, text.trim().to_string(), cx)
             }
             Prompt::AddTag if !text.trim().is_empty() => self.add_tag(text, cx),
+            Prompt::OpenBucket if !text.trim().is_empty() => {
+                let bucket = SharedString::from(text.trim().to_string());
+                // Remember it, so a token that cannot list still builds a usable
+                // sidebar over a session.
+                if !self.buckets.contains(&bucket) {
+                    self.buckets.push(bucket.clone());
+                }
+                self.open(bucket, String::new(), cx);
+            }
             Prompt::AssumeRole if !text.trim().is_empty() => self.assume_role(text, cx),
             Prompt::SsoStart if !text.trim().is_empty() => self.start_sso(text, cx),
             Prompt::KmsKey if !text.trim().is_empty() => {
@@ -2371,7 +2416,10 @@ impl Browser {
                 section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
                     |this, _event, _window, cx| {
                         if this.client.is_some() {
-                            this.start_prompt(Prompt::NewBucket, cx);
+                            // Opening by name rather than creating: a scoped
+                            // token is denied CreateBucket too, and reaching an
+                            // existing bucket is the far more common need.
+                            this.start_prompt(Prompt::OpenBucket, cx);
                         }
                     },
                 )),
@@ -2473,11 +2521,13 @@ impl Browser {
                         .child(SharedString::from(format!("lọc: {}", self.filter))),
                 )
             })
-            .child(
-                action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
-                    |this, _event, _window, cx| this.start_prompt(Prompt::NewFolder, cx),
-                )),
-            )
+            .when(bucket.is_some(), |this| {
+                this.child(
+                    action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.start_prompt(Prompt::NewFolder, cx),
+                    )),
+                )
+            })
             .when(bucket.is_some(), |this| {
                 this.child(
                     action_button("scan-orphans", "Dọn upload dở", theme).on_click(cx.listener(
@@ -2523,6 +2573,59 @@ impl Browser {
                         })),
                 )
             })
+    }
+
+    /// What fills the object pane when there is nothing to list. A blank area
+    /// with the explanation hidden in the status bar left the user staring at
+    /// black — the recovery has to be where they are already looking.
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.bucket.is_some() || self.client.is_none() {
+            return None;
+        }
+        let theme = self.theme;
+        let cannot_list = self.buckets.is_empty();
+
+        Some(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_color(theme.text)
+                        .child(if cannot_list {
+                            "Không liệt kê được bucket"
+                        } else {
+                            "Chọn một bucket"
+                        }),
+                )
+                .child(
+                    div()
+                        .max_w(px(440.))
+                        .text_xs()
+                        .child(wrapped_text(
+                            if cannot_list {
+                                // The common R2 case, named so the user can tell
+                                // this apart from wrong credentials.
+                                "Token này có thể chỉ có quyền trên một bucket cụ thể — với R2 đó là cách cấp quyền được khuyến nghị. Mở thẳng bucket theo tên."
+                            } else {
+                                "Chọn ở cột bên trái, hoặc mở theo tên."
+                            },
+                            62,
+                            theme.text_muted,
+                        )),
+                )
+                .child(
+                    action_button("empty-open-bucket", "Mở bucket theo tên", theme).on_click(
+                        cx.listener(|this, _event, _window, cx| {
+                            this.start_prompt(Prompt::OpenBucket, cx)
+                        }),
+                    ),
+                ),
+        )
     }
 
     fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3275,14 +3378,11 @@ impl Browser {
                                 .flex_col()
                                 .gap_1()
                                 .child(div().text_color(theme.text).child("s3browser"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.text_muted)
-                                        .child(
-                                            "Cần một profile để bắt đầu. Khoá bí mật lưu trong Keychain của máy, không nằm trong file cấu hình.",
-                                        ),
-                                ),
+                                .child(div().text_xs().child(wrapped_text(
+                                    "Cần một profile để bắt đầu. Khoá bí mật lưu trong Keychain của máy, không nằm trong file cấu hình.",
+                                    64,
+                                    theme.text_muted,
+                                ))),
                         )
                         .children(
                             [
@@ -3334,12 +3434,11 @@ impl Browser {
                                             .flex_col()
                                             .gap_1()
                                             .child(div().text_color(theme.text).child(title))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.text_muted)
-                                                    .child(detail),
-                                            ),
+                                            .child(div().text_xs().child(wrapped_text(
+                                                detail,
+                                                52,
+                                                theme.text_muted,
+                                            ))),
                                     )
                                     .child(action_button(id, button, theme).on_click(cx.listener(
                                         move |this, _event, window, cx| match id {
@@ -3421,12 +3520,11 @@ impl Browser {
                         .when_some(form.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         })
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.text_faint)
-                                .child("Endpoint để trống là AWS thật. R2, B2, Wasabi, Spaces và MinIO được nhận diện từ endpoint để tự đặt region và kiểu địa chỉ."),
-                        )
+                        .child(div().text_xs().child(wrapped_text(
+                            "Endpoint để trống là AWS thật. R2, B2, Wasabi, Spaces và MinIO được nhận diện từ endpoint để tự đặt region và kiểu địa chỉ.",
+                            60,
+                            theme.text_faint,
+                        )))
                         .child(
                             div()
                                 .flex()
@@ -4001,8 +4099,13 @@ impl Render for Browser {
                                     this.start_uploads(paths.paths().to_vec(), cx);
                                 },
                             ))
-                            .child(self.render_columns(cx))
-                            .child(self.render_rows(cx)),
+                            .when_some(self.render_empty_state(cx), |this, empty| {
+                                this.child(empty)
+                            })
+                            .when(self.bucket.is_some(), |this| {
+                                this.child(self.render_columns(cx))
+                                    .child(self.render_rows(cx))
+                            }),
                     )
                     .children(self.render_inspector(cx)),
             )
@@ -4415,6 +4518,84 @@ fn parse_assume_role(text: &str) -> Option<s3core::sts::AssumeRole> {
         mfa_code,
         duration: None,
     })
+}
+
+/// Breaks text into lines at word boundaries.
+///
+/// gpui 0.2.2 wraps by treating any non-ASCII character as a break opportunity,
+/// so Vietnamese text splits mid-word — "cấp" comes out as "c" / "ấp", which
+/// reads as a rendering fault. Wrapping here and rendering one line per element
+/// sidesteps the built-in wrapping entirely.
+///
+/// `max_chars` is a character budget, not a pixel measurement: the UI font is
+/// proportional, so this is an approximation chosen to fit the container rather
+/// than an exact fit.
+fn wrap_words(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let line_len = line.chars().count();
+
+        if !line.is_empty() && line_len + 1 + word_len > max_chars {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        // A word longer than the budget goes on its own line rather than being
+        // cut: breaking it is what this function exists to avoid.
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// A block of text wrapped at word boundaries, one element per line.
+fn wrapped_text(text: &str, max_chars: usize, color: gpui::Hsla) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .text_color(color)
+        .children(
+            wrap_words(text, max_chars)
+                .into_iter()
+                .map(SharedString::from)
+                .map(|line| div().child(line)),
+        )
+}
+
+/// Splits a bucket off the end of an endpoint URL.
+///
+/// Cloudflare's dashboard shows the S3 endpoint with the bucket already on it
+/// (`https://<id>.r2.cloudflarestorage.com/<bucket>`), which is the string
+/// people copy. Pasted as-is it breaks: the SDK cannot handle an endpoint with
+/// a path prefix (aws-sdk-rust#1387), and the failure looks like bad
+/// credentials rather than a bad URL.
+///
+/// Returns the endpoint without the path, plus the bucket if there was one.
+fn split_endpoint(endpoint: &str) -> (String, Option<String>) {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return (trimmed.to_string(), None);
+    };
+
+    match rest.split_once('/') {
+        Some((host, path)) if !path.is_empty() => {
+            // Only a single segment is a bucket; anything deeper is a path
+            // prefix this app cannot serve, so leave it for the caller to
+            // reject rather than silently guessing.
+            let bucket = path.split('/').next().unwrap_or(path);
+            (format!("{scheme}://{host}"), Some(bucket.to_string()))
+        }
+        _ => (format!("{scheme}://{rest}"), None),
+    }
 }
 
 /// What is wrong with a profile form, or `None` if nothing is.
@@ -4895,6 +5076,86 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn wrapping_never_splits_a_word() {
+        // The bug this exists for: gpui breaks before any non-ASCII character,
+        // turning "cấp" into "c" / "ấp". Every line here must be whole words.
+        let text = "Token này có thể chỉ có quyền trên một bucket cụ thể — với R2 đó là cách cấp quyền được khuyến nghị.";
+        let lines = wrap_words(text, 40);
+        assert!(lines.len() > 1, "this text is long enough to wrap");
+        for line in &lines {
+            assert!(!line.starts_with(' ') && !line.ends_with(' '), "{line:?}");
+        }
+        // Rejoining the lines must give back exactly the words, in order —
+        // nothing dropped and nothing cut in half.
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
+        );
+
+        // Short text stays on one line.
+        assert_eq!(wrap_words("ngắn", 40), vec!["ngắn"]);
+
+        // A word longer than the budget gets its own line rather than being cut.
+        let long = "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com";
+        assert_eq!(wrap_words(long, 20), vec![long]);
+
+        // Empty input still yields one (empty) line, so callers can render
+        // unconditionally.
+        assert_eq!(wrap_words("", 40), vec![String::new()]);
+        assert_eq!(wrap_words("   ", 40), vec![String::new()]);
+
+        // The budget is respected where the words allow it.
+        for line in wrap_words(text, 30) {
+            let len = line.chars().count();
+            assert!(
+                len <= 30 || !line.contains(' '),
+                "line over budget without being a single long word: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_with_a_bucket_on_it_is_split_rather_than_broken() {
+        // Exactly what Cloudflare's dashboard hands you, and what people paste.
+        assert_eq!(
+            split_endpoint("https://abc123.r2.cloudflarestorage.com/s3-browser"),
+            (
+                "https://abc123.r2.cloudflarestorage.com".into(),
+                Some("s3-browser".into())
+            )
+        );
+
+        // A plain endpoint is left alone.
+        assert_eq!(
+            split_endpoint("https://abc123.r2.cloudflarestorage.com"),
+            ("https://abc123.r2.cloudflarestorage.com".into(), None)
+        );
+        // A trailing slash is not a bucket.
+        assert_eq!(
+            split_endpoint("http://127.0.0.1:9000/"),
+            ("http://127.0.0.1:9000".into(), None)
+        );
+        // Port survives the split.
+        assert_eq!(
+            split_endpoint("http://127.0.0.1:9000/demo"),
+            ("http://127.0.0.1:9000".into(), Some("demo".into()))
+        );
+        // Surrounding whitespace from a paste.
+        assert_eq!(
+            split_endpoint("  https://h/b  "),
+            ("https://h".into(), Some("b".into()))
+        );
+        // Deeper paths take only the first segment as the bucket.
+        assert_eq!(
+            split_endpoint("https://h/bucket/prefix"),
+            ("https://h".into(), Some("bucket".into()))
+        );
+        // Something with no scheme is passed through untouched rather than
+        // mangled into a wrong host.
+        assert_eq!(split_endpoint("localhost:9000"), ("localhost:9000".into(), None));
     }
 
     #[test]
