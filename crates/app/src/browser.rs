@@ -551,6 +551,11 @@ impl Browser {
             self.bucket_versioned = false;
             self.refresh_versioning(bucket.clone(), cx);
         }
+        // Reached by name or by `--open`, it still belongs in the list — the
+        // sidebar was empty while the user was plainly inside a bucket.
+        if !self.buckets.contains(&bucket) {
+            self.buckets.push(bucket.clone());
+        }
         self.bucket = Some(bucket.clone());
         self.prefix = prefix.clone();
         self.entries.clear();
@@ -2535,13 +2540,7 @@ impl Browser {
                     )),
                 )
             })
-            .when(bucket.is_some() && self.selection.is_empty(), |this| {
-                this.child(
-                    danger_button("empty-bucket", "Dọn sạch bucket".into(), theme).on_click(
-                        cx.listener(|this, _event, _window, cx| this.ask_empty_bucket(cx)),
-                    ),
-                )
-            })
+
             .when(self.selection.len() == 1, |this| {
                 this.child(
                     action_button("rename", "Đổi tên", theme).on_click(cx.listener(
@@ -4295,6 +4294,10 @@ fn object_row(
     div()
         .id(position)
         .h(px(ROW_HEIGHT))
+        // Without this the row is only as wide as its content: `flex_1` on the
+        // name has nothing to expand into, so the size and date columns bunch up
+        // against the name instead of lining up under their headers.
+        .w_full()
         .px_3()
         .flex()
         .items_center()
@@ -4311,6 +4314,7 @@ fn object_row(
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .overflow_hidden()
                 .text_color(theme.text)
                 .child(SharedString::from(entry.name.clone())),
