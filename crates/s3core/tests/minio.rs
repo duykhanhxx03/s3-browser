@@ -426,3 +426,47 @@ async fn an_expired_signature_is_refused() {
 
     client.delete_object(bucket, key).await.unwrap();
 }
+
+#[tokio::test]
+async fn reads_metadata_and_round_trips_tags() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let key = "inspect-tests/doc.txt";
+    client
+        .put_object(bucket, key, b"inspect me".to_vec())
+        .await
+        .unwrap();
+
+    let head = client.head_object(bucket, key).await.unwrap();
+    assert_eq!(head.size, 10);
+    assert!(head.modified_epoch.is_some(), "inspector shows a date");
+    assert!(head.etag.is_some());
+    // A plain object is readable as-is, so no restore control should appear.
+    assert_eq!(
+        s3core::restore_state(head.restore.as_deref(), head.storage_class.as_deref()),
+        s3core::RestoreState::NotArchived
+    );
+
+    // No tags yet.
+    assert!(client.object_tags(bucket, key).await.unwrap().is_empty());
+
+    let tags = vec![
+        ("env".to_string(), "prod".to_string()),
+        ("owner".to_string(), "mai".to_string()),
+    ];
+    client.set_object_tags(bucket, key, &tags).await.unwrap();
+    assert_eq!(client.object_tags(bucket, key).await.unwrap(), tags);
+
+    // Writing a shorter set replaces rather than merges — S3 has no per-tag edit.
+    let one = vec![("env".to_string(), "staging".to_string())];
+    client.set_object_tags(bucket, key, &one).await.unwrap();
+    assert_eq!(client.object_tags(bucket, key).await.unwrap(), one);
+
+    // The empty set deletes the tagging entirely.
+    client.set_object_tags(bucket, key, &[]).await.unwrap();
+    assert!(client.object_tags(bucket, key).await.unwrap().is_empty());
+
+    client.delete_object(bucket, key).await.unwrap();
+}

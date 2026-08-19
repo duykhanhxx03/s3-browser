@@ -12,7 +12,8 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
-    CompletedMultipartUpload, Delete, MetadataDirective, ObjectIdentifier, StorageClass,
+    CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective, ObjectIdentifier,
+    RestoreRequest, StorageClass, Tag, Tagging, Tier,
 };
 use aws_sdk_s3::Client;
 
@@ -143,6 +144,26 @@ pub struct ObjectHead {
     pub etag: Option<String>,
     /// `None` means STANDARD; S3 omits the header for it.
     pub storage_class: Option<String>,
+    pub content_type: Option<String>,
+    pub modified_epoch: Option<i64>,
+    /// User metadata (the `x-amz-meta-` headers), without the prefix.
+    pub metadata: Vec<(String, String)>,
+    /// The raw `x-amz-restore` header for an archived object: it says whether a
+    /// restore is still running and when the copy expires.
+    pub restore: Option<String>,
+}
+
+/// How far along a Glacier restore is. Derived from `x-amz-restore`, which is
+/// absent entirely for objects that were never archived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreState {
+    /// Readable as-is; no restore involved.
+    NotArchived,
+    /// Archived and not restored — a GET would fail until a restore is asked for.
+    Archived,
+    InProgress,
+    /// Restored and readable until the temporary copy expires.
+    Done,
 }
 
 /// One finished part of a multipart upload. Persisted so a resumed upload can
@@ -413,6 +434,22 @@ impl S3Client {
             size: out.content_length().unwrap_or(0),
             etag: out.e_tag().map(str::to_owned),
             storage_class: out.storage_class().map(|class| class.as_str().to_owned()),
+            content_type: out.content_type().map(str::to_owned),
+            modified_epoch: out.last_modified().map(|t| t.secs()),
+            metadata: out
+                .metadata()
+                .map(|map| {
+                    let mut pairs: Vec<(String, String)> = map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    // S3 returns metadata unordered; a stable order keeps the
+                    // inspector from reshuffling itself on every refresh.
+                    pairs.sort();
+                    pairs
+                })
+                .unwrap_or_default(),
+            restore: out.restore().map(str::to_owned),
         })
     }
 
@@ -626,6 +663,111 @@ impl S3Client {
                 })
             })
             .collect())
+    }
+
+    pub async fn object_tags(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>> {
+        let out = self
+            .inner
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("GetObjectTagging failed for s3://{bucket}/{key}"))?;
+
+        let mut tags: Vec<(String, String)> = out
+            .tag_set()
+            .iter()
+            .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+            .collect();
+        tags.sort();
+        Ok(tags)
+    }
+
+    /// Replaces the whole tag set — S3 has no way to change one tag. An empty
+    /// set deletes the tagging, which is why this doubles as the delete path.
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: &[(String, String)],
+    ) -> Result<()> {
+        if tags.is_empty() {
+            self.inner
+                .delete_object_tagging()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .with_context(|| format!("DeleteObjectTagging failed for s3://{bucket}/{key}"))?;
+            return Ok(());
+        }
+
+        let mut set = Vec::with_capacity(tags.len());
+        for (key_name, value) in tags {
+            set.push(
+                Tag::builder()
+                    .key(key_name)
+                    .value(value)
+                    .build()
+                    .context("thẻ không hợp lệ")?,
+            );
+        }
+
+        self.inner
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .tagging(
+                Tagging::builder()
+                    .set_tag_set(Some(set))
+                    .build()
+                    .context("bộ thẻ không hợp lệ")?,
+            )
+            .send()
+            .await
+            .with_context(|| format!("PutObjectTagging failed for s3://{bucket}/{key}"))?;
+        Ok(())
+    }
+
+    /// Asks for an archived object to be made readable for `days`. The call
+    /// returns immediately; the copy appears minutes to hours later depending on
+    /// the tier, which is why the inspector polls the restore state rather than
+    /// treating this as done.
+    pub async fn restore_object(&self, bucket: &str, key: &str, days: i32) -> Result<()> {
+        let request = RestoreRequest::builder()
+            .days(days)
+            .glacier_job_parameters(
+                GlacierJobParameters::builder()
+                    .tier(Tier::Standard)
+                    .build()
+                    .context("tham số restore không hợp lệ")?,
+            )
+            .build();
+
+        match self
+            .inner
+            .restore_object()
+            .bucket(bucket)
+            .key(key)
+            .restore_request(request)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A restore already running is not a failure the user needs to
+                // see as one — it means what they asked for is happening.
+                let message = format!("{error:?}");
+                if message.contains("RestoreAlreadyInProgress") {
+                    Ok(())
+                } else {
+                    Err(error).with_context(|| {
+                        format!("RestoreObject failed for s3://{bucket}/{key}")
+                    })
+                }
+            }
+        }
     }
 
     /// A time-limited URL anyone can GET without credentials.
@@ -946,6 +1088,31 @@ impl S3Client {
     }
 }
 
+/// Reads `x-amz-restore`. The header looks like `ongoing-request="false",
+/// expiry-date="..."` — the flag matters more than the date, because an object
+/// with a restore still running is not readable yet however promising it looks.
+///
+/// The header is absent both for objects that were never archived and for
+/// archived ones nobody has asked for yet, so the storage class is what tells
+/// those two apart.
+pub fn restore_state(restore_header: Option<&str>, storage_class: Option<&str>) -> RestoreState {
+    match restore_header {
+        Some(header) if header.contains("ongoing-request=\"true\"") => RestoreState::InProgress,
+        Some(_) => RestoreState::Done,
+        None if storage_class.is_some_and(is_archived_class) => RestoreState::Archived,
+        None => RestoreState::NotArchived,
+    }
+}
+
+/// Storage classes that cannot be read without restoring first.
+///
+/// `GLACIER_IR` is deliberately absent: Instant Retrieval is cheap-but-slow
+/// storage that still serves a plain GET, so offering a restore for it would be
+/// an operation that does nothing.
+pub fn is_archived_class(storage_class: &str) -> bool {
+    matches!(storage_class, "GLACIER" | "DEEP_ARCHIVE")
+}
+
 /// SigV4's hard ceiling for a presigned URL.
 pub const PRESIGN_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -1094,6 +1261,45 @@ mod tests {
             session_token: None,
             relaxed_checksums: false,
         }
+    }
+
+    #[test]
+    fn restore_state_distinguishes_archived_from_merely_cold() {
+        // Never archived: no header, ordinary class.
+        assert_eq!(restore_state(None, None), RestoreState::NotArchived);
+        assert_eq!(
+            restore_state(None, Some("STANDARD_IA")),
+            RestoreState::NotArchived
+        );
+
+        // Archived and untouched — a GET would fail, so the UI must offer a restore.
+        assert_eq!(restore_state(None, Some("GLACIER")), RestoreState::Archived);
+        assert_eq!(
+            restore_state(None, Some("DEEP_ARCHIVE")),
+            RestoreState::Archived
+        );
+
+        // Instant Retrieval serves a plain GET; offering a restore would do nothing.
+        assert_eq!(
+            restore_state(None, Some("GLACIER_IR")),
+            RestoreState::NotArchived
+        );
+        assert!(!is_archived_class("GLACIER_IR"));
+
+        // Restore running: not readable yet, however encouraging the header looks.
+        assert_eq!(
+            restore_state(Some(r#"ongoing-request="true""#), Some("GLACIER")),
+            RestoreState::InProgress
+        );
+
+        // Restore finished, with the expiry the copy is good until.
+        assert_eq!(
+            restore_state(
+                Some(r#"ongoing-request="false", expiry-date="Fri, 21 Aug 2026 00:00:00 GMT""#),
+                Some("GLACIER")
+            ),
+            RestoreState::Done
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use s3core::{
-    format_size, format_timestamp, sort_entries, Entry, OrphanedUpload, Profile, S3Client, Sort,
-    SortKey,
+    format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
+    OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{ImportedProfile, ProfileStore, StoredProfile};
@@ -48,6 +48,8 @@ pub enum Prompt {
     /// Renaming the one selected entry; carries its key so the rename still
     /// targets the right object if the selection changes while typing.
     Rename(String),
+    /// Adding a tag to the inspected object, typed as `khoá=giá trị`.
+    AddTag,
 }
 
 impl Prompt {
@@ -57,6 +59,7 @@ impl Prompt {
             Prompt::NewFolder => "Tên thư mục mới",
             Prompt::NewBucket => "Tên bucket mới",
             Prompt::Rename(_) => "Tên mới",
+            Prompt::AddTag => "Thẻ mới (khoá=giá trị)",
         }
     }
 }
@@ -78,6 +81,16 @@ pub struct Share {
     /// Set when the profile signs with a session token, which caps how long any
     /// URL can really last.
     temporary_credentials: bool,
+}
+
+/// The inspector's contents for one object. Metadata costs a HEAD and tags cost
+/// another request, so this is only ever filled in when the panel is open — a
+/// listing must never pay for it.
+pub struct Inspection {
+    key: String,
+    head: Option<ObjectHead>,
+    tags: Vec<(String, String)>,
+    loading: bool,
 }
 
 pub struct Browser {
@@ -124,6 +137,7 @@ pub struct Browser {
     confirm: Option<Confirm>,
     /// The share panel: which key it is for, and the URL once it exists.
     share: Option<Share>,
+    inspector: Option<Inspection>,
     /// Whether the open bucket keeps versions, so a delete confirmation can say
     /// whether it removes data or only hides it. Refreshed when the bucket
     /// changes, not on every navigation within one.
@@ -203,6 +217,7 @@ impl Browser {
             orphans_open: false,
             confirm: None,
             share: None,
+            inspector: None,
             bucket_versioned: false,
             ticking: false,
             connect_task: None,
@@ -796,6 +811,176 @@ impl Browser {
         cx.notify();
     }
 
+    /// Opens the inspector for the selected object and loads its details. This
+    /// is the only place metadata is fetched: doing it while listing would mean
+    /// a HEAD per row, which is the mistake that makes other S3 clients slow and
+    /// expensive.
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        if self.inspector.is_some() {
+            self.inspector = None;
+            cx.notify();
+            return;
+        }
+        self.open_inspector(cx);
+    }
+
+    fn open_inspector(&mut self, cx: &mut Context<Self>) {
+        let mut selected = self.selection.iter();
+        let (Some(key), None) = (selected.next(), selected.next()) else {
+            return;
+        };
+        if key.ends_with('/') {
+            self.report("Thư mục không có metadata".into());
+            return;
+        }
+        let key = key.clone();
+        self.inspector = Some(Inspection {
+            key: key.clone(),
+            head: None,
+            tags: Vec::new(),
+            loading: true,
+        });
+        self.load_inspection(key, cx);
+        cx.notify();
+    }
+
+    fn load_inspection(&mut self, key: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+
+        let loading = Tokio::spawn(cx, async move {
+            let head = client.head_object(&bucket, &key).await;
+            // Tagging is a separate request, and a provider that does not
+            // implement it must not blank out the metadata that did load.
+            let tags = client.object_tags(&bucket, &key).await.unwrap_or_default();
+            head.map(|head| (head, tags))
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = loading.await;
+            _ = this.update(cx, |this, cx| {
+                if let Some(inspector) = this.inspector.as_mut() {
+                    inspector.loading = false;
+                    match outcome {
+                        Ok(Ok((head, tags))) => {
+                            inspector.head = Some(head);
+                            inspector.tags = tags;
+                        }
+                        Ok(Err(error)) => this.report(format!("{error}")),
+                        Err(error) => this.report(format!("Task lỗi: {error}")),
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn restore_inspected(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let key = inspector.key.clone();
+        let reload = key.clone();
+
+        let restoring = Tokio::spawn(cx, async move {
+            // Three days is enough to fetch something without paying for a copy
+            // that lingers.
+            client.restore_object(&bucket, &key, 3).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = restoring.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.status = "Đã yêu cầu khôi phục — có thể mất vài giờ".into();
+                        this.load_inspection(reload, cx);
+                    }
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn remove_tag(&mut self, tag_key: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let key = inspector.key.clone();
+        // S3 replaces the whole tag set, so removing one means writing the rest.
+        let remaining: Vec<(String, String)> = inspector
+            .tags
+            .iter()
+            .filter(|(name, _)| name != &tag_key)
+            .cloned()
+            .collect();
+        let reload = key.clone();
+
+        let writing = Tokio::spawn(cx, async move {
+            client.set_object_tags(&bucket, &key, &remaining).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = writing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => this.load_inspection(reload, cx),
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn add_tag(&mut self, text: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(inspector)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.inspector.as_ref(),
+        ) else {
+            return;
+        };
+        let Some((name, value)) = parse_tag(&text) else {
+            self.report("Thẻ phải có dạng khoá=giá trị".into());
+            return;
+        };
+
+        let key = inspector.key.clone();
+        let mut tags = inspector.tags.clone();
+        // Same key twice is a rejected tag set, so a repeat is an edit.
+        tags.retain(|(existing, _)| existing != &name);
+        tags.push((name, value));
+        let reload = key.clone();
+
+        let writing = Tokio::spawn(cx, async move {
+            client.set_object_tags(&bucket, &key, &tags).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = writing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => this.load_inspection(reload, cx),
+                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// Opens the share panel for the one selected object. Folders are excluded:
     /// a prefix is not a thing that can be signed.
     fn start_share(&mut self, cx: &mut Context<Self>) {
@@ -1131,6 +1316,7 @@ impl Browser {
             Prompt::Rename(key) if !text.trim().is_empty() => {
                 self.rename_entry(key, text.trim().to_string(), cx)
             }
+            Prompt::AddTag if !text.trim().is_empty() => self.add_tag(text, cx),
             _ => {}
         }
         cx.notify();
@@ -1176,6 +1362,7 @@ impl Browser {
                 }
                 "d" => return self.download_selection(cx),
                 "enter" => return self.start_rename(cx),
+                "i" => return self.toggle_inspector(cx),
                 "j" => {
                     self.drawer_open = !self.drawer_open;
                     cx.notify();
@@ -1416,6 +1603,11 @@ impl Browser {
                 .child(
                     action_button("share", "Chia sẻ", theme).on_click(cx.listener(
                         |this, _event, _window, cx| this.start_share(cx),
+                    )),
+                )
+                .child(
+                    action_button("inspect", "Chi tiết", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.toggle_inspector(cx),
                     )),
                 )
             })
@@ -1685,6 +1877,189 @@ impl Browser {
                     .flex_1()
                     .into_any_element()
                 }),
+        )
+    }
+
+    fn render_inspector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let inspector = self.inspector.as_ref()?;
+        let theme = self.theme;
+
+        let body = match (&inspector.head, inspector.loading) {
+            (None, true) => div()
+                .p_3()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child("Đang tải…")
+                .into_any_element(),
+            (None, false) => div()
+                .p_3()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child("Không đọc được metadata")
+                .into_any_element(),
+            (Some(head), _) => {
+                let class = head.storage_class.as_deref().unwrap_or("STANDARD");
+                let state = restore_state(head.restore.as_deref(), head.storage_class.as_deref());
+
+                div()
+                    .id("inspector-body")
+                    .flex_1()
+                    .overflow_hidden()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .text_xs()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(detail_row("Kích thước", format_size(head.size), theme))
+                            .child(detail_row(
+                                "Sửa đổi",
+                                head.modified_epoch.map(format_timestamp).unwrap_or_default(),
+                                theme,
+                            ))
+                            .child(detail_row(
+                                "Kiểu",
+                                head.content_type.clone().unwrap_or_default(),
+                                theme,
+                            ))
+                            .child(detail_row("Lớp lưu trữ", class.to_string(), theme))
+                            .child(detail_row(
+                                "ETag",
+                                head.etag.clone().unwrap_or_default().replace('"', ""),
+                                theme,
+                            )),
+                    )
+                    // Only archived objects get the restore control, and its
+                    // label says which of the three states it is in.
+                    .when(state != RestoreState::NotArchived, |this| {
+                        this.child(match state {
+                            RestoreState::Archived => {
+                                action_button("restore", "Khôi phục (3 ngày)", theme)
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.restore_inspected(cx)
+                                    }))
+                                    .into_any_element()
+                            }
+                            RestoreState::InProgress => div()
+                                .text_color(theme.text_muted)
+                                .child("Đang khôi phục — chưa đọc được")
+                                .into_any_element(),
+                            _ => div()
+                                .text_color(theme.text_muted)
+                                .child("Đã khôi phục, đọc được tạm thời")
+                                .into_any_element(),
+                        })
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_color(theme.text_faint)
+                                            .child("THẺ"),
+                                    )
+                                    .child(action_button("add-tag", "Thêm", theme).on_click(
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.start_prompt(Prompt::AddTag, cx)
+                                        }),
+                                    )),
+                            )
+                            .children(inspector.tags.iter().map(|(name, value)| {
+                                let name = name.clone();
+                                let removing = name.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_color(theme.text)
+                                            .child(SharedString::from(format!("{name} = {value}"))),
+                                    )
+                                    .child(
+                                        icon_button_dyn(
+                                            SharedString::from(format!("rm-tag-{name}")),
+                                            "✕",
+                                            theme,
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, _event, _window, cx| {
+                                                this.remove_tag(removing.clone(), cx)
+                                            },
+                                        )),
+                                    )
+                            }))
+                            .when(inspector.tags.is_empty(), |this| {
+                                this.child(
+                                    div().text_color(theme.text_faint).child("Chưa có thẻ nào"),
+                                )
+                            }),
+                    )
+                    .when(!head.metadata.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_color(theme.text_faint).child("METADATA"))
+                                .children(head.metadata.iter().map(|(name, value)| {
+                                    div().text_color(theme.text).child(SharedString::from(
+                                        format!("{name} = {value}"),
+                                    ))
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            }
+        };
+
+        Some(
+            div()
+                .w(px(300.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .bg(theme.panel)
+                .border_l_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .h(px(28.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(theme.text)
+                                .overflow_hidden()
+                                .child(SharedString::from(entry_name_of(&inspector.key))),
+                        )
+                        .child(icon_button("close-inspector", "✕", theme).on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.inspector = None;
+                                cx.notify();
+                            },
+                        ))),
+                )
+                .child(body),
         )
     }
 
@@ -2155,7 +2530,8 @@ impl Render for Browser {
                             ))
                             .child(self.render_columns(cx))
                             .child(self.render_rows(cx)),
-                    ),
+                    )
+                    .children(self.render_inspector(cx)),
             )
             .children(self.render_drawer(cx))
             .children(self.render_orphans(cx))
@@ -2207,6 +2583,40 @@ fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::S
         .text_color(theme.text)
         .hover(|this| this.bg(theme.selected))
         .child(label)
+}
+
+/// One `label: value` line in the inspector.
+fn detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .gap_2()
+        .child(div().w(px(84.)).text_color(theme.text_faint).child(label))
+        .child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .text_color(theme.text)
+                .child(SharedString::from(value)),
+        )
+}
+
+/// `icon_button` for ids built from data.
+fn icon_button_dyn(
+    id: SharedString,
+    glyph: &'static str,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .text_xs()
+        .text_color(theme.text_muted)
+        .hover(|style| style.bg(theme.hover))
+        .child(glyph)
 }
 
 /// `action_button` for labels that come from data rather than a literal.
@@ -2354,6 +2764,18 @@ const PRESIGN_PRESETS: [(&str, Duration); 4] = [
     ("7 ngày", Duration::from_secs(7 * 24 * 3600)),
     ("15 phút", Duration::from_secs(900)),
 ];
+
+/// Splits `khoá=giá trị`. Only the first `=` separates, because an S3 tag value
+/// may legitimately contain one. Returns `None` for input that would produce an
+/// empty key, which S3 rejects anyway.
+fn parse_tag(text: &str) -> Option<(String, String)> {
+    let (name, value) = text.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), value.trim().to_string()))
+}
 
 /// Headline for the delete dialog. Names the single victim when there is one,
 /// because "Xoá 1 mục" tells the user nothing about what they are about to lose.
@@ -2554,6 +2976,7 @@ mod tests {
             orphans_open: false,
             confirm: None,
             share: None,
+            inspector: None,
             bucket_versioned: false,
             ticking: false,
             connect_task: None,
@@ -2698,6 +3121,34 @@ mod tests {
 
         // A limit this button never sets must not strand the user.
         assert_eq!(next_bandwidth_limit(999), BANDWIDTH_PRESETS[0]);
+    }
+
+    #[test]
+    fn tags_split_on_the_first_equals_only() {
+        assert_eq!(
+            parse_tag("env=prod"),
+            Some(("env".into(), "prod".into()))
+        );
+
+        // A value may contain `=`; splitting on the last one would mangle it.
+        assert_eq!(
+            parse_tag("url=https://x/?a=b"),
+            Some(("url".into(), "https://x/?a=b".into()))
+        );
+
+        // Whitespace around either half is the user's formatting, not the tag.
+        assert_eq!(
+            parse_tag("  owner = mai  "),
+            Some(("owner".into(), "mai".into()))
+        );
+
+        // An empty value is legal in S3; an empty key is not.
+        assert_eq!(parse_tag("draft="), Some(("draft".into(), String::new())));
+        assert_eq!(parse_tag("=orphan"), None);
+        assert_eq!(parse_tag("   =x"), None);
+
+        // No separator at all is not a tag.
+        assert_eq!(parse_tag("justwords"), None);
     }
 
     #[test]
