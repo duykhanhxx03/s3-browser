@@ -49,7 +49,7 @@ impl SsoRole {
     /// What to show in a picker. The account name alone is ambiguous when the
     /// same person can reach several roles in it.
     pub fn label(&self) -> String {
-        format!("{} · {} ({})", self.account_name, self.role_name, self.account_id)
+        format!("{} / {} ({})", self.account_name, self.role_name, self.account_id)
     }
 }
 
@@ -324,6 +324,6 @@ mod tests {
         };
         // Account name alone is ambiguous when one account offers several roles,
         // and the id is what tells two identically named accounts apart.
-        assert_eq!(role.label(), "Production · ReadOnly (123456789012)");
+        assert_eq!(role.label(), "Production / ReadOnly (123456789012)");
     }
 }

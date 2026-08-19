@@ -312,6 +312,8 @@ pub struct Browser {
     sso: Option<SsoFlow>,
     /// The add-profile form, when open.
     form: Option<Form>,
+    /// Whether the profile manager dialog is open.
+    profiles_open: bool,
     /// The command palette: `Some` with the query typed so far.
     palette: Option<String>,
     /// Which row the palette has highlighted.
@@ -398,6 +400,7 @@ impl Browser {
             orphans_open: false,
             confirm: None,
             form: None,
+            profiles_open: false,
             sso: None,
             palette: None,
             palette_selected: 0,
@@ -562,7 +565,7 @@ impl Browser {
                                 debug_log!("ListBuckets failed: {error}");
                                 // Say what to do next, not just what broke.
                                 this.status =
-                                    "Không liệt kê được bucket — token có thể chỉ có quyền trên một bucket. Bấm + ở BUCKETS để mở theo tên."
+                                    "Không liệt kê được bucket. Token có thể chỉ có quyền trên một bucket; bấm + ở BUCKETS để mở theo tên."
                                         .into();
                                 Vec::new()
                             }
@@ -953,7 +956,7 @@ impl Browser {
                             flow.access_token = Some(token);
                             flow.roles = roles;
                         }
-                        this.status = "Đã đăng nhập — chọn role".into();
+                        this.status = "Đã đăng nhập, chọn role".into();
                     }
                     Ok(Err(error)) => {
                         this.sso = None;
@@ -1083,7 +1086,7 @@ impl Browser {
                         // this session, presigned URLs included, dies with it.
                         this.status = match expires_at {
                             Some(at) => format!(
-                                "Đã nhận role — phiên hết hạn {}",
+                                "Đã nhận role, phiên hết hạn {}",
                                 s3core::format_timestamp(
                                     at.duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_secs() as i64)
@@ -1784,7 +1787,7 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => {
-                        this.status = "Đã khôi phục version — bản cũ vẫn còn trong lịch sử".into();
+                        this.status = "Đã khôi phục version, bản cũ vẫn còn trong lịch sử".into();
                         this.load_inspection(reload, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error}")),
@@ -1866,7 +1869,7 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => {
-                        this.status = "Đã yêu cầu khôi phục — có thể mất vài giờ".into();
+                        this.status = "Đã yêu cầu khôi phục, có thể mất vài giờ".into();
                         this.load_inspection(reload, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error}")),
@@ -2454,7 +2457,6 @@ impl Browser {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let active_profile = self.active_profile;
         let current_bucket = self.bucket.clone();
 
         div()
@@ -2467,71 +2469,6 @@ impl Browser {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .child(
-                section_header("PROFILES", "add-profile", theme).on_click(cx.listener(
-                    |this, _event, window, cx| this.open_form(FormKind::NewProfile, window, cx),
-                )),
-            )
-            .children(
-                self.profiles
-                    .iter()
-                    .enumerate()
-                    .map(|(index, profile)| {
-                        let selected = active_profile == Some(index);
-                        // The remove button lives on the row rather than behind a
-                        // menu: gpui 0.2.2 has no context menu, and a profile you
-                        // cannot delete is worse than one that is easy to delete
-                        // by accident — the confirmation covers that.
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                sidebar_row(
-                                    SharedString::from(format!("profile-{}", profile.id)),
-                                    SharedString::from(profile.name.clone()),
-                                    selected,
-                                    theme,
-                                )
-                                .flex_1()
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    this.connect(index, cx);
-                                })),
-                            )
-                            .child(
-                                icon_button_dyn(
-                                    SharedString::from(format!("rm-profile-{}", profile.id)),
-                                    "trash",
-                                    theme,
-                                )
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    this.ask_remove_profile(index, cx)
-                                })),
-                            )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        action_button("import-aws", "Nhập từ ~/.aws", theme).on_click(
-                            cx.listener(|this, _event, _window, cx| this.import_from_aws(cx)),
-                        ),
-                    )
-                    .when(self.profiles.is_empty(), |this| {
-                        this.child(
-                            action_button("add-minio", "Thêm MinIO local", theme).on_click(
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.add_minio_dev_profile(cx)
-                                }),
-                            ),
-                        )
-                    }),
-            )
-            .child(div().h(px(8.)))
             .child(
                 section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
                     |this, _event, window, cx| {
@@ -2563,6 +2500,171 @@ impl Browser {
                     })
                     .collect::<Vec<_>>(),
             )
+            // Buckets are browsed constantly and profiles are switched rarely,
+            // so the list gets the height and the profile gets a footer.
+            .child(div().flex_1())
+            .child(self.render_profile_footer(cx))
+    }
+
+    /// The active profile, pinned to the bottom. It opens the manager rather
+    /// than expanding in place: managing profiles is a task of its own, and
+    /// growing the sidebar downward pushed the bucket list around.
+    fn render_profile_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let active = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "Chưa chọn profile".to_string());
+
+        div()
+            .pt_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .id("profile-switcher")
+                    .h(px(CONTROL_BAR_HEIGHT))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.hover))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.profiles_open = true;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_color(theme.text)
+                            .child(SharedString::from(active)),
+                    )
+                    .child(icon("plus", theme.text_faint)),
+            )
+    }
+
+    fn render_profiles_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.profiles_open {
+            return None;
+        }
+        let theme = self.theme;
+
+        Some(
+            div()
+                .id("profiles-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.profiles_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("profiles-dialog")
+                        .w(px(DIALOG_WIDTH))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(div().text_color(theme.text).child("Profile"))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .max_h(px(280.))
+                                .overflow_hidden()
+                                .children(self.profiles.iter().enumerate().map(
+                                    |(index, profile)| {
+                                        let selected = self.active_profile == Some(index);
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                sidebar_row(
+                                                    SharedString::from(format!(
+                                                        "profile-{}",
+                                                        profile.id
+                                                    )),
+                                                    SharedString::from(profile.name.clone()),
+                                                    selected,
+                                                    theme,
+                                                )
+                                                .flex_1()
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        this.profiles_open = false;
+                                                        this.connect(index, cx);
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                icon_button_dyn(
+                                                    SharedString::from(format!(
+                                                        "rm-profile-{}",
+                                                        profile.id
+                                                    )),
+                                                    "trash",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        this.ask_remove_profile(index, cx)
+                                                    },
+                                                )),
+                                            )
+                                    },
+                                ))
+                                .when(self.profiles.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.text_faint)
+                                            .child("Chưa có profile nào"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(action_button("import-aws", "Nhập từ ~/.aws", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.import_from_aws(cx)
+                                    }),
+                                ))
+                                .child(action_button("add-profile", "Profile mới", theme).on_click(
+                                    cx.listener(|this, _event, window, cx| {
+                                        this.profiles_open = false;
+                                        this.open_form(FormKind::NewProfile, window, cx)
+                                    }),
+                                ))
+                                .child(action_button("profiles-close", "Đóng", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.profiles_open = false;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                ),
+        )
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2851,7 +2953,7 @@ impl Browser {
         let stats = self.transfers.stats();
         let queue_label = if stats.active + stats.queued > 0 {
             let speed = if stats.bytes_per_second > 0 {
-                format!(" · {}/s", format_size(stats.bytes_per_second as i64))
+                format!("  {}/s", format_size(stats.bytes_per_second as i64))
             } else {
                 String::new()
             };
@@ -2886,7 +2988,7 @@ impl Browser {
                 div()
                     .text_color(theme.text_faint)
                     .child(SharedString::from(format!(
-                        "{m}F lọc · {m}N thư mục · {m}D tải xuống · {m}J hàng đợi",
+                        "{m}F lọc   {m}N thư mục   {m}D tải xuống   {m}J hàng đợi",
                         m = platform::primary_modifier()
                     ))),
             )
@@ -2942,7 +3044,7 @@ impl Browser {
                         .px_3()
                         .text_xs()
                         .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("HÀNG ĐỢI · {}", jobs.len())))
+                        .child(SharedString::from(format!("HÀNG ĐỢI {}", jobs.len())))
                         .child(div().flex_1())
                         .child(
                             setting_chip(
@@ -3070,7 +3172,7 @@ impl Browser {
                             .child(detail_row(
                                 "Mã hoá",
                                 match (&head.encryption, &head.kms_key_id) {
-                                    (Some(kind), Some(key)) => format!("{kind} · {key}"),
+                                    (Some(kind), Some(key)) => format!("{kind} ({key})"),
                                     (Some(kind), None) => kind.clone(),
                                     // Not the same as "unknown": S3 omits the
                                     // header exactly when nothing encrypts it.
@@ -3097,7 +3199,7 @@ impl Browser {
                             }
                             RestoreState::InProgress => div()
                                 .text_color(theme.text_muted)
-                                .child("Đang khôi phục — chưa đọc được")
+                                .child("Đang khôi phục, chưa đọc được")
                                 .into_any_element(),
                             _ => div()
                                 .text_color(theme.text_muted)
@@ -3207,7 +3309,7 @@ impl Browser {
                                 .gap_1()
                                 .child(div().text_color(theme.text_faint).child(
                                     SharedString::from(format!(
-                                        "PHIÊN BẢN · {}",
+                                        "PHIÊN BẢN {}",
                                         inspector.versions.len()
                                     )),
                                 ))
@@ -3238,13 +3340,13 @@ impl Browser {
                                                 .child(SharedString::from(if version
                                                     .is_delete_marker
                                                 {
-                                                    format!("{when} · delete marker")
+                                                    format!("{when}   delete marker")
                                                 } else {
                                                     format!(
-                                                        "{when} · {}{}",
+                                                        "{when}   {}{}",
                                                         format_size(version.size),
                                                         if version.is_latest {
-                                                            " · hiện tại"
+                                                            "   hiện tại"
                                                         } else {
                                                             ""
                                                         }
@@ -3926,7 +4028,7 @@ impl Browser {
                         .px_3()
                         .text_xs()
                         .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("UPLOAD DỞ · {count}")))
+                        .child(SharedString::from(format!("UPLOAD DỞ {count}")))
                         .child(div().flex_1())
                         .when(count > 0, |this| {
                             this.child(danger_button(
@@ -4145,7 +4247,7 @@ impl Browser {
                     div()
                         .text_xs()
                         .text_color(theme.text_faint)
-                        .child("Enter để xác nhận · Esc để huỷ"),
+                        .child("Enter để xác nhận, Esc để huỷ"),
                 ),
         )
     }
@@ -4213,6 +4315,7 @@ impl Render for Browser {
             .children(self.render_palette(cx))
             .children(self.render_sso(cx))
             .children(self.render_form(cx))
+            .children(self.render_profiles_dialog(cx))
     }
 }
 
@@ -4437,7 +4540,7 @@ fn object_row(
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let size_label = if entry.is_folder {
-        SharedString::from("—")
+        SharedString::from("")
     } else {
         SharedString::from(format_size(entry.size))
     };
@@ -4553,7 +4656,7 @@ fn encryption_label(encryption: &Encryption) -> String {
         Encryption::Aes256 => "SSE-S3".into(),
         // The key id can be a full ARN, which would push everything else off the
         // row; the tail is the part that identifies it to a human.
-        Encryption::Kms(key) => format!("KMS · {}", key.rsplit('/').next().unwrap_or(key)),
+        Encryption::Kms(key) => format!("KMS {}", key.rsplit('/').next().unwrap_or(key)),
     }
 }
 
@@ -5093,6 +5196,7 @@ mod tests {
             orphans_open: false,
             confirm: None,
             form: None,
+            profiles_open: false,
             sso: None,
             palette: None,
             palette_selected: 0,
@@ -5272,7 +5376,7 @@ mod tests {
     fn wrapping_never_splits_a_word() {
         // The bug this exists for: gpui breaks before any non-ASCII character,
         // turning "cấp" into "c" / "ấp". Every line here must be whole words.
-        let text = "Token này có thể chỉ có quyền trên một bucket cụ thể — với R2 đó là cách cấp quyền được khuyến nghị.";
+        let text = "Token này có thể chỉ có quyền trên một bucket cụ thể, với R2 đó là cách cấp quyền được khuyến nghị.";
         let lines = wrap_words(text, 40);
         assert!(lines.len() > 1, "this text is long enough to wrap");
         for line in &lines {
@@ -5460,12 +5564,12 @@ mod tests {
             encryption_label(&Encryption::Kms(
                 "arn:aws:kms:ap-southeast-1:1234:key/abcd-1234".into()
             )),
-            "KMS · abcd-1234"
+            "KMS abcd-1234"
         );
         // A bare id has no slash to split on and must survive intact.
         assert_eq!(
             encryption_label(&Encryption::Kms("abcd-1234".into())),
-            "KMS · abcd-1234"
+            "KMS abcd-1234"
         );
 
         // Default → SSE-S3 applies directly.
