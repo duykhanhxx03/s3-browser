@@ -71,6 +71,11 @@ impl Journal {
         connection
             .execute_batch(SCHEMA)
             .context("creating transfer journal schema")?;
+        // Journals written before checksums existed have no such column. Adding
+        // it here rather than in SCHEMA keeps `CREATE TABLE IF NOT EXISTS` from
+        // silently skipping the change on an existing file; the error when it is
+        // already present is the expected outcome, not a failure.
+        _ = connection.execute("ALTER TABLE parts ADD COLUMN checksum_crc32 TEXT", []);
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -157,8 +162,15 @@ impl Journal {
 
     pub fn record_part(&self, job_id: i64, part: &CompletedPart) -> Result<()> {
         self.connection.lock().unwrap().execute(
-            "INSERT OR REPLACE INTO parts (job_id, part_number, etag, size) VALUES (?1, ?2, ?3, ?4)",
-            params![job_id, part.part_number, part.etag, part.size as i64],
+            "INSERT OR REPLACE INTO parts (job_id, part_number, etag, size, checksum_crc32) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                job_id,
+                part.part_number,
+                part.etag,
+                part.size as i64,
+                part.checksum_crc32
+            ],
         )?;
         Ok(())
     }
@@ -166,7 +178,8 @@ impl Journal {
     pub fn parts(&self, job_id: i64) -> Result<Vec<CompletedPart>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT part_number, etag, size FROM parts WHERE job_id = ?1 ORDER BY part_number",
+            "SELECT part_number, etag, size, checksum_crc32 FROM parts \
+             WHERE job_id = ?1 ORDER BY part_number",
         )?;
         let parts = statement
             .query_map(params![job_id], |row| {
@@ -174,6 +187,7 @@ impl Journal {
                     part_number: row.get(0)?,
                     etag: row.get(1)?,
                     size: row.get::<_, i64>(2)? as u64,
+                    checksum_crc32: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -308,6 +322,7 @@ mod tests {
                         part_number: number,
                         etag: format!("etag-{number}"),
                         size: 5 * 1024 * 1024,
+                        checksum_crc32: Some("y/Q5Jg==".into()),
                     },
                 )
                 .unwrap();
@@ -320,6 +335,7 @@ mod tests {
                     part_number: 1,
                     etag: "etag-1-retry".into(),
                     size: 5 * 1024 * 1024,
+                    checksum_crc32: Some("y/Q5Jg==".into()),
                 },
             )
             .unwrap();
@@ -369,6 +385,7 @@ mod tests {
                     part_number: 1,
                     etag: "e".into(),
                     size: 1,
+                    checksum_crc32: Some("y/Q5Jg==".into()),
                 },
             )
             .unwrap();

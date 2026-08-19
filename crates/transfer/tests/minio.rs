@@ -283,15 +283,17 @@ async fn a_partial_multipart_upload_can_be_completed_later() {
             vec![
                 s3core::CompletedPart {
                     part_number: 2,
-                    etag: etag2,
+                    etag: etag2.etag.clone(),
                     size: part_size as u64,
+                    checksum_crc32: etag2.checksum_crc32.clone(),
                 },
                 // Deliberately out of order: complete_multipart_upload must sort,
                 // because S3 rejects an unordered part list.
                 s3core::CompletedPart {
                     part_number: 1,
-                    etag: etag1,
+                    etag: etag1.etag.clone(),
                     size: part_size as u64,
+                    checksum_crc32: etag1.checksum_crc32.clone(),
                 },
             ],
         )

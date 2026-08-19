@@ -661,8 +661,9 @@ async fn sse_headers_reach_the_server_on_both_upload_paths() {
             &upload_id,
             vec![s3core::CompletedPart {
                 part_number: 1,
-                etag,
+                etag: etag.etag,
                 size: 5 * 1024 * 1024,
+                checksum_crc32: etag.checksum_crc32,
             }],
         )
         .await

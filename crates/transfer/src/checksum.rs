@@ -53,11 +53,30 @@ pub fn crc32_of_file(path: &Path) -> Result<String> {
     Ok(s3core::encode_crc32(hasher.finalize()))
 }
 
+/// Whether a reported checksum covers the whole object or is composed from its
+/// parts.
+///
+/// A multipart upload's checksum is a CRC32 over the concatenated part
+/// checksums, with the part count appended as `-N`. Comparing that to a CRC32
+/// of the file always fails — the same trap as the multipart ETag, wearing a
+/// different hat. Verifying one needs the exact part boundaries used at upload
+/// time, which a download does not know.
+fn is_composite(checksum: &str) -> bool {
+    checksum
+        .rsplit_once('-')
+        .is_some_and(|(_, count)| !count.is_empty() && count.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Compares a downloaded file against what the server said.
 pub fn verify(path: &Path, expected: Option<&str>) -> Result<Verification> {
     let Some(expected) = expected else {
         return Ok(Verification::Unavailable);
     };
+    if is_composite(expected) {
+        // Not a failure: the object is fine, this check simply cannot speak to
+        // it. Reporting a mismatch here would fail every large download.
+        return Ok(Verification::Unavailable);
+    }
     let actual = crc32_of_file(path)?;
     Ok(if actual == expected {
         Verification::Ok
@@ -97,19 +116,42 @@ mod tests {
         s3core::encode_crc32(value)
     }
 
-    fn temp_file(contents: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "s3b-checksum-{}-{}",
-            std::process::id(),
-            contents.len()
-        ));
+    /// `tag` makes the name unique per test. Naming by content length collided
+    /// between two tests using the same fixture, and since tests run in
+    /// parallel one deleted the file the other was still reading.
+    fn temp_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("s3b-checksum-{}-{tag}", std::process::id()));
         std::fs::write(&path, contents).unwrap();
         path
     }
 
     #[test]
+    fn a_composite_checksum_is_not_compared_against_the_whole_file() {
+        // The trap: a multipart object's checksum is built from its parts, so a
+        // whole-file CRC32 never equals it. Treating that as corruption would
+        // fail every large download — exactly the case checksums exist for.
+        assert!(is_composite("y/Q5Jg==-3"));
+        assert!(is_composite("AAAAAA==-12"));
+
+        // A single-part checksum has no suffix. Base64 can end in `=` or
+        // contain `+` and `/`, none of which must be read as a part count.
+        assert!(!is_composite("y/Q5Jg=="));
+        assert!(!is_composite("/////w=="));
+        // A trailing dash with no number is not a part count either.
+        assert!(!is_composite("abc-"));
+
+        let path = temp_file("composite", b"123456789");
+        assert_eq!(
+            verify(&path, Some("y/Q5Jg==-3")).unwrap(),
+            Verification::Unavailable
+        );
+        _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn verify_distinguishes_matching_corrupt_and_unknown() {
-        let path = temp_file(b"123456789");
+        let path = temp_file("verify", b"123456789");
         let good = "y/Q5Jg==";
 
         assert_eq!(verify(&path, Some(good)).unwrap(), Verification::Ok);
@@ -129,7 +171,7 @@ mod tests {
 
     #[test]
     fn an_empty_file_still_has_a_checksum() {
-        let path = temp_file(b"");
+        let path = temp_file("empty", b"");
         // CRC32 of nothing is 0; a zero-byte object is a legitimate object and
         // must not be reported as unverifiable.
         assert_eq!(crc32_of_file(&path).unwrap(), "AAAAAA==");
@@ -142,7 +184,7 @@ mod tests {
         // more than once — a hasher fed only the first chunk would still look
         // correct on every small test.
         let big: Vec<u8> = (0..3_000_000).map(|i| (i % 251) as u8).collect();
-        let path = temp_file(&big);
+        let path = temp_file("big", &big);
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&big);

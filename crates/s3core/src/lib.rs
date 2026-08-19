@@ -16,7 +16,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
-    ChecksumMode, CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective,
+    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective,
     ObjectIdentifier, RestoreRequest, ServerSideEncryption, StorageClass, Tag, Tagging, Tier,
 };
 use aws_sdk_s3::Client;
@@ -179,6 +179,13 @@ pub enum RestoreState {
     Done,
 }
 
+/// What a finished `UploadPart` hands back.
+#[derive(Clone, Debug)]
+pub struct UploadedPart {
+    pub etag: String,
+    pub checksum_crc32: Option<String>,
+}
+
 /// One finished part of a multipart upload. Persisted so a resumed upload can
 /// complete without re-sending what the server already has.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +193,12 @@ pub struct CompletedPart {
     pub part_number: i32,
     pub etag: String,
     pub size: u64,
+    /// Base64 CRC32 of this part, when the upload asked for checksums.
+    ///
+    /// `CompleteMultipartUpload` has to repeat every part's checksum, so this
+    /// travels with the part rather than being recomputed — the bytes are long
+    /// gone by then, and on a resumed upload they were never in this process.
+    pub checksum_crc32: Option<String>,
 }
 
 /// A multipart upload left behind by a crash or a cancel. S3 keeps billing for
@@ -584,13 +597,15 @@ impl S3Client {
     pub async fn create_multipart_upload(&self, bucket: &str, key: &str) -> Result<String> {
         // Encryption is decided here, once. Setting it per part is not a thing
         // S3 supports — the parts inherit whatever the upload was created with.
-        // No checksum algorithm here yet: declaring one obliges
-        // CompleteMultipartUpload to repeat every part's checksum in its part
-        // list, and `CompletedPart` does not carry one — the journal persists
-        // parts across restarts, so adding the field is a schema change rather
-        // than a one-line fix. Single-request uploads do carry a checksum; see
-        // the note in PLAN §6.
-        let mut req = self.inner.create_multipart_upload().bucket(bucket).key(key);
+        // Declaring the algorithm is what makes S3 combine the per-part
+        // checksums into one for the object; without it the parts carry values
+        // nothing ever compares.
+        let mut req = self
+            .inner
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32);
         match self.encryption() {
             Encryption::BucketDefault => {}
             Encryption::Aes256 => req = req.server_side_encryption(ServerSideEncryption::Aes256),
@@ -617,10 +632,12 @@ impl S3Client {
         upload_id: &str,
         part_number: i32,
         body: Vec<u8>,
-    ) -> Result<String> {
+    ) -> Result<UploadedPart> {
+        let checksum = crc32_base64(&body);
         let out = self
             .inner
             .upload_part()
+            .checksum_crc32(&checksum)
             .bucket(bucket)
             .key(key)
             .upload_id(upload_id)
@@ -630,9 +647,13 @@ impl S3Client {
             .await
             .with_context(|| format!("UploadPart {part_number} failed for s3://{bucket}/{key}"))?;
 
-        out.e_tag()
-            .map(str::to_owned)
-            .context("UploadPart returned no ETag")
+        Ok(UploadedPart {
+            etag: out
+                .e_tag()
+                .map(str::to_owned)
+                .context("UploadPart returned no ETag")?,
+            checksum_crc32: Some(checksum),
+        })
     }
 
     /// Parts must be listed in ascending part-number order or S3 rejects the call.
@@ -651,6 +672,10 @@ impl S3Client {
                 aws_sdk_s3::types::CompletedPart::builder()
                     .part_number(part.part_number)
                     .e_tag(part.etag)
+                    // Repeating the part checksum is required once the upload
+                    // declared an algorithm; omitting it fails the completion
+                    // with an error that names neither the part nor the reason.
+                    .set_checksum_crc32(part.checksum_crc32)
                     .build(),
             );
         }
@@ -720,6 +745,9 @@ impl S3Client {
                     part_number: number,
                     etag: etag.to_string(),
                     size: part.size().unwrap_or(0) as u64,
+                    // A resumed upload never held these bytes, so the server's
+                    // copy is the only place this value can come from.
+                    checksum_crc32: part.checksum_crc32().map(str::to_owned),
                 });
             }
 
@@ -1284,6 +1312,10 @@ impl S3Client {
                 part_number: number,
                 etag,
                 size: end - offset + 1,
+                checksum_crc32: out
+                    .copy_part_result()
+                    .and_then(|result| result.checksum_crc32())
+                    .map(str::to_owned),
             });
             offset = end + 1;
             number += 1;

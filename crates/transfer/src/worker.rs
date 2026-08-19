@@ -139,13 +139,14 @@ async fn upload(
         in_flight.spawn(async move {
             let _permit = permit;
             let body = read_chunk(&path, offset, length).await?;
-            let etag = client
+            let uploaded = client
                 .upload_part(&bucket, &key, &upload_id, number, body)
                 .await?;
             anyhow::Ok(CompletedPart {
                 part_number: number,
-                etag,
+                etag: uploaded.etag,
                 size: length,
+                checksum_crc32: uploaded.checksum_crc32,
             })
         });
     }
@@ -313,6 +314,9 @@ async fn download(
                 // so a half-finished file is inspectable.
                 etag: format!("bytes={offset}-{}", offset + length - 1),
                 size: bytes.len() as u64,
+                // A download part is never sent back to S3, so it has no
+                // checksum to repeat.
+                checksum_crc32: None,
             })
         });
     }
