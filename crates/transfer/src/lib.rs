@@ -335,13 +335,33 @@ impl TransferEngine {
         key: &str,
         destination_dir: &Path,
     ) -> Result<i64> {
+        let name = key.rsplit('/').next().unwrap_or(key).to_string();
+        self.enqueue_download_to(client, bucket, key, destination_dir, &name)
+            .await
+    }
+
+    /// Downloads to `destination_dir/relative`, so a folder download can keep
+    /// its shape instead of flattening every file into one directory.
+    ///
+    /// `relative` is built from the key by the caller and never trusted from
+    /// the server: a key containing `..` would otherwise write outside the
+    /// directory the user chose.
+    pub async fn enqueue_download_to(
+        &self,
+        client: S3Client,
+        bucket: &str,
+        key: &str,
+        destination_dir: &Path,
+        relative: &str,
+    ) -> Result<i64> {
         let head = client.head_object(bucket, key).await?;
-        let name = key.rsplit('/').next().unwrap_or(key);
+        let local = safe_join(destination_dir, relative)
+            .with_context(|| format!("đường dẫn không hợp lệ cho {key}"))?;
 
         let id = self.insert(Job {
             id: 0,
             direction: Direction::Download,
-            local: destination_dir.join(name),
+            local,
             bucket: bucket.to_string(),
             key: key.to_string(),
             size: head.size.max(0) as u64,
@@ -524,6 +544,33 @@ impl TransferEngine {
     }
 }
 
+/// Joins a server-supplied relative path onto a directory, refusing anything
+/// that would escape it.
+///
+/// S3 keys are arbitrary strings: `../../.ssh/authorized_keys` is a perfectly
+/// legal key. Joining one straight onto the download directory would write
+/// wherever it points, so every component is checked instead of trusted.
+pub fn safe_join(base: &Path, relative: &str) -> Option<PathBuf> {
+    let mut path = base.to_path_buf();
+    let mut added = false;
+
+    for part in relative.split('/') {
+        // Empty parts come from `a//b` and a trailing slash; `.` is a no-op.
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        // `..` walks out. A backslash is a separator on Windows, so a key
+        // containing one would smuggle extra components past this loop.
+        if part == ".." || part.contains('\\') {
+            return None;
+        }
+        path.push(part);
+        added = true;
+    }
+
+    added.then_some(path)
+}
+
 /// Part size that keeps the object under the 10,000-part ceiling while staying
 /// at or above S3's 5 MiB minimum.
 pub fn part_size_for(total: u64) -> u64 {
@@ -593,6 +640,41 @@ fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_join_refuses_anything_that_escapes_the_directory() {
+        let base = Path::new("/tmp/dl");
+
+        // The ordinary case: nesting is preserved.
+        assert_eq!(
+            safe_join(base, "trip/day-1/photo.jpg").unwrap(),
+            Path::new("/tmp/dl/trip/day-1/photo.jpg")
+        );
+        assert_eq!(safe_join(base, "a.txt").unwrap(), Path::new("/tmp/dl/a.txt"));
+
+        // An S3 key is an arbitrary string. These are all legal keys, and every
+        // one of them would write outside the chosen directory.
+        assert_eq!(safe_join(base, "../evil"), None);
+        assert_eq!(safe_join(base, "a/../../evil"), None);
+        assert_eq!(safe_join(base, ".."), None);
+
+        // A leading slash is not an escape: the empty first component drops out
+        // and the rest lands *inside* the destination. Rejecting it would throw
+        // away a legal key for no safety gain.
+        assert_eq!(
+            safe_join(base, "/etc/passwd").unwrap(),
+            Path::new("/tmp/dl/etc/passwd")
+        );
+
+        // Empty and dot components are noise from `a//b` or `./a`, not attacks.
+        assert_eq!(safe_join(base, "a//b").unwrap(), Path::new("/tmp/dl/a/b"));
+        assert_eq!(safe_join(base, "./a").unwrap(), Path::new("/tmp/dl/a"));
+
+        // Nothing left after filtering means there is no file to write.
+        assert_eq!(safe_join(base, ""), None);
+        assert_eq!(safe_join(base, "/"), None);
+        assert_eq!(safe_join(base, "."), None);
+    }
 
     #[test]
     fn part_size_grows_to_stay_under_the_part_ceiling() {

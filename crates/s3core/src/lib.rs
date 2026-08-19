@@ -1336,7 +1336,7 @@ impl S3Client {
 
     /// Every key under `prefix`, paging until exhausted. No delimiter here — we
     /// want the whole subtree flat.
-    async fn list_keys_recursive(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    pub async fn list_keys_recursive(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
         let mut token = None;
 

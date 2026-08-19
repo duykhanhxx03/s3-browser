@@ -1472,14 +1472,16 @@ impl Browser {
         let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
             return;
         };
-        let keys: Vec<String> = self
+        // Folders come along now. They used to be filtered out here, so a
+        // selection mixing files and folders quietly downloaded only the files
+        // and said nothing about the rest.
+        let selected: Vec<Entry> = self
             .entries
             .iter()
-            .filter(|entry| !entry.is_folder && self.selection.contains(&entry.key))
-            .map(|entry| entry.key.clone())
+            .filter(|entry| self.selection.contains(&entry.key))
+            .cloned()
             .collect();
-        if keys.is_empty() {
-            self.report("Chọn tệp để tải xuống (thư mục chưa hỗ trợ)".into());
+        if selected.is_empty() {
             return;
         }
 
@@ -1489,14 +1491,42 @@ impl Browser {
         };
 
         let engine = self.transfers.clone();
+        let prefix = self.prefix.clone();
         self.drawer_open = true;
+        self.status = "Đang chuẩn bị tải xuống…".into();
 
         let queueing = Tokio::spawn(cx, async move {
+            // (key, path under the destination). Expanding folders needs a
+            // listing per folder, so it happens off the UI thread.
+            let mut targets: Vec<(String, String)> = Vec::new();
+            for entry in &selected {
+                if entry.is_folder {
+                    for key in client.list_keys_recursive(&bucket, &entry.key).await? {
+                        // Relative to the prefix being viewed, so the folder
+                        // arrives with its own name on top rather than as a
+                        // pile of loose files.
+                        let relative = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+                        if !relative.is_empty() && !relative.ends_with('/') {
+                            targets.push((key, relative));
+                        }
+                    }
+                } else {
+                    let name = entry.key.rsplit('/').next().unwrap_or(&entry.key);
+                    targets.push((entry.key.clone(), name.to_string()));
+                }
+            }
+
             let mut ids = Vec::new();
-            for key in keys {
+            for (key, relative) in targets {
                 ids.push(
                     engine
-                        .enqueue_download(client.clone(), &bucket, &key, &destination)
+                        .enqueue_download_to(
+                            client.clone(),
+                            &bucket,
+                            &key,
+                            &destination,
+                            &relative,
+                        )
                         .await?,
                 );
             }
@@ -1508,7 +1538,11 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(ids)) => {
-                        this.status = format!("Đang tải xuống {} tệp", ids.len()).into()
+                        this.status = if ids.is_empty() {
+                            "Không có tệp nào để tải".into()
+                        } else {
+                            format!("Đang tải xuống {} tệp", ids.len()).into()
+                        }
                     }
                     Ok(Err(error)) => this.report(format!("{error}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
