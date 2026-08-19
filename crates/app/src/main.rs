@@ -22,6 +22,11 @@ use platform::Chrome;
 fn main() {
     Application::new().run(|cx: &mut App| {
         gpui_tokio::init(cx);
+        // Brings the component library's key bindings and theme with it. The
+        // Input widget's editing keys (word-wise delete, select-all, paste) are
+        // bindings rather than hardcoded handling, so skipping this leaves an
+        // input that looks right and does nothing.
+        gpui_component::init(cx);
 
         let chrome = Chrome::detect();
         let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
@@ -34,7 +39,13 @@ fn main() {
                 window_min_size: Some(size(px(720.), px(420.))),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| Browser::new(window, cx)),
+            |window, cx| {
+                // Dialogs, sheets and notifications from the component library
+                // render into layers that only exist inside a Root, so the app's
+                // own view has to sit under one.
+                let browser = cx.new(|cx| Browser::new(window, cx));
+                cx.new(|cx| gpui_component::Root::new(gpui::AnyView::from(browser), window, cx))
+            },
         )
         .expect("failed to open window");
 

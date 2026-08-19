@@ -7,9 +7,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, ClickEvent, Context, ExternalPaths, FocusHandle, KeyDownEvent,
-    Modifiers, SharedString, Subscription, Task, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, App, ClickEvent, Context, Entity, ExternalPaths,
+    FocusHandle, KeyDownEvent, Modifiers, SharedString, Subscription, Task,
+    UniformListScrollHandle, Window,
 };
+use gpui_component::input::{Input, InputState};
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
@@ -135,101 +137,66 @@ pub struct SsoFlow {
     roles: Vec<s3core::sso::SsoRole>,
 }
 
-/// One field in a form.
+/// One field in a form. The value lives in the component library's
+/// [`InputState`] rather than here — that entity is what owns the cursor, the
+/// selection and the edit history.
 pub struct Field {
     label: &'static str,
-    placeholder: &'static str,
-    value: String,
-    /// Shown as dots. Someone adding a profile may well be screen-sharing, and
-    /// a secret key on screen is a secret key leaked.
-    secret: bool,
+    state: Entity<InputState>,
 }
 
-/// A multi-field form.
+/// The add-profile form.
 ///
-/// gpui 0.2.2 has no text input widget, so this is the same hand-rolled key
-/// capture as the one-line prompt, extended to several fields. That limitation
-/// quietly shaped the app: with only one field to type into, anything needing a
-/// real form — adding a profile by hand, which is the only way to reach R2, B2,
-/// Wasabi or Spaces — simply never got built.
-///
-/// Paste is the part that cannot be skipped: nobody types a forty-character
-/// secret key by hand, so ⌘V has to work even though the cursor does not.
+/// Every field is a real text input: cursor keys, selection, ⌘A, ⌘V, undo and
+/// IME all work because the component library implements them, not because this
+/// file re-derives them. The hand-rolled version this replaces had none of that
+/// — and its absence had quietly shaped the app, because with only one usable
+/// field there was no way to build a form at all.
 pub struct Form {
     fields: Vec<Field>,
-    focused: usize,
     error: Option<SharedString>,
 }
 
 impl Form {
-    fn new_profile() -> Self {
+    fn new_profile(window: &mut Window, cx: &mut App) -> Self {
+        // Written out rather than built in a closure: each InputState needs the
+        // window mutably, so a closure capturing it cannot be called twice.
+        let specs: [(&'static str, &'static str, bool); 5] = [
+            ("Tên", "R2 của tôi", false),
+            // The one field that decides everything else: empty means AWS.
+            ("Endpoint", "để trống nếu là AWS thật", false),
+            ("Region", "us-east-1", false),
+            ("Access key", "", false),
+            ("Secret key", "dán bằng ⌘V", true),
+        ];
+
+        let mut fields = Vec::with_capacity(specs.len());
+        for (label, placeholder, masked) in specs {
+            let state = cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder(placeholder);
+                // Masked hides the value behind dots; someone adding a profile
+                // may well be screen-sharing.
+                if masked {
+                    state.masked(true)
+                } else {
+                    state
+                }
+            });
+            fields.push(Field { label, state });
+        }
+
         Self {
-            fields: vec![
-                Field {
-                    label: "Tên",
-                    placeholder: "R2 của tôi",
-                    value: String::new(),
-                    secret: false,
-                },
-                Field {
-                    label: "Endpoint",
-                    // The one field that decides everything else: leaving it
-                    // empty means real AWS.
-                    placeholder: "để trống nếu là AWS thật",
-                    value: String::new(),
-                    secret: false,
-                },
-                Field {
-                    label: "Region",
-                    placeholder: "us-east-1",
-                    value: String::new(),
-                    secret: false,
-                },
-                Field {
-                    label: "Access key",
-                    placeholder: "",
-                    value: String::new(),
-                    secret: false,
-                },
-                Field {
-                    label: "Secret key",
-                    placeholder: "dán bằng ⌘V",
-                    value: String::new(),
-                    secret: true,
-                },
-            ],
-            focused: 0,
+            fields,
             error: None,
         }
     }
 
-    fn value(&self, label: &str) -> &str {
+    fn value(&self, label: &str, cx: &App) -> String {
         self.fields
             .iter()
             .find(|field| field.label == label)
-            .map(|field| field.value.trim())
-            .unwrap_or("")
-    }
-
-    fn focus_next(&mut self, backwards: bool) {
-        let count = self.fields.len();
-        self.focused = if backwards {
-            (self.focused + count - 1) % count
-        } else {
-            (self.focused + 1) % count
-        };
-    }
-
-    fn insert(&mut self, text: &str) {
-        if let Some(field) = self.fields.get_mut(self.focused) {
-            field.value.push_str(text);
-        }
-    }
-
-    fn backspace(&mut self) {
-        if let Some(field) = self.fields.get_mut(self.focused) {
-            field.value.pop();
-        }
+            .map(|field| field.state.read(cx).value().trim().to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -1047,8 +1014,8 @@ impl Browser {
         }));
     }
 
-    fn open_profile_form(&mut self, cx: &mut Context<Self>) {
-        self.form = Some(Form::new_profile());
+    fn open_profile_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.form = Some(Form::new_profile(window, cx));
         cx.notify();
     }
 
@@ -1056,26 +1023,16 @@ impl Browser {
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        let name = form.value("Tên").to_string();
-        let endpoint = form.value("Endpoint").to_string();
-        let region = form.value("Region").to_string();
-        let access_key = form.value("Access key").to_string();
-        let secret_key = form.value("Secret key").to_string();
+        let name = form.value("Tên", cx);
+        let endpoint = form.value("Endpoint", cx);
+        let region = form.value("Region", cx);
+        let access_key = form.value("Access key", cx);
+        let secret_key = form.value("Secret key", cx);
 
         // Check everything before touching the keychain, so a rejected form
         // never leaves a half-made profile behind.
-        let missing = if name.is_empty() {
-            Some("Cần tên profile")
-        } else if access_key.is_empty() {
-            Some("Cần access key")
-        } else if secret_key.is_empty() {
-            Some("Cần secret key")
-        } else if self.profiles.iter().any(|p| p.name == name) {
-            Some("Đã có profile trùng tên")
-        } else {
-            None
-        };
-        if let Some(message) = missing {
+        let taken: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
+        if let Some(message) = validate_profile(&name, &access_key, &secret_key, &taken) {
             if let Some(form) = self.form.as_mut() {
                 form.error = Some(message.into());
             }
@@ -1166,7 +1123,12 @@ impl Browser {
             .collect()
     }
 
-    fn run_command(&mut self, command: Command, cx: &mut Context<Self>) {
+    fn run_command(
+        &mut self,
+        command: Command,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         self.palette = None;
         match command {
             Command::Refresh => {
@@ -1200,7 +1162,13 @@ impl Browser {
             Command::EmptyBucket => self.ask_empty_bucket(cx),
             Command::AssumeRole => self.start_prompt(Prompt::AssumeRole, cx),
             Command::SsoSignIn => self.start_prompt(Prompt::SsoStart, cx),
-            Command::NewProfile => self.open_profile_form(cx),
+            Command::NewProfile => {
+                // Reached from the palette, which has no window handle here;
+                // the command runner is given one by its caller.
+                if let Some(window) = window {
+                    self.open_profile_form(window, cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -2153,81 +2121,24 @@ impl Browser {
         cx.notify();
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let primary = is_primary(&keystroke.modifiers);
 
-        // The form owns the keyboard while it is up.
+        // No form branch here on purpose: when a field is focused the Input
+        // element receives keys itself. Intercepting them here would break
+        // exactly the editing this integration exists to provide. Escape and
+        // Enter are handled below, where they do not conflict with typing.
         if self.form.is_some() {
-            // Paste first: a secret key is never typed by hand, so ⌘V has to
-            // work even though this input has no cursor or selection.
-            if primary && keystroke.key == "v" {
-                if let Some(text) = cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                {
-                    if let Some(form) = self.form.as_mut() {
-                        // Newlines would be invisible in a single-line field and
-                        // silently corrupt a pasted key.
-                        form.insert(text.trim());
-                        form.error = None;
-                    }
-                    cx.notify();
-                }
-                return;
-            }
-
             match keystroke.key.as_str() {
                 "escape" => {
                     self.form = None;
                     cx.notify();
                     return;
                 }
+                // Enter reaches here only when no field consumed it.
                 "enter" => return self.submit_profile_form(cx),
-                "tab" => {
-                    if let Some(form) = self.form.as_mut() {
-                        form.focus_next(keystroke.modifiers.shift);
-                    }
-                    cx.notify();
-                    return;
-                }
-                "down" => {
-                    if let Some(form) = self.form.as_mut() {
-                        form.focus_next(false);
-                    }
-                    cx.notify();
-                    return;
-                }
-                "up" => {
-                    if let Some(form) = self.form.as_mut() {
-                        form.focus_next(true);
-                    }
-                    cx.notify();
-                    return;
-                }
-                "backspace" => {
-                    if let Some(form) = self.form.as_mut() {
-                        form.backspace();
-                    }
-                    cx.notify();
-                    return;
-                }
-                _ => {
-                    // Modifier combinations are shortcuts, not text.
-                    if primary {
-                        return;
-                    }
-                    if let Some(text) = keystroke.key_char.as_deref() {
-                        if !text.is_empty() && !text.chars().any(char::is_control) {
-                            if let Some(form) = self.form.as_mut() {
-                                form.insert(text);
-                                form.error = None;
-                            }
-                            cx.notify();
-                        }
-                    }
-                    return;
-                }
+                _ => return,
             }
         }
 
@@ -2241,7 +2152,7 @@ impl Browser {
                 }
                 "enter" => {
                     if let Some(command) = matches.get(self.palette_selected).copied() {
-                        self.run_command(command, cx);
+                        self.run_command(command, Some(window), cx);
                     }
                     return;
                 }
@@ -2393,7 +2304,7 @@ impl Browser {
             .border_color(theme.border)
             .child(
                 section_header("PROFILES", "add-profile", theme).on_click(cx.listener(
-                    |this, _event, _window, cx| this.open_profile_form(cx),
+                    |this, _event, window, cx| this.open_profile_form(window, cx),
                 )),
             )
             .children(
@@ -3243,7 +3154,7 @@ impl Browser {
                         .flex_col()
                         .gap_3()
                         .rounded_lg()
-                        .bg(theme.panel)
+                        .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
@@ -3348,12 +3259,10 @@ impl Browser {
         Some(
             div()
                 .id("onboarding")
-                .absolute()
-                .inset_0()
+                .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.ground)
                 .child(
                     div()
                         .w(px(460.))
@@ -3415,6 +3324,12 @@ impl Browser {
                                     .child(
                                         div()
                                             .flex_1()
+                                            // Without a zero minimum a flex child
+                                            // refuses to shrink below its content,
+                                            // and the button next to it is pushed
+                                            // outside the card.
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
                                             .flex()
                                             .flex_col()
                                             .gap_1()
@@ -3427,9 +3342,11 @@ impl Browser {
                                             ),
                                     )
                                     .child(action_button(id, button, theme).on_click(cx.listener(
-                                        move |this, _event, _window, cx| match id {
+                                        move |this, _event, window, cx| match id {
                                             "onboard-import" => this.import_from_aws(cx),
-                                            "onboard-manual" => this.open_profile_form(cx),
+                                            "onboard-manual" => {
+                                                this.open_profile_form(window, cx)
+                                            }
                                             "onboard-minio" => this.add_minio_dev_profile(cx),
                                             _ => this.start_prompt(Prompt::SsoStart, cx),
                                         },
@@ -3446,7 +3363,6 @@ impl Browser {
     fn render_form(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let form = self.form.as_ref()?;
         let theme = self.theme;
-        let focused = form.focused;
 
         Some(
             div()
@@ -3470,7 +3386,7 @@ impl Browser {
                         .flex_col()
                         .gap_3()
                         .rounded_lg()
-                        .bg(theme.panel)
+                        .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
@@ -3479,21 +3395,10 @@ impl Browser {
                             div()
                                 .text_xs()
                                 .text_color(theme.text_muted)
-                                .child("Tab để chuyển ô · ⌘V để dán · Enter để lưu"),
+                                .child("Tab để chuyển ô · Enter để lưu · Esc để huỷ"),
                         )
-                        .children(form.fields.iter().enumerate().map(|(ix, field)| {
-                            let active = ix == focused;
-                            let shown = if field.value.is_empty() {
-                                field.placeholder.to_string()
-                            } else if field.secret {
-                                "•".repeat(field.value.chars().count())
-                            } else {
-                                field.value.clone()
-                            };
-                            let empty = field.value.is_empty();
-
+                        .children(form.fields.iter().map(|field| {
                             div()
-                                .id(("field", ix))
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -3504,40 +3409,14 @@ impl Browser {
                                         .text_color(theme.text_faint)
                                         .child(field.label),
                                 )
+                                // The real thing: cursor, selection, ⌘A, ⌘V,
+                                // undo and IME are the widget's, not ours.
                                 .child(
                                     div()
                                         .flex_1()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.hover)
-                                        .border_1()
-                                        // The border is the only cursor this
-                                        // input has, so the focused field has to
-                                        // be unmistakable.
-                                        .border_color(if active {
-                                            theme.accent
-                                        } else {
-                                            theme.border
-                                        })
-                                        .text_xs()
-                                        .text_color(if empty {
-                                            theme.text_faint
-                                        } else {
-                                            theme.text
-                                        })
-                                        .child(SharedString::from(if active && !empty {
-                                            format!("{shown}▌")
-                                        } else {
-                                            shown
-                                        })),
+                                        .min_w(px(0.))
+                                        .child(Input::new(&field.state)),
                                 )
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if let Some(form) = this.form.as_mut() {
-                                        form.focused = ix;
-                                    }
-                                    cx.notify();
-                                }))
                         }))
                         .when_some(form.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
@@ -3592,7 +3471,7 @@ impl Browser {
                         .flex_col()
                         .gap_3()
                         .rounded_lg()
-                        .bg(theme.panel)
+                        .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
                         .child(div().text_color(theme.text).child("Đăng nhập AWS SSO"))
@@ -3701,7 +3580,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .rounded_lg()
-                        .bg(theme.panel)
+                        .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
@@ -3748,8 +3627,8 @@ impl Browser {
                                             div().text_color(theme.text_faint).child(shortcut),
                                         )
                                         .on_click(cx.listener(
-                                            move |this, _event, _window, cx| {
-                                                this.run_command(command, cx)
+                                            move |this, _event, window, cx| {
+                                                this.run_command(command, Some(window), cx)
                                             },
                                         ))
                                 }))
@@ -3792,7 +3671,7 @@ impl Browser {
                         .flex_col()
                         .gap_3()
                         .rounded_lg()
-                        .bg(theme.panel)
+                        .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
                         // Clicks inside the dialog must not reach the scrim.
@@ -4093,8 +3972,14 @@ impl Render for Browser {
             .font_family(platform::ui_font_candidates()[0])
             .bg(theme.ground)
             .text_color(theme.text)
-            .child(self.render_toolbar(cx))
-            .children(self.render_prompt())
+            // Nothing to browse without a profile, and the chrome behind a
+            // translucent overlay read as clutter rather than as background.
+            .when_some(self.render_onboarding(cx), |this, onboarding| {
+                this.child(onboarding)
+            })
+            .when(!self.profiles.is_empty(), |this| {
+                this.child(self.render_toolbar(cx))
+                    .children(self.render_prompt())
             .child(
                 div()
                     .flex_1()
@@ -4121,28 +4006,19 @@ impl Render for Browser {
                     )
                     .children(self.render_inspector(cx)),
             )
-            .children(self.render_drawer(cx))
-            .children(self.render_orphans(cx))
+                    .children(self.render_drawer(cx))
+                    .children(self.render_orphans(cx))
+            })
             .child(self.render_status(cx))
             .children(self.render_confirm(cx))
             .children(self.render_share(cx))
             .children(self.render_palette(cx))
             .children(self.render_sso(cx))
             .children(self.render_form(cx))
-            .children(self.render_onboarding(cx))
     }
 }
 
 // ------------------------------------------------------------------ elements
-
-fn section_label(text: &'static str, theme: Theme) -> impl IntoElement {
-    div()
-        .px_2()
-        .py_1()
-        .text_xs()
-        .text_color(theme.text_faint)
-        .child(text)
-}
 
 /// A section label with an add button. The button was the missing half: every
 /// way to create a profile or bucket existed only as a keyboard shortcut or as
@@ -4539,6 +4415,32 @@ fn parse_assume_role(text: &str) -> Option<s3core::sts::AssumeRole> {
         mfa_code,
         duration: None,
     })
+}
+
+/// What is wrong with a profile form, or `None` if nothing is.
+///
+/// Separate from the form itself because the fields now live inside the
+/// component library's input state, which needs a window to exist — the rules
+/// should stay checkable without one.
+fn validate_profile(
+    name: &str,
+    access_key: &str,
+    secret_key: &str,
+    taken: &[&str],
+) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("Cần tên profile")
+    } else if access_key.is_empty() {
+        Some("Cần access key")
+    } else if secret_key.is_empty() {
+        Some("Cần secret key")
+    } else if taken.contains(&name) {
+        // Names are how profiles are told apart in the sidebar, so a duplicate
+        // makes the list unreadable even though the ids stay unique.
+        Some("Đã có profile trùng tên")
+    } else {
+        None
+    }
 }
 
 /// Everything the palette can run. One list so the palette, the shortcut hints
@@ -4996,52 +4898,33 @@ mod tests {
     }
 
     #[test]
-    fn profile_form_reads_fields_by_label_and_trims() {
-        let mut form = Form::new_profile();
-        form.focused = 0;
-        form.insert("  R2 của tôi  ");
-        assert_eq!(form.value("Tên"), "R2 của tôi");
+    fn profile_validation_catches_every_way_the_form_can_be_wrong() {
+        // The happy path.
+        assert_eq!(validate_profile("R2", "AKIA", "secret", &[]), None);
 
-        // An untouched field is empty, not missing — the caller decides what an
-        // empty endpoint means (real AWS).
-        assert_eq!(form.value("Endpoint"), "");
-        // A label that does not exist must not panic the form.
-        assert_eq!(form.value("Không có"), "");
-    }
+        // Each required field, reported specifically rather than as one vague
+        // "invalid" — the point of the message is to say which box to fill.
+        assert_eq!(
+            validate_profile("", "AKIA", "secret", &[]),
+            Some("Cần tên profile")
+        );
+        assert_eq!(
+            validate_profile("R2", "", "secret", &[]),
+            Some("Cần access key")
+        );
+        assert_eq!(
+            validate_profile("R2", "AKIA", "", &[]),
+            Some("Cần secret key")
+        );
 
-    #[test]
-    fn form_focus_wraps_in_both_directions() {
-        let mut form = Form::new_profile();
-        let last = form.fields.len() - 1;
-
-        // Forward off the end comes back to the first field, so Tab always does
-        // something rather than getting stuck.
-        form.focused = last;
-        form.focus_next(false);
-        assert_eq!(form.focused, 0);
-
-        // Backwards off the front reaches the last, which is what Shift-Tab
-        // from the first field has to do.
-        form.focus_next(true);
-        assert_eq!(form.focused, last);
-    }
-
-    #[test]
-    fn typing_and_backspace_only_touch_the_focused_field() {
-        let mut form = Form::new_profile();
-        form.focused = 3;
-        form.insert("AKIA");
-        form.backspace();
-        assert_eq!(form.value("Access key"), "AKI");
-
-        // Every other field is untouched.
-        assert_eq!(form.value("Tên"), "");
-        assert_eq!(form.value("Secret key"), "");
-
-        // Backspacing an empty field is a no-op, not a panic.
-        form.focused = 0;
-        form.backspace();
-        assert_eq!(form.value("Tên"), "");
+        // Duplicate names make the sidebar unreadable even though ids stay
+        // unique underneath.
+        assert_eq!(
+            validate_profile("R2", "AKIA", "secret", &["R2"]),
+            Some("Đã có profile trùng tên")
+        );
+        // A different name alongside an existing one is fine.
+        assert_eq!(validate_profile("B2", "AKIA", "secret", &["R2"]), None);
     }
 
     #[test]

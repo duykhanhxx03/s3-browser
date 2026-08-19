@@ -40,7 +40,7 @@ pub fn reduce_transparency() -> bool {
     use objc2_app_kit::NSWorkspace;
     // Reading AppKit state needs the main thread; `detect` is called during
     // window setup, which is on it.
-    unsafe { NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency() }
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency()
 }
 
 #[cfg(not(target_os = "macos"))]

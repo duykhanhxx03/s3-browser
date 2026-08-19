@@ -30,6 +30,11 @@ pub struct Theme {
     pub ground: Hsla,
     /// Sidebar, toolbar and status bar.
     pub panel: Hsla,
+    /// Dialogs and popovers. Opaque, unlike [`panel`]: a panel is an alpha wash
+    /// meant to composite over the ground, which is right for a sidebar and
+    /// wrong for something floating over content — at 5% alpha the content
+    /// underneath reads straight through the dialog.
+    pub modal: Hsla,
     pub hover: Hsla,
     pub selected: Hsla,
     /// Highlight painted over the object list while a Finder drag is in flight.
@@ -57,6 +62,7 @@ impl Theme {
                     rgb(0x12151b).into()
                 },
                 panel: rgba(0xffffff0d).into(),
+                modal: rgb(0x1c2029).into(),
                 hover: rgba(0xffffff14).into(),
                 selected: rgba(0x5ca8ff3d).into(),
                 drop_target: rgba(0x5ca8ff29).into(),
@@ -80,6 +86,7 @@ impl Theme {
                 },
                 // On a light ground the panels read as *lighter*, not darker.
                 panel: rgba(0xffffff8c).into(),
+                modal: rgb(0xfbfcfe).into(),
                 hover: rgba(0x1b243014).into(),
                 selected: rgba(0x0a6cdb26).into(),
                 drop_target: rgba(0x0a6cdb1f).into(),
@@ -119,6 +126,24 @@ mod tests {
             Mode::from_appearance(WindowAppearance::VibrantLight),
             Mode::Light
         );
+    }
+
+    #[test]
+    fn dialogs_are_opaque_in_both_modes() {
+        for chrome in [Chrome::Glass, Chrome::Solid] {
+            for appearance in [WindowAppearance::Dark, WindowAppearance::Light] {
+                let theme = Theme::from_window(appearance, chrome);
+                // A dialog floats over content. Any transparency here and the
+                // list underneath reads through the text on top of it.
+                assert_eq!(
+                    theme.modal.a, 1.0,
+                    "modal must be opaque for {chrome:?}/{appearance:?}"
+                );
+                // The panel is deliberately not opaque; if these ever became
+                // the same value the distinction would have been lost.
+                assert!(theme.panel.a < 1.0);
+            }
+        }
     }
 
     #[test]

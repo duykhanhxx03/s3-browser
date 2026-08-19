@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 gpui.workspace = true
+gpui-component.workspace = true
 gpui_tokio.workspace = true
 s3core.workspace = true
 transfer.workspace = true

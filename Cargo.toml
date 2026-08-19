@@ -9,6 +9,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 gpui = "0.2.2"
+gpui-component = "0.5.1"
 gpui_tokio = { path = "crates/gpui_tokio" }
 s3core = { path = "crates/s3core" }
 transfer = { path = "crates/transfer" }
