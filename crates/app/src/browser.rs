@@ -39,44 +39,79 @@ const SIDEBAR_WIDTH: f32 = 214.;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
 
-/// What typed characters currently go to. One mechanism covers the filter box
-/// and the two name prompts, so there is a single place that handles Enter,
-/// Escape and backspace.
+/// The one input that still belongs inline: a filter narrows what is already on
+/// screen, so putting it in a dialog would hide the thing being filtered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Prompt {
     Filter,
+}
+
+/// What a form asks for.
+///
+/// Everything here used to type into a single unlabelled bar at the top of the
+/// window. That bar had no title, no cancel button and nowhere to report a bad
+/// value — so what it wanted had to be guessed from a placeholder, and a
+/// mistake was only discovered after pressing Enter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormKind {
+    NewProfile,
     NewFolder,
     NewBucket,
-    /// Renaming the one selected entry; carries its key so the rename still
-    /// targets the right object if the selection changes while typing.
+    /// Carries the key, so a rename still targets the right object if the
+    /// selection changes while the dialog is open.
     Rename(String),
-    /// Adding a tag to the inspected object, typed as `khoá=giá trị`.
-    AddTag,
-    /// The KMS key id to encrypt uploads with.
-    KmsKey,
-    /// A bucket name to open directly, for tokens that cannot list buckets.
     OpenBucket,
-    /// Role ARN to assume, optionally followed by an MFA code.
+    AddTag,
+    KmsKey,
     AssumeRole,
-    /// The organisation's SSO portal URL, optionally with ` <region>`.
     SsoStart,
 }
 
-impl Prompt {
-    fn label(&self) -> &'static str {
+impl FormKind {
+    fn title(&self) -> &'static str {
         match self {
-            Prompt::Filter => "Lọc",
-            Prompt::NewFolder => "Tên thư mục mới",
-            Prompt::NewBucket => "Tên bucket mới",
-            Prompt::Rename(_) => "Tên mới",
-            Prompt::AddTag => "Thẻ mới (khoá=giá trị)",
-            Prompt::KmsKey => "KMS key id",
-            Prompt::OpenBucket => "Tên bucket cần mở",
-            Prompt::AssumeRole => "Role ARN (thêm ' mfa:<serial> <mã>' nếu cần)",
-            Prompt::SsoStart => "SSO start URL (thêm ' <region>' nếu khác us-east-1)",
+            FormKind::NewProfile => "Profile mới",
+            FormKind::NewFolder => "Thư mục mới",
+            FormKind::NewBucket => "Bucket mới",
+            FormKind::Rename(_) => "Đổi tên",
+            FormKind::OpenBucket => "Mở bucket",
+            FormKind::AddTag => "Thẻ mới",
+            FormKind::KmsKey => "Mã hoá KMS",
+            FormKind::AssumeRole => "Nhận role",
+            FormKind::SsoStart => "Đăng nhập SSO",
+        }
+    }
+
+    /// Label and placeholder for each field. One entry means a single-field
+    /// dialog, which is most of them.
+    fn fields(&self) -> Vec<(&'static str, &'static str, bool)> {
+        match self {
+            FormKind::NewProfile => vec![
+                ("Tên", "R2 của tôi", false),
+                ("Endpoint", "để trống nếu là AWS", false),
+                ("Region", "us-east-1", false),
+                ("Access key", "", false),
+                ("Secret key", "", true),
+            ],
+            FormKind::NewFolder => vec![("Tên", "", false)],
+            FormKind::NewBucket => vec![("Tên", "", false)],
+            FormKind::Rename(_) => vec![("Tên mới", "", false)],
+            FormKind::OpenBucket => vec![("Bucket", "", false)],
+            FormKind::AddTag => vec![("Khoá", "", false), ("Giá trị", "", false)],
+            FormKind::KmsKey => vec![("Key id", "", false)],
+            FormKind::AssumeRole => vec![
+                ("Role ARN", "arn:aws:iam::…:role/…", false),
+                ("MFA serial", "không bắt buộc", false),
+                ("Mã MFA", "không bắt buộc", false),
+            ],
+            FormKind::SsoStart => vec![
+                ("Portal URL", "https://…/start", false),
+                ("Region", "us-east-1", false),
+            ],
         }
     }
 }
+
 
 /// A destructive action waiting for the user to say yes. Holding the entries
 /// rather than re-reading the selection means the dialog acts on exactly what
@@ -156,25 +191,17 @@ pub struct Field {
 /// — and its absence had quietly shaped the app, because with only one usable
 /// field there was no way to build a form at all.
 pub struct Form {
+    kind: FormKind,
     fields: Vec<Field>,
     error: Option<SharedString>,
 }
 
 impl Form {
-    fn new_profile(window: &mut Window, cx: &mut App) -> Self {
-        // Written out rather than built in a closure: each InputState needs the
-        // window mutably, so a closure capturing it cannot be called twice.
-        let specs: [(&'static str, &'static str, bool); 5] = [
-            ("Tên", "R2 của tôi", false),
-            // The one field that decides everything else: empty means AWS.
-            ("Endpoint", "để trống nếu là AWS thật", false),
-            ("Region", "us-east-1", false),
-            ("Access key", "", false),
-            ("Secret key", "dán bằng ⌘V", true),
-        ];
-
-        let mut fields = Vec::with_capacity(specs.len());
-        for (label, placeholder, masked) in specs {
+    fn new(kind: FormKind, window: &mut Window, cx: &mut App) -> Self {
+        let mut fields = Vec::new();
+        // A loop rather than a closure: each InputState needs the window
+        // mutably, so a closure capturing it could not be called twice.
+        for (label, placeholder, masked) in kind.fields() {
             let state = cx.new(|cx| {
                 let state = InputState::new(window, cx).placeholder(placeholder);
                 // Masked hides the value behind dots; someone adding a profile
@@ -189,6 +216,7 @@ impl Form {
         }
 
         Self {
+            kind,
             fields,
             error: None,
         }
@@ -198,6 +226,14 @@ impl Form {
         self.fields
             .iter()
             .find(|field| field.label == label)
+            .map(|field| field.state.read(cx).value().trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The first field's value, for the single-field dialogs.
+    fn first(&self, cx: &App) -> String {
+        self.fields
+            .first()
             .map(|field| field.state.read(cx).value().trim().to_string())
             .unwrap_or_default()
     }
@@ -1039,8 +1075,76 @@ impl Browser {
         }));
     }
 
-    fn open_profile_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.form = Some(Form::new_profile(window, cx));
+    fn open_form(&mut self, kind: FormKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.form = Some(Form::new(kind, window, cx));
+        cx.notify();
+    }
+
+    fn submit_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let kind = form.kind.clone();
+        let first = form.first(cx);
+
+        // Every single-field dialog rejects an empty value the same way, so the
+        // button never silently does nothing.
+        if first.is_empty() && kind != FormKind::NewProfile {
+            if let Some(form) = self.form.as_mut() {
+                form.error = Some("Chưa nhập gì".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        match kind {
+            FormKind::NewProfile => return self.submit_profile_form(cx),
+            FormKind::NewFolder => {
+                self.form = None;
+                self.create_folder(first, cx);
+            }
+            FormKind::NewBucket => {
+                self.form = None;
+                self.create_bucket(first, cx);
+            }
+            FormKind::Rename(key) => {
+                self.form = None;
+                self.rename_entry(key, first, cx);
+            }
+            FormKind::OpenBucket => {
+                self.form = None;
+                let bucket = SharedString::from(first);
+                self.open(bucket, String::new(), cx);
+            }
+            FormKind::AddTag => {
+                let value = form.value("Giá trị", cx);
+                self.form = None;
+                self.add_tag(format!("{first}={value}"), cx);
+            }
+            FormKind::KmsKey => {
+                self.form = None;
+                if let Some(client) = self.client.as_ref() {
+                    client.set_encryption(Encryption::Kms(first));
+                    self.status = "Mã hoá: SSE-KMS".into();
+                }
+            }
+            FormKind::AssumeRole => {
+                let serial = form.value("MFA serial", cx);
+                let code = form.value("Mã MFA", cx);
+                self.form = None;
+                let text = if serial.is_empty() || code.is_empty() {
+                    first
+                } else {
+                    format!("{first} mfa:{serial} {code}")
+                };
+                self.assume_role(text, cx);
+            }
+            FormKind::SsoStart => {
+                let region = form.value("Region", cx);
+                self.form = None;
+                self.start_sso(format!("{first} {region}").trim().to_string(), cx);
+            }
+        }
         cx.notify();
     }
 
@@ -1111,8 +1215,7 @@ impl Browser {
         };
         self.confirm = Some(Confirm {
             title: format!("Xoá profile {}?", profile.name).into(),
-            detail: "Khoá bí mật trong Keychain cũng bị xoá. Dữ liệu trên S3 không bị đụng tới."
-                .into(),
+            detail: "Xoá cả khoá trong Keychain. Dữ liệu trên S3 giữ nguyên.".into(),
             doomed: Vec::new(),
             version: None,
             empty_bucket: None,
@@ -1179,9 +1282,21 @@ impl Browser {
             }
             Command::GoUp => self.go_up(cx),
             Command::Filter => self.start_prompt(Prompt::Filter, cx),
-            Command::NewFolder => self.start_prompt(Prompt::NewFolder, cx),
-            Command::NewBucket => self.start_prompt(Prompt::NewBucket, cx),
-            Command::Rename => self.start_rename(cx),
+            Command::NewFolder => {
+                if let Some(window) = window {
+                    self.open_form(FormKind::NewFolder, window, cx);
+                }
+            }
+            Command::NewBucket => {
+                if let Some(window) = window {
+                    self.open_form(FormKind::NewBucket, window, cx);
+                }
+            }
+            Command::Rename => {
+                if let Some(window) = window {
+                    self.start_rename(window, cx);
+                }
+            }
             Command::Share => self.start_share(cx),
             Command::Inspect => self.toggle_inspector(cx),
             Command::Preview => self.quick_look(cx),
@@ -1201,13 +1316,19 @@ impl Browser {
             }
             Command::ScanOrphans => self.scan_orphans(cx),
             Command::EmptyBucket => self.ask_empty_bucket(cx),
-            Command::AssumeRole => self.start_prompt(Prompt::AssumeRole, cx),
-            Command::SsoSignIn => self.start_prompt(Prompt::SsoStart, cx),
-            Command::NewProfile => {
-                // Reached from the palette, which has no window handle here;
-                // the command runner is given one by its caller.
+            Command::AssumeRole => {
                 if let Some(window) = window {
-                    self.open_profile_form(window, cx);
+                    self.open_form(FormKind::AssumeRole, window, cx);
+                }
+            }
+            Command::SsoSignIn => {
+                if let Some(window) = window {
+                    self.open_form(FormKind::SsoStart, window, cx);
+                }
+            }
+            Command::NewProfile => {
+                if let Some(window) = window {
+                    self.open_form(FormKind::NewProfile, window, cx);
                 }
             }
         }
@@ -1571,10 +1692,9 @@ impl Browser {
         self.confirm = Some(Confirm {
             title: format!("Dọn sạch {bucket}?").into(),
             detail: if self.bucket_versioned {
-                "Xoá mọi object, mọi phiên bản cũ và mọi delete marker. Bucket này bật versioning nên đây là xoá vĩnh viễn, không hoàn tác được."
-                    .into()
+                "Xoá mọi object và mọi phiên bản. Vĩnh viễn.".into()
             } else {
-                "Xoá mọi object trong bucket. Không hoàn tác được.".into()
+                "Xoá mọi object. Không hoàn tác được.".into()
             },
             doomed: Vec::new(),
             version: None,
@@ -1897,13 +2017,13 @@ impl Browser {
 
     /// Opens the rename prompt, but only for a single entry: renaming several
     /// things at once has no sensible meaning with one text field.
-    fn start_rename(&mut self, cx: &mut Context<Self>) {
+    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut selected = self.selection.iter();
         let (Some(key), None) = (selected.next(), selected.next()) else {
             return;
         };
         let key = key.clone();
-        self.start_prompt(Prompt::Rename(key), cx);
+        self.open_form(FormKind::Rename(key), window, cx);
     }
 
     /// Renames one entry. A folder is a prefix, so renaming it moves every key
@@ -2111,52 +2231,15 @@ impl Browser {
     // ------------------------------------------------------------------ input
 
     fn start_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
-        self.prompt_text = match &prompt {
-            Prompt::Filter => self.filter.clone(),
-            // Start from the existing name so a rename is an edit, not retyping.
-            Prompt::Rename(key) => entry_name_of(key),
-            _ => String::new(),
-        };
+        self.prompt_text = self.filter.clone();
         self.prompt = Some(prompt);
         cx.notify();
     }
 
     fn commit_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.prompt.take() else {
-            return;
-        };
-        let text = std::mem::take(&mut self.prompt_text);
-        match prompt {
-            Prompt::Filter => {} // already applied while typing
-            Prompt::NewFolder if !text.trim().is_empty() => {
-                self.create_folder(text.trim().to_string(), cx)
-            }
-            Prompt::NewBucket if !text.trim().is_empty() => {
-                self.create_bucket(text.trim().to_string(), cx)
-            }
-            Prompt::Rename(key) if !text.trim().is_empty() => {
-                self.rename_entry(key, text.trim().to_string(), cx)
-            }
-            Prompt::AddTag if !text.trim().is_empty() => self.add_tag(text, cx),
-            Prompt::OpenBucket if !text.trim().is_empty() => {
-                let bucket = SharedString::from(text.trim().to_string());
-                // Remember it, so a token that cannot list still builds a usable
-                // sidebar over a session.
-                if !self.buckets.contains(&bucket) {
-                    self.buckets.push(bucket.clone());
-                }
-                self.open(bucket, String::new(), cx);
-            }
-            Prompt::AssumeRole if !text.trim().is_empty() => self.assume_role(text, cx),
-            Prompt::SsoStart if !text.trim().is_empty() => self.start_sso(text, cx),
-            Prompt::KmsKey if !text.trim().is_empty() => {
-                if let Some(client) = self.client.as_ref() {
-                    client.set_encryption(Encryption::Kms(text.trim().to_string()));
-                    self.status = "Mã hoá: SSE-KMS".into();
-                }
-            }
-            _ => {}
-        }
+        // The filter is applied while typing, so committing just dismisses it.
+        self.prompt = None;
+        self.prompt_text.clear();
         cx.notify();
     }
 
@@ -2187,7 +2270,7 @@ impl Browser {
                     return;
                 }
                 // Enter reaches here only when no field consumed it.
-                "enter" => return self.submit_profile_form(cx),
+                "enter" => return self.submit_form(cx),
                 _ => return,
             }
         }
@@ -2254,9 +2337,9 @@ impl Browser {
             match keystroke.key.as_str() {
                 "f" => return self.start_prompt(Prompt::Filter, cx),
                 "n" if keystroke.modifiers.shift => {
-                    return self.start_prompt(Prompt::NewBucket, cx)
+                    return self.open_form(FormKind::NewBucket, window, cx)
                 }
-                "n" => return self.start_prompt(Prompt::NewFolder, cx),
+                "n" => return self.open_form(FormKind::NewFolder, window, cx),
                 "r" => {
                     if let (Some(bucket), prefix) = (self.bucket.clone(), self.prefix.clone()) {
                         self.open(bucket, prefix, cx);
@@ -2264,7 +2347,7 @@ impl Browser {
                     return;
                 }
                 "d" => return self.download_selection(cx),
-                "enter" => return self.start_rename(cx),
+                "enter" => return self.start_rename(window, cx),
                 "i" => return self.toggle_inspector(cx),
                 "k" => return self.open_palette(cx),
                 "j" => {
@@ -2354,7 +2437,7 @@ impl Browser {
             .border_color(theme.border)
             .child(
                 section_header("PROFILES", "add-profile", theme).on_click(cx.listener(
-                    |this, _event, window, cx| this.open_profile_form(window, cx),
+                    |this, _event, window, cx| this.open_form(FormKind::NewProfile, window, cx),
                 )),
             )
             .children(
@@ -2419,12 +2502,12 @@ impl Browser {
             .child(div().h(px(8.)))
             .child(
                 section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
-                    |this, _event, _window, cx| {
+                    |this, _event, window, cx| {
                         if this.client.is_some() {
                             // Opening by name rather than creating: a scoped
                             // token is denied CreateBucket too, and reaching an
                             // existing bucket is the far more common need.
-                            this.start_prompt(Prompt::OpenBucket, cx);
+                            this.open_form(FormKind::OpenBucket, window, cx);
                         }
                     },
                 )),
@@ -2529,7 +2612,7 @@ impl Browser {
             .when(bucket.is_some(), |this| {
                 this.child(
                     action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.start_prompt(Prompt::NewFolder, cx),
+                        |this, _event, window, cx| this.open_form(FormKind::NewFolder, window, cx),
                     )),
                 )
             })
@@ -2544,7 +2627,7 @@ impl Browser {
             .when(self.selection.len() == 1, |this| {
                 this.child(
                     action_button("rename", "Đổi tên", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.start_rename(cx),
+                        |this, _event, window, cx| this.start_rename(window, cx),
                     )),
                 )
                 .child(
@@ -2607,20 +2690,20 @@ impl Browser {
                         .text_xs()
                         .child(wrapped_text(
                             if cannot_list {
-                                // The common R2 case, named so the user can tell
-                                // this apart from wrong credentials.
-                                "Token này có thể chỉ có quyền trên một bucket cụ thể — với R2 đó là cách cấp quyền được khuyến nghị. Mở thẳng bucket theo tên."
+                                // Naming the likely cause separates this from
+                                // wrong credentials, which look identical.
+                                "Token có thể chỉ có quyền trên một bucket."
                             } else {
-                                "Chọn ở cột bên trái, hoặc mở theo tên."
+                                "Chọn ở cột bên trái."
                             },
-                            62,
+                            48,
                             theme.text_muted,
                         )),
                 )
                 .child(
                     action_button("empty-open-bucket", "Mở bucket theo tên", theme).on_click(
-                        cx.listener(|this, _event, _window, cx| {
-                            this.start_prompt(Prompt::OpenBucket, cx)
+                        cx.listener(|this, _event, window, cx| {
+                            this.open_form(FormKind::OpenBucket, window, cx)
                         }),
                     ),
                 ),
@@ -2851,11 +2934,11 @@ impl Browser {
                                         "Mã hoá: {}",
                                         encryption_label(&current)
                                     )))
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    .on_click(cx.listener(move |this, _event, window, cx| {
                                         match next_encryption(&current) {
                                             // KMS needs a key id, so it asks
                                             // rather than silently picking one.
-                                            None => this.start_prompt(Prompt::KmsKey, cx),
+                                            None => this.open_form(FormKind::KmsKey, window, cx),
                                             Some(next) => {
                                                 if let Some(client) = this.client.as_ref() {
                                                     client.set_encryption(next);
@@ -3005,8 +3088,8 @@ impl Browser {
                                             .child("THẺ"),
                                     )
                                     .child(action_button("add-tag", "Thêm", theme).on_click(
-                                        cx.listener(|this, _event, _window, cx| {
-                                            this.start_prompt(Prompt::AddTag, cx)
+                                        cx.listener(|this, _event, window, cx| {
+                                            this.open_form(FormKind::AddTag, window, cx)
                                         }),
                                     )),
                             )
@@ -3289,9 +3372,7 @@ impl Browser {
                                 div()
                                     .text_xs()
                                     .text_color(theme.danger)
-                                    .child(
-                                        "Profile này dùng credential tạm thời (STS/SSO): link sẽ chết khi session hết hạn, dù chọn thời hạn dài hơn.",
-                                    ),
+                                    .child("Credential tạm: link chết khi session hết hạn."),
                             )
                         })
                         .child(match &share.url {
@@ -3377,38 +3458,19 @@ impl Browser {
                                 .flex_col()
                                 .gap_1()
                                 .child(div().text_color(theme.text).child("s3browser"))
-                                .child(div().text_xs().child(wrapped_text(
-                                    "Cần một profile để bắt đầu. Khoá bí mật lưu trong Keychain của máy, không nằm trong file cấu hình.",
-                                    64,
-                                    theme.text_muted,
-                                ))),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child("Khoá bí mật lưu trong Keychain."),
+                                ),
                         )
                         .children(
                             [
-                                step(
-                                    "Nhập từ ~/.aws",
-                                    "Đọc credentials và config có sẵn. Profile SSO hoặc assume-role cần đăng nhập riêng.",
-                                    "Nhập",
-                                    "onboard-import",
-                                ),
-                                step(
-                                    "Nhập thủ công",
-                                    "Cho R2, B2, Wasabi, Spaces, MinIO tự dựng — bất cứ thứ gì có endpoint riêng.",
-                                    "Tạo",
-                                    "onboard-manual",
-                                ),
-                                step(
-                                    "MinIO trên máy",
-                                    "Dành cho thử nghiệm: http://127.0.0.1:9000 với minioadmin/minioadmin.",
-                                    "Tạo",
-                                    "onboard-minio",
-                                ),
-                                step(
-                                    "Đăng nhập AWS SSO",
-                                    "Mở trình duyệt để duyệt, rồi chọn account và role.",
-                                    "Đăng nhập",
-                                    "onboard-sso",
-                                ),
+                                step("Nhập từ ~/.aws", "Profile có khoá tĩnh", "Nhập", "onboard-import"),
+                                step("Nhập thủ công", "R2, B2, Wasabi, Spaces, MinIO", "Tạo", "onboard-manual"),
+                                step("MinIO trên máy", "127.0.0.1:9000", "Tạo", "onboard-minio"),
+                                step("Đăng nhập AWS SSO", "Qua trình duyệt", "Đăng nhập", "onboard-sso"),
                             ]
                             .map(|(title, detail, button, id)| {
                                 div()
@@ -3443,10 +3505,10 @@ impl Browser {
                                         move |this, _event, window, cx| match id {
                                             "onboard-import" => this.import_from_aws(cx),
                                             "onboard-manual" => {
-                                                this.open_profile_form(window, cx)
+                                                this.open_form(FormKind::NewProfile, window, cx)
                                             }
                                             "onboard-minio" => this.add_minio_dev_profile(cx),
-                                            _ => this.start_prompt(Prompt::SsoStart, cx),
+                                            _ => this.open_form(FormKind::SsoStart, window, cx),
                                         },
                                     )))
                             }),
@@ -3488,13 +3550,7 @@ impl Browser {
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
-                        .child(div().text_color(theme.text).child("Profile mới"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.text_muted)
-                                .child("Tab để chuyển ô · Enter để lưu · Esc để huỷ"),
-                        )
+                        .child(div().text_color(theme.text).child(form.kind.title()))
                         .children(form.fields.iter().map(|field| {
                             div()
                                 .flex()
@@ -3519,11 +3575,6 @@ impl Browser {
                         .when_some(form.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         })
-                        .child(div().text_xs().child(wrapped_text(
-                            "Endpoint để trống là AWS thật. R2, B2, Wasabi, Spaces và MinIO được nhận diện từ endpoint để tự đặt region và kiểu địa chỉ.",
-                            60,
-                            theme.text_faint,
-                        )))
                         .child(
                             div()
                                 .flex()
@@ -3537,7 +3588,7 @@ impl Browser {
                                 ))
                                 .child(action_button("form-save", "Lưu", theme).on_click(
                                     cx.listener(|this, _event, _window, cx| {
-                                        this.submit_profile_form(cx)
+                                        this.submit_form(cx)
                                     }),
                                 )),
                         ),
@@ -3580,7 +3631,7 @@ impl Browser {
                                     div()
                                         .text_xs()
                                         .text_color(theme.text_muted)
-                                        .child("Duyệt trong trình duyệt, rồi quay lại đây."),
+                                        .child("Duyệt trong trình duyệt:"),
                                 )
                                 .child(
                                     div()
@@ -4018,7 +4069,7 @@ impl Browser {
 
     fn render_prompt(&self) -> Option<impl IntoElement> {
         let theme = self.theme;
-        let prompt = self.prompt.as_ref()?;
+        self.prompt.as_ref()?;
 
         Some(
             div()
@@ -4034,7 +4085,7 @@ impl Browser {
                     div()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child(prompt.label()),
+                        .child("Lọc"),
                 )
                 .child(
                     div()
@@ -4763,7 +4814,7 @@ fn delete_detail(doomed: &[Entry], versioned: bool) -> String {
 
     let mut detail = if folders > 0 {
         let noun = if folders == 1 { "thư mục" } else { "thư mục" };
-        format!("Gồm {folders} {noun} — mọi thứ bên trong cũng bị xoá. ")
+        format!("Gồm {folders} {noun}, kể cả nội dung bên trong. ")
     } else {
         String::new()
     };
@@ -5408,7 +5459,7 @@ mod tests {
         let with_folder = [entry("a.txt", false, 0), entry("logs", true, 0)];
         let detail = delete_detail(&with_folder, false);
         assert!(detail.starts_with("Gồm 1 thư mục"), "{detail}");
-        assert!(detail.contains("bên trong cũng bị xoá"), "{detail}");
+        assert!(detail.contains("nội dung bên trong"), "{detail}");
 
         // Versioned buckets must not be told "cannot be undone" — it is false,
         // and it hides that the old versions keep costing money.
