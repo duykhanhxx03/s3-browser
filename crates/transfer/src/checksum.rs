@@ -27,30 +27,6 @@ pub enum Verification {
     Unavailable,
 }
 
-/// Base64 alphabet, written out because pulling a dependency for eight lines of
-/// encoding is not worth the supply chain.
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Encodes exactly four bytes, which is all a CRC32 ever needs.
-fn base64_crc32(value: u32) -> String {
-    let bytes = value.to_be_bytes();
-    let mut out = String::with_capacity(8);
-
-    // 4 bytes is one full 3-byte group plus a 1-byte remainder.
-    let group = [bytes[0], bytes[1], bytes[2]];
-    let triple = u32::from(group[0]) << 16 | u32::from(group[1]) << 8 | u32::from(group[2]);
-    for shift in [18, 12, 6, 0] {
-        out.push(B64[((triple >> shift) & 0x3f) as usize] as char);
-    }
-
-    let remainder = u32::from(bytes[3]) << 16;
-    out.push(B64[((remainder >> 18) & 0x3f) as usize] as char);
-    out.push(B64[((remainder >> 12) & 0x3f) as usize] as char);
-    out.push('=');
-    out.push('=');
-    out
-}
-
 /// CRC32 of a file, in the base64 form S3 reports.
 ///
 /// Reads in chunks: a downloaded file can be larger than memory, and the whole
@@ -72,7 +48,9 @@ pub fn crc32_of_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(base64_crc32(hasher.finalize()))
+    // `encode_crc32`, not `crc32_base64`: the digest is already computed, and
+    // hashing it again yields a value that matches nothing.
+    Ok(s3core::encode_crc32(hasher.finalize()))
 }
 
 /// Compares a downloaded file against what the server said.
@@ -101,17 +79,22 @@ mod tests {
         assert_eq!(hasher.finalize(), 0xCBF4_3926);
 
         // And the base64 of those four bytes is what S3 puts in the header.
-        assert_eq!(base64_crc32(0xCBF4_3926), "y/Q5Jg==");
+        assert_eq!(crc32_base64_of(0xCBF4_3926), "y/Q5Jg==");
     }
 
     #[test]
     fn base64_pads_a_four_byte_value_correctly() {
-        assert_eq!(base64_crc32(0), "AAAAAA==");
-        assert_eq!(base64_crc32(0xFFFF_FFFF), "/////w==");
+        assert_eq!(crc32_base64_of(0), "AAAAAA==");
+        assert_eq!(crc32_base64_of(0xFFFF_FFFF), "/////w==");
         // Two padding characters always, because four bytes is never a whole
         // number of 3-byte groups.
-        assert!(base64_crc32(0x1234_5678).ends_with("=="));
-        assert_eq!(base64_crc32(0x1234_5678).len(), 8);
+        assert!(crc32_base64_of(0x1234_5678).ends_with("=="));
+        assert_eq!(crc32_base64_of(0x1234_5678).len(), 8);
+    }
+
+    /// The encoder takes bytes; these tests think in CRC values.
+    fn crc32_base64_of(value: u32) -> String {
+        s3core::encode_crc32(value)
     }
 
     fn temp_file(contents: &[u8]) -> std::path::PathBuf {
@@ -163,7 +146,7 @@ mod tests {
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&big);
-        assert_eq!(crc32_of_file(&path).unwrap(), base64_crc32(hasher.finalize()));
+        assert_eq!(crc32_of_file(&path).unwrap(), crc32_base64_of(hasher.finalize()));
 
         _ = std::fs::remove_file(&path);
     }

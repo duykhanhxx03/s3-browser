@@ -16,8 +16,8 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
-    CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective, ObjectIdentifier,
-    RestoreRequest, ServerSideEncryption, StorageClass, Tag, Tagging, Tier,
+    ChecksumMode, CompletedMultipartUpload, Delete, GlacierJobParameters, MetadataDirective,
+    ObjectIdentifier, RestoreRequest, ServerSideEncryption, StorageClass, Tag, Tagging, Tier,
 };
 use aws_sdk_s3::Client;
 
@@ -472,6 +472,10 @@ impl S3Client {
             .head_object()
             .bucket(bucket)
             .key(key)
+            // Without this S3 omits the checksum headers even when it has them
+            // stored, which reads exactly like a provider that does not support
+            // checksums at all.
+            .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
             .with_context(|| format!("HeadObject failed for s3://{bucket}/{key}"))?;
@@ -519,7 +523,14 @@ impl S3Client {
     }
 
     pub async fn put_object(&self, bucket: &str, key: &str, body: Vec<u8>) -> Result<()> {
-        let mut req = self.inner.put_object().bucket(bucket).key(key).body(body.into());
+        let checksum = crc32_base64(&body);
+        let mut req = self
+            .inner
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_crc32(checksum)
+            .body(body.into());
         match self.encryption() {
             Encryption::BucketDefault => {}
             Encryption::Aes256 => req = req.server_side_encryption(ServerSideEncryption::Aes256),
@@ -573,6 +584,12 @@ impl S3Client {
     pub async fn create_multipart_upload(&self, bucket: &str, key: &str) -> Result<String> {
         // Encryption is decided here, once. Setting it per part is not a thing
         // S3 supports — the parts inherit whatever the upload was created with.
+        // No checksum algorithm here yet: declaring one obliges
+        // CompleteMultipartUpload to repeat every part's checksum in its part
+        // list, and `CompletedPart` does not carry one — the journal persists
+        // parts across restarts, so adding the field is a schema change rather
+        // than a one-line fix. Single-request uploads do carry a checksum; see
+        // the note in PLAN §6.
         let mut req = self.inner.create_multipart_upload().bucket(bucket).key(key);
         match self.encryption() {
             Encryption::BucketDefault => {}
@@ -1445,6 +1462,43 @@ pub fn public_url(profile: &Profile, bucket: &str, key: &str) -> String {
             profile.region
         ),
     }
+}
+
+/// CRC32 of some bytes, base64-encoded the way S3 reports and accepts it.
+///
+/// Attached explicitly to each upload request rather than left to the SDK's
+/// global setting: `relaxed_checksums` turns that setting off for non-AWS
+/// providers (they reject the automatic headers), which had the side effect of
+/// storing no checksum at all — so a download had nothing to verify against.
+/// An explicit value goes through regardless.
+pub fn crc32_base64(bytes: &[u8]) -> String {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(bytes);
+    encode_crc32(hasher.finalize())
+}
+
+/// Encodes an already-computed CRC32.
+///
+/// Separate from [`crc32_base64`] on purpose: they take the same-looking `&[u8]`
+/// versus `u32` and mixing them up hashes the digest a second time, which
+/// produces a plausible-looking value that matches nothing. That mistake was
+/// made once already and only a real server caught it.
+pub fn encode_crc32(value: u32) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let value = value.to_be_bytes();
+
+    // Four bytes is one full 3-byte group plus a 1-byte remainder.
+    let triple =
+        u32::from(value[0]) << 16 | u32::from(value[1]) << 8 | u32::from(value[2]);
+    let mut out = String::with_capacity(8);
+    for shift in [18, 12, 6, 0] {
+        out.push(B64[((triple >> shift) & 0x3f) as usize] as char);
+    }
+    let remainder = u32::from(value[3]) << 16;
+    out.push(B64[((remainder >> 18) & 0x3f) as usize] as char);
+    out.push(B64[((remainder >> 12) & 0x3f) as usize] as char);
+    out.push_str("==");
+    out
 }
 
 /// CopyObject refuses anything larger; past this a copy has to go through

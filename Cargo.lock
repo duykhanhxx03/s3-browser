@@ -6201,6 +6201,7 @@ dependencies = [
  "aws-sdk-sso",
  "aws-sdk-ssooidc",
  "aws-sdk-sts",
+ "crc32fast",
  "tokio",
 ]
 
