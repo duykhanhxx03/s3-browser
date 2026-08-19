@@ -185,7 +185,19 @@ Versioning UI đầy đủ ✅; SSE-S3/KMS ✅; **ACL editor — chưa làm**; S
 
 **ACL editor chưa làm** — và nên cân nhắc có đáng làm không: AWS khuyến nghị tắt ACL (Object Ownership = bucket owner enforced) từ 2023, bucket mới mặc định đã tắt. Làm một editor cho cơ chế mà chính AWS khuyên đừng dùng thì giá trị thấp; bucket policy có ích hơn nhiều và đang nằm ở phần "sau 1.0".
 
-### M5 — Ship (2–3 tuần)
+### M5 — Ship (2–3 tuần) — **đang làm**
+Xong: reduced-transparency (glass tự tắt khi bật cài đặt trợ năng), màn hình bắt đầu, cấu hình `cargo-packager` + dựng thật `.app`/`.dmg` chưa ký (xem `docs/PACKAGING.md`).
+
+**Chặn bởi thứ không phải code:** ký Developer ID và notarize cần tài khoản Apple Developer trả phí; máy dev hiện chỉ có chứng chỉ *Apple Development*, loại chỉ chạy thử cục bộ được. Auto-update cần nơi host và một cặp khoá ký — khoá riêng không được nằm trong repo, nên phải quyết định chỗ host trước rồi mới làm.
+
+**Ba điều đo được khi đóng gói:**
+1. `cargo packager` không tự build, chạy thẳng sẽ báo lỗi trỏ vào binary chưa tồn tại.
+2. Bundle vừa dựng xong có chữ ký **không hợp lệ** (`code has no resources but signature indicates they must be present`) — linker ký cho file binary đơn lẻ, không ký cho cấu trúc bundle bọc quanh nó sau đó. Phải `codesign --force --deep --sign -` lại kể cả để chạy thử.
+3. Ký ad-hoc xong `codesign --verify` báo hợp lệ nhưng `spctl` **vẫn từ chối** — chữ ký hợp lệ về cấu trúc không đồng nghĩa với được phép phân phối.
+
+Còn lại: crash reporting (sentry + minidump).
+
+### Chi tiết M5 gốc
 Onboarding lần đầu; polish theme/animation/reduced-transparency; crash reporting (sentry + minidump); đóng gói `cargo-packager` (.app + .dmg), ký Developer ID + notarize (`rcodesign` hoặc notarytool), auto-update (`cargo-packager-updater` hoặc Velopack). **Phân phối trực tiếp, không App Store** (App Sandbox siết drag-drop/bookmark; GPUI chưa có accessibility — rủi ro review).
 
 Sau 1.0: sync hai chiều, bucket policy/CORS/lifecycle editor, drag-out, cross-account copy, Windows/Linux (GPUI đã ổn trên Windows từ 10/2025, blur = Acrylic/Mica).
