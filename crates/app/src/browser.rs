@@ -16,10 +16,10 @@ use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
     capability::{Capabilities, CapabilityCache, Support},
-    Encryption, ObjectAcl, ObjectVersion, OrphanedUpload, Profile, RestoreState, S3Client, Sort, SortKey,
+    Encryption, ObjectAcl, ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
-use vault::{ImportedProfile, ProfileStore, StoredProfile};
+use vault::{ProfileStore, StoredProfile};
 
 use crate::platform::{self, Chrome};
 use crate::theme::Theme;
@@ -274,6 +274,18 @@ impl Form {
     }
 }
 
+/// What ⌘C or ⌘X put aside, waiting for a paste.
+///
+/// Holds keys rather than a live selection: the user is expected to navigate
+/// somewhere else before pasting, and the selection is gone by then.
+#[derive(Clone)]
+pub struct Clipboard {
+    bucket: SharedString,
+    entries: Vec<Entry>,
+    /// True for a cut: paste moves instead of copying.
+    cut: bool,
+}
+
 pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
@@ -312,14 +324,13 @@ pub struct Browser {
     transfers: TransferEngine,
     drawer_open: bool,
 
-    orphans: Vec<OrphanedUpload>,
-    orphans_open: bool,
 
     confirm: Option<Confirm>,
     /// An SSO sign-in in progress, and the roles it turned up once done.
     sso: Option<SsoFlow>,
     /// The add-profile form, when open.
     form: Option<Form>,
+    clipboard: Option<Clipboard>,
     /// Whether the profile manager dialog is open.
     profiles_open: bool,
     /// The command palette: `Some` with the query typed so far.
@@ -414,10 +425,9 @@ impl Browser {
             transfers,
             drawer_open: false,
 
-            orphans: Vec::new(),
-            orphans_open: false,
             confirm: None,
             form: None,
+            clipboard: None,
             profiles_open: false,
             sso: None,
             palette: None,
@@ -479,53 +489,6 @@ impl Browser {
             access_key: "minioadmin".into(),
         };
         self.add_profile(profile, "minioadmin", cx);
-    }
-
-    fn import_from_aws(&mut self, cx: &mut Context<Self>) {
-        let imported = match vault::import_aws_profiles() {
-            Ok(imported) => imported,
-            Err(error) => {
-                self.error = Some(format!("Không đọc được ~/.aws: {error}").into());
-                return;
-            }
-        };
-
-        if imported.is_empty() {
-            self.status = "Không tìm thấy profile nào có khoá tĩnh trong ~/.aws".into();
-            cx.notify();
-            return;
-        }
-
-        let mut added = 0;
-        for ImportedProfile {
-            mut profile,
-            secret_key,
-            session_token,
-        } in imported
-        {
-            if self.profiles.iter().any(|p| p.name == profile.name) {
-                continue;
-            }
-            profile.id = vault::new_profile_id(&profile.name, &self.profiles);
-            if let Err(error) = vault::set_secret_key(&profile.id, &secret_key) {
-                self.error = Some(format!("Không lưu được khoá cho {}: {error}", profile.name).into());
-                continue;
-            }
-            // An STS/SSO profile without its token authenticates nowhere.
-            if let Err(error) = vault::set_session_token(&profile.id, session_token.as_deref()) {
-                self.error = Some(format!("Không lưu được session token cho {}: {error}", profile.name).into());
-                continue;
-            }
-            self.profiles.push(profile);
-            added += 1;
-        }
-
-        self.save_profiles();
-        self.status = format!("Đã nhập {added} profile từ ~/.aws").into();
-        if added > 0 && self.client.is_none() {
-            self.connect(self.profiles.len() - added, cx);
-        }
-        cx.notify();
     }
 
     fn connect(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1386,6 +1349,10 @@ impl Browser {
                     self.start_duplicate(window, cx);
                 }
             }
+            Command::Copy => self.copy_to_clipboard_selection(false, cx),
+            Command::Cut => self.copy_to_clipboard_selection(true, cx),
+            Command::Paste => self.paste(cx),
+            Command::SelectAll => self.select_all(cx),
             Command::Share => self.start_share(cx),
             Command::Inspect => self.toggle_inspector(cx),
             Command::Preview => self.quick_look(cx),
@@ -1403,7 +1370,6 @@ impl Browser {
             Command::ToggleQueue => {
                 self.drawer_open = !self.drawer_open;
             }
-            Command::ScanOrphans => self.scan_orphans(cx),
             Command::EmptyBucket => self.ask_empty_bucket(cx),
             Command::AssumeRole => {
                 if let Some(window) = window {
@@ -2201,6 +2167,155 @@ impl Browser {
         self.open_form(FormKind::Rename(key), window, cx);
     }
 
+    /// Puts the selection aside for a later paste. `cut` makes it a move.
+    fn copy_to_clipboard_selection(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(bucket) = self.bucket.clone() else {
+            return;
+        };
+        let entries: Vec<Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| self.selection.contains(&entry.key))
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+
+        self.status = format!(
+            "{} {} mục",
+            if cut { "Đã cắt" } else { "Đã chép" },
+            entries.len()
+        )
+        .into();
+        self.clipboard = Some(Clipboard {
+            bucket,
+            entries,
+            cut,
+        });
+        cx.notify();
+    }
+
+    /// Pastes into the prefix on screen.
+    ///
+    /// Cross-bucket works because the copy is server-side either way; a cut
+    /// deletes the source only after its copy is confirmed, so an interruption
+    /// leaves a duplicate rather than a hole.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(clipboard)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.clipboard.clone(),
+        ) else {
+            return;
+        };
+        let prefix = self.prefix.clone();
+
+        // Pasting where the items already are would copy each onto itself.
+        if clipboard.bucket == bucket
+            && clipboard.entries.iter().all(|entry| {
+                parent_prefix_of(&entry.key) == prefix
+            })
+        {
+            self.report("Đã ở đúng thư mục này".into());
+            return;
+        }
+
+        let cut = clipboard.cut;
+        let source_bucket = clipboard.bucket.to_string();
+        let target_bucket = bucket.to_string();
+        let entries = clipboard.entries.clone();
+        self.status = format!("Đang dán {} mục…", entries.len()).into();
+
+        let pasting = Tokio::spawn(cx, async move {
+            let mut moved = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+
+            for entry in &entries {
+                let name = entry_name_of(&entry.key);
+                if entry.is_folder {
+                    let destination = format!("{prefix}{name}/");
+                    // A folder is N objects; moving across buckets is not
+                    // supported by `move_prefix`, so only the same-bucket case
+                    // can cut. Copying works either way.
+                    let outcome = if cut && source_bucket == target_bucket {
+                        client
+                            .move_prefix(&source_bucket, &entry.key, &destination, |_, _| {})
+                            .await
+                    } else {
+                        client
+                            .copy_prefix(&source_bucket, &entry.key, &destination, |_, _| {})
+                            .await
+                    };
+                    match outcome {
+                        Ok(report) => {
+                            moved += report.moved;
+                            errors.extend(report.errors);
+                        }
+                        Err(error) => errors.push(format!("{}: {error}", entry.key)),
+                    }
+                } else {
+                    let destination = format!("{prefix}{name}");
+                    let outcome = client
+                        .copy_object(&source_bucket, &entry.key, &target_bucket, &destination)
+                        .await;
+                    match outcome {
+                        Ok(()) => {
+                            // Delete only once the copy is confirmed.
+                            if cut {
+                                if let Err(error) =
+                                    client.delete_object(&source_bucket, &entry.key).await
+                                {
+                                    errors.push(format!("{}: {error}", entry.key));
+                                }
+                            }
+                            moved += 1;
+                        }
+                        Err(error) => errors.push(format!("{}: {error}", entry.key)),
+                    }
+                }
+            }
+            (moved, errors)
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let (moved, errors) = pasting.await.unwrap_or((0, Vec::new()));
+            _ = this.update(cx, |this, cx| {
+                if errors.is_empty() {
+                    this.status = format!("Đã dán {moved} mục").into();
+                    // A cut is spent once pasted; a copy stays for pasting again,
+                    // which is what both Finder and Explorer do.
+                    if cut {
+                        this.clipboard = None;
+                    }
+                } else {
+                    this.report(format!(
+                        "Dán {moved} mục, {} lỗi: {}",
+                        errors.len(),
+                        errors.first().cloned().unwrap_or_default()
+                    ));
+                }
+                if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
+                    this.open(bucket, prefix, cx);
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        // Only what is on screen: selecting behind an active filter would act on
+        // rows the user cannot see.
+        self.selection = self
+            .visible
+            .iter()
+            .filter_map(|ix| self.entries.get(*ix))
+            .map(|entry| entry.key.clone())
+            .collect();
+        cx.notify();
+    }
+
     /// Copies one object beside itself under a new name. Server-side, so a
     /// multi-gigabyte object never travels through this machine.
     fn duplicate_entry(&mut self, key: String, new_name: String, cx: &mut Context<Self>) {
@@ -2314,117 +2429,6 @@ impl Browser {
                 this.selection.clear();
                 if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
                     this.open(bucket, prefix, cx);
-                }
-                cx.notify();
-            });
-        });
-        self.op_task = Some(task);
-        cx.notify();
-    }
-
-    /// Looks for multipart uploads left behind by a crash or a cancel. S3 bills
-    /// for their parts indefinitely and they never show up in a normal listing,
-    /// so this is the only way to find them.
-    fn scan_orphans(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
-            return;
-        };
-        self.orphans_open = true;
-        self.status = "Đang tìm upload dở…".into();
-
-        let scanning = Tokio::spawn(cx, async move { client.list_orphaned_uploads(&bucket).await });
-
-        let task = cx.spawn(async move |this, cx| {
-            let outcome = scanning.await;
-            _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok(Ok(orphans)) => {
-                        this.status = if orphans.is_empty() {
-                            "Không có upload dở nào".into()
-                        } else {
-                            format!("Tìm thấy {} upload dở", orphans.len()).into()
-                        };
-                        this.orphans = orphans;
-                    }
-                    Ok(Err(error)) => this.report(format!("{error}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
-                }
-                cx.notify();
-            });
-        });
-        self.op_task = Some(task);
-        cx.notify();
-    }
-
-    /// Aborts one orphaned upload, releasing the storage it was holding.
-    fn abort_orphan(&mut self, upload_id: SharedString, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
-            return;
-        };
-        let Some(orphan) = self
-            .orphans
-            .iter()
-            .find(|orphan| orphan.upload_id == upload_id.as_ref())
-            .cloned()
-        else {
-            return;
-        };
-
-        let aborting = Tokio::spawn(cx, async move {
-            client
-                .abort_multipart_upload(&bucket, &orphan.key, &orphan.upload_id)
-                .await
-        });
-
-        let task = cx.spawn(async move |this, cx| {
-            let outcome = aborting.await;
-            _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok(Ok(())) => this.orphans.retain(|o| o.upload_id != upload_id.as_ref()),
-                    Ok(Err(error)) => this.report(format!("{error}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
-                }
-                cx.notify();
-            });
-        });
-        self.op_task = Some(task);
-        cx.notify();
-    }
-
-    /// Aborts every orphan currently listed, reporting how many failed rather
-    /// than stopping at the first error.
-    fn abort_all_orphans(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
-            return;
-        };
-        let orphans = self.orphans.clone();
-        if orphans.is_empty() {
-            return;
-        }
-
-        let aborting = Tokio::spawn(cx, async move {
-            let mut failures = 0usize;
-            for orphan in &orphans {
-                if client
-                    .abort_multipart_upload(&bucket, &orphan.key, &orphan.upload_id)
-                    .await
-                    .is_err()
-                {
-                    failures += 1;
-                }
-            }
-            (orphans.len(), failures)
-        });
-
-        let task = cx.spawn(async move |this, cx| {
-            let (total, failures) = aborting.await.unwrap_or((0, 0));
-            _ = this.update(cx, |this, cx| {
-                // Anything that failed is still out there, so re-scan rather than
-                // leaving the list claiming the bucket is clean.
-                this.orphans.clear();
-                this.status = abort_summary(total, failures).into();
-                if failures > 0 {
-                    this.scan_orphans(cx);
                 }
                 cx.notify();
             });
@@ -2581,6 +2585,10 @@ impl Browser {
                     return;
                 }
                 "d" => return self.download_selection(cx),
+                "c" => return self.copy_to_clipboard_selection(false, cx),
+                "x" => return self.copy_to_clipboard_selection(true, cx),
+                "v" => return self.paste(cx),
+                "a" => return self.select_all(cx),
                 "enter" => return self.start_rename(window, cx),
                 "i" => return self.toggle_inspector(cx),
                 "k" => return self.open_palette(cx),
@@ -2844,11 +2852,6 @@ impl Browser {
                                 .flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(action_button("import-aws", "Nhập từ ~/.aws", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.import_from_aws(cx)
-                                    }),
-                                ))
                                 .child(action_button("add-profile", "Profile mới", theme).on_click(
                                     cx.listener(|this, _event, window, cx| {
                                         this.profiles_open = false;
@@ -2946,13 +2949,6 @@ impl Browser {
                 this.child(
                     action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
                         |this, _event, window, cx| this.open_form(FormKind::NewFolder, window, cx),
-                    )),
-                )
-            })
-            .when(bucket.is_some(), |this| {
-                this.child(
-                    action_button("scan-orphans", "Dọn upload dở", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.scan_orphans(cx),
                     )),
                 )
             })
@@ -3876,7 +3872,6 @@ impl Browser {
                         )
                         .children(
                             [
-                                step("Nhập từ ~/.aws", "Profile có khoá tĩnh", "Nhập", "onboard-import"),
                                 step("Nhập thủ công", "R2, B2, Wasabi, Spaces, MinIO", "Tạo", "onboard-manual"),
                                 step("MinIO trên máy", "127.0.0.1:9000", "Tạo", "onboard-minio"),
                                 step("Đăng nhập AWS SSO", "Qua trình duyệt", "Đăng nhập", "onboard-sso"),
@@ -3912,7 +3907,6 @@ impl Browser {
                                     )
                                     .child(action_button(id, button, theme).on_click(cx.listener(
                                         move |this, _event, window, cx| match id {
-                                            "onboard-import" => this.import_from_aws(cx),
                                             "onboard-manual" => {
                                                 this.open_form(FormKind::NewProfile, window, cx)
                                             }
@@ -4270,108 +4264,6 @@ impl Browser {
         )
     }
 
-    fn render_orphans(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.orphans_open {
-            return None;
-        }
-        let theme = self.theme;
-        let count = self.orphans.len();
-
-        Some(
-            div()
-                .h(px(PANEL_HEIGHT))
-                .flex()
-                .flex_col()
-                .bg(theme.panel)
-                .border_t_1()
-                .border_color(theme.border_strong)
-                .child(
-                    div()
-                        .h(px(CONTROL_BAR_HEIGHT))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .text_xs()
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("UPLOAD DỞ {count}")))
-                        .child(div().flex_1())
-                        .when(count > 0, |this| {
-                            this.child(danger_button(
-                                "abort-all-orphans",
-                                SharedString::from(format!("Huỷ tất cả ({count})")),
-                                theme,
-                            )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.abort_all_orphans(cx)
-                            })))
-                        })
-                        .child(
-                            action_button("close-orphans", "Đóng", theme).on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.orphans_open = false;
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
-                .child(if self.orphans.is_empty() {
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(theme.text_faint)
-                        .child("Không có upload dở nào")
-                        .into_any_element()
-                } else {
-                    uniform_list(
-                        "orphans",
-                        self.orphans.len(),
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|ix| this.orphans.get(ix).cloned())
-                                .map(|orphan| this.render_orphan(orphan, cx))
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .flex_1()
-                    .into_any_element()
-                }),
-        )
-    }
-
-    fn render_orphan(&self, orphan: OrphanedUpload, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let upload_id = SharedString::from(orphan.upload_id.clone());
-        let when: SharedString = orphan
-            .initiated_epoch
-            .map(format_timestamp)
-            .unwrap_or_else(|| "?".into())
-            .into();
-
-        div()
-            .id(upload_id.clone())
-            .h(px(HEADER_HEIGHT))
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_xs()
-            .child(
-                div()
-                    .flex_1()
-                    .text_color(theme.text)
-                    .overflow_hidden()
-                    .child(SharedString::from(orphan.key)),
-            )
-            .child(div().text_color(theme.text_faint).child(when))
-            .child(action_button("abort-orphan", "Huỷ", theme).on_click(cx.listener(
-                move |this, _event, _window, cx| this.abort_orphan(upload_id.clone(), cx),
-            )))
-    }
-
     /// Column widths for the transfer table. Shared by the header and the rows
     /// so they line up — the object list taught that lesson the hard way.
     const JOB_COLS: (f32, f32, f32, f32) = (18., 150., 130., 78.);
@@ -4648,8 +4540,7 @@ impl Render for Browser {
                     .children(self.render_inspector(cx)),
             )
                     .children(self.render_drawer(cx))
-                    .children(self.render_orphans(cx))
-            })
+                    })
             .child(self.render_status(cx))
             .children(self.render_confirm(cx))
             .children(self.render_share(cx))
@@ -5257,6 +5148,10 @@ pub enum Command {
     NewBucket,
     Rename,
     Duplicate,
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
     Share,
     Inspect,
     Preview,
@@ -5264,7 +5159,6 @@ pub enum Command {
     Download,
     Delete,
     ToggleQueue,
-    ScanOrphans,
     EmptyBucket,
     AssumeRole,
     SsoSignIn,
@@ -5282,7 +5176,11 @@ impl Command {
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
-            Command::Duplicate => ("Sao chép", ""),
+            Command::Duplicate => ("Nhân bản", ""),
+            Command::Copy => ("Chép", "⌘C"),
+            Command::Cut => ("Cắt", "⌘X"),
+            Command::Paste => ("Dán", "⌘V"),
+            Command::SelectAll => ("Chọn tất cả", "⌘A"),
             Command::Share => ("Chia sẻ / presigned URL", ""),
             Command::Inspect => ("Chi tiết", "⌘I"),
             Command::Preview => ("Xem trước", "Space"),
@@ -5290,7 +5188,6 @@ impl Command {
             Command::Download => ("Tải xuống", "⌘D"),
             Command::Delete => ("Xoá mục đã chọn", "⌘⌫"),
             Command::ToggleQueue => ("Hàng đợi truyền tải", "⌘J"),
-            Command::ScanOrphans => ("Dọn upload dở", ""),
             Command::EmptyBucket => ("Dọn sạch bucket", ""),
             Command::AssumeRole => ("Nhận role (STS AssumeRole)", ""),
             Command::SsoSignIn => ("Đăng nhập AWS SSO", ""),
@@ -5298,7 +5195,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 19] {
+    fn all() -> [Command; 22] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -5307,6 +5204,10 @@ impl Command {
             Command::NewBucket,
             Command::Rename,
             Command::Duplicate,
+            Command::Copy,
+            Command::Cut,
+            Command::Paste,
+            Command::SelectAll,
             Command::Share,
             Command::Inspect,
             Command::Preview,
@@ -5314,7 +5215,6 @@ impl Command {
             Command::Download,
             Command::Delete,
             Command::ToggleQueue,
-            Command::ScanOrphans,
             Command::EmptyBucket,
             Command::AssumeRole,
             Command::SsoSignIn,
@@ -5418,19 +5318,6 @@ fn renamed_key(key: &str, new_name: &str) -> Option<String> {
     ))
 }
 
-/// What to tell the user after a bulk abort. Pure because the partial-failure
-/// arithmetic is the easy thing to get backwards.
-fn abort_summary(total: usize, failures: usize) -> String {
-    let succeeded = total.saturating_sub(failures);
-    if failures == 0 {
-        format!("Đã huỷ {total} upload dở")
-    } else if succeeded == 0 {
-        format!("Không huỷ được upload nào ({failures} lỗi)")
-    } else {
-        format!("Đã huỷ {succeeded}/{total} upload dở, {failures} lỗi")
-    }
-}
-
 /// Whether the visible range is close enough to the end to justify fetching the
 /// next page. Pure so the paging rule can be tested without a client.
 fn should_prefetch(
@@ -5488,6 +5375,18 @@ fn is_primary(modifiers: &Modifiers) -> bool {
 }
 
 /// `a/b/c/` → `a/b/`, `a/` → ``, `` → ``.
+/// The prefix a key sits directly under, with its trailing slash.
+///
+/// Used to spot a paste into the folder the items already live in, which would
+/// otherwise copy each object onto itself.
+fn parent_prefix_of(key: &str) -> String {
+    let body = key.trim_end_matches('/');
+    match body.rfind('/') {
+        Some(ix) => body[..=ix].to_string(),
+        None => String::new(),
+    }
+}
+
 fn parent_prefix(prefix: &str) -> String {
     prefix
         .trim_end_matches('/')
@@ -5547,10 +5446,9 @@ mod tests {
             transfers: TransferEngine::in_memory().expect("in-memory queue"),
             drawer_open: false,
 
-            orphans: Vec::new(),
-            orphans_open: false,
             confirm: None,
             form: None,
+            clipboard: None,
             profiles_open: false,
             sso: None,
             palette: None,
@@ -5571,6 +5469,21 @@ mod tests {
         };
         browser.resort_and_filter();
         browser
+    }
+
+    #[test]
+    fn parent_prefix_of_a_key_is_where_a_paste_would_be_a_no_op() {
+        assert_eq!(parent_prefix_of("reports/q1.txt"), "reports/");
+        assert_eq!(parent_prefix_of("a/b/c.txt"), "a/b/");
+        // A key at the root has no parent prefix, which is the empty string and
+        // exactly what `self.prefix` holds at the top of a bucket.
+        assert_eq!(parent_prefix_of("top.txt"), "");
+
+        // A folder key ends in `/`; its parent is the level above, not itself.
+        // Getting this backwards would make pasting a folder into its own
+        // parent look like a no-op and silently do nothing.
+        assert_eq!(parent_prefix_of("a/b/"), "a/");
+        assert_eq!(parent_prefix_of("solo/"), "");
     }
 
     #[test]
@@ -5911,7 +5824,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), 22);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -6106,15 +6019,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn abort_summary_reports_partial_failures_honestly() {
-        assert_eq!(abort_summary(3, 0), "Đã huỷ 3 upload dở");
-        // The success count is what landed, not the total.
-        assert_eq!(abort_summary(3, 1), "Đã huỷ 2/3 upload dở, 1 lỗi");
-        // Claiming a partial win when nothing worked would be a lie.
-        assert_eq!(abort_summary(3, 3), "Không huỷ được upload nào (3 lỗi)");
-        // A task that died before reporting must not underflow.
-        assert_eq!(abort_summary(0, 0), "Đã huỷ 0 upload dở");
-        assert_eq!(abort_summary(1, 5), "Không huỷ được upload nào (5 lỗi)");
-    }
 }

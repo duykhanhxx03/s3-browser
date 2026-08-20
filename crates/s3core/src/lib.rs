@@ -1470,6 +1470,44 @@ impl S3Client {
         self.delete_object(src_bucket, src_key).await
     }
 
+    /// Copies every key under a prefix to another prefix.
+    ///
+    /// Same shape as [`move_prefix`](Self::move_prefix) without the delete, so a
+    /// partial result leaves the source untouched — the failure mode is a
+    /// half-copied destination, which is recoverable by running it again.
+    pub async fn copy_prefix(
+        &self,
+        bucket: &str,
+        src_prefix: &str,
+        dst_prefix: &str,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<MoveReport> {
+        if src_prefix == dst_prefix {
+            return Ok(MoveReport::default());
+        }
+        // Copying a prefix into itself would walk keys it is still creating.
+        if dst_prefix.starts_with(src_prefix) {
+            anyhow::bail!("Không thể chép {src_prefix} vào trong chính nó ({dst_prefix})");
+        }
+
+        let keys = self.list_keys_recursive(bucket, src_prefix).await?;
+        let total = keys.len();
+        let mut report = MoveReport::default();
+        progress(0, total);
+
+        for (done, key) in keys.iter().enumerate() {
+            let suffix = key.strip_prefix(src_prefix).unwrap_or(key);
+            let target = format!("{dst_prefix}{suffix}");
+
+            match self.copy_object(bucket, key, bucket, &target).await {
+                Ok(()) => report.moved += 1,
+                Err(error) => report.errors.push(format!("{key}: {error}")),
+            }
+            progress(done + 1, total);
+        }
+        Ok(report)
+    }
+
     /// Renames a folder, which S3 has no concept of: every key under the prefix
     /// is copied to the new prefix and then deleted.
     ///
