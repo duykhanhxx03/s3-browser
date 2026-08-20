@@ -1,7 +1,7 @@
 //! The browser window: profiles and buckets on the left, one prefix listed on
 //! the right, with sorting, filtering, paging and folder operations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -331,6 +331,9 @@ pub struct Browser {
     /// The add-profile form, when open.
     form: Option<Form>,
     clipboard: Option<Clipboard>,
+    /// Decoded thumbnails, keyed by object key. `None` marks a key already
+    /// tried and rejected, so a failure is not retried on every repaint.
+    thumbnails: HashMap<String, Option<std::sync::Arc<gpui::Image>>>,
     /// Whether the profile manager dialog is open.
     profiles_open: bool,
     /// The command palette: `Some` with the query typed so far.
@@ -363,6 +366,9 @@ pub struct Browser {
     /// Capability probing gets its own slot: it runs alongside whatever the user
     /// is doing, and sharing `op_task` meant opening the inspector cancelled it.
     caps_task: Option<Task<()>>,
+    /// Thumbnails load in the background and must not cancel a user action, so
+    /// they get their own slot rather than sharing `op_task`.
+    thumb_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
 }
@@ -428,6 +434,7 @@ impl Browser {
             confirm: None,
             form: None,
             clipboard: None,
+            thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
             palette: None,
@@ -443,6 +450,7 @@ impl Browser {
             paging_task: None,
             op_task: None,
             caps_task: None,
+            thumb_task: None,
             tick_task: None,
             _appearance: Some(appearance),
         };
@@ -2167,6 +2175,70 @@ impl Browser {
         self.open_form(FormKind::Rename(key), window, cx);
     }
 
+    /// Fetches thumbnails for the image rows currently on screen.
+    ///
+    /// Only what is visible, only images, and only ones small enough to be worth
+    /// the bytes: a listing of a thousand photos would otherwise be a thousand
+    /// GETs, which is a real bill and a slow list. Each key is attempted once —
+    /// the map records failures too, or a broken object would be re-fetched on
+    /// every repaint.
+    fn load_thumbnails(&mut self, range: &Range<usize>, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+
+        let wanted: Vec<Entry> = self
+            .visible
+            .get(range.clone())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ix| self.entries.get(*ix))
+            .filter(|entry| {
+                !entry.is_folder
+                    && !self.thumbnails.contains_key(&entry.key)
+                    && entry.size > 0
+                    && entry.size <= THUMBNAIL_LIMIT
+                    && preview_kind(&entry.key, None) == PreviewKind::Image
+            })
+            .cloned()
+            .collect();
+
+        if wanted.is_empty() {
+            return;
+        }
+        // Reserve the slots now, so a second scroll over the same rows does not
+        // queue the same fetches again while the first is still in flight.
+        for entry in &wanted {
+            self.thumbnails.insert(entry.key.clone(), None);
+        }
+
+        let fetching = Tokio::spawn(cx, async move {
+            let mut loaded = Vec::new();
+            for entry in wanted {
+                let size = entry.size.max(0) as u64;
+                if let Ok(bytes) = client.get_range(&bucket, &entry.key, 0..size, None).await {
+                    if let Some(format) = image_format_for_key(&entry.key) {
+                        loaded.push((
+                            entry.key,
+                            std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)),
+                        ));
+                    }
+                }
+            }
+            loaded
+        });
+
+        self.thumb_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(loaded) = fetching.await else { return };
+            _ = this.update(cx, |this, cx| {
+                for (key, image) in loaded {
+                    this.thumbnails.insert(key, Some(image));
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// Puts the selection aside for a later paste. `cut` makes it a move.
     fn copy_to_clipboard_selection(&mut self, cut: bool, cx: &mut Context<Self>) {
         let Some(bucket) = self.bucket.clone() else {
@@ -3102,6 +3174,7 @@ impl Browser {
             self.visible.len(),
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
                 this.maybe_prefetch(&range, cx);
+                this.load_thumbnails(&range, cx);
 
                 range
                     .map(|position| {
@@ -3110,7 +3183,12 @@ impl Browser {
                         let selected = this.selection.contains(&entry.key);
                         let is_folder = entry.is_folder;
 
-                        object_row(position, entry, selected, theme).on_click(cx.listener(
+                        let thumbnail = this
+                            .thumbnails
+                            .get(&entry.key)
+                            .cloned()
+                            .flatten();
+                        object_row(position, entry, selected, thumbnail, theme).on_click(cx.listener(
                             move |this, event: &ClickEvent, _window, cx| {
                                 // gpui 0.2.2 has no `on_double_click`, but the click
                                 // event carries the count, so both gestures live here.
@@ -4780,6 +4858,7 @@ fn object_row(
     position: usize,
     entry: &Entry,
     selected: bool,
+    thumbnail: Option<std::sync::Arc<gpui::Image>>,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let size_label = if entry.is_folder {
@@ -4813,10 +4892,16 @@ fn object_row(
                 .flex()
                 .items_center()
                 // Folders lead, so they carry the accent; files stay quiet.
-                .child(if entry.is_folder {
-                    icon("folder", theme.accent)
-                } else {
-                    icon("file", theme.text_faint)
+                // A thumbnail when one has loaded, the type icon otherwise. The
+                // slot is the same width either way, so rows do not shift as
+                // images arrive.
+                .child(match thumbnail {
+                    Some(image) => gpui::img(image)
+                        .size(px(18.))
+                        .rounded_sm()
+                        .into_any_element(),
+                    None if entry.is_folder => icon("folder", theme.accent).into_any_element(),
+                    None => icon("file", theme.text_faint).into_any_element(),
                 }),
         )
         .child(
@@ -4912,6 +4997,11 @@ fn next_encryption(current: &Encryption) -> Option<Encryption> {
         Encryption::Kms(_) => Some(Encryption::BucketDefault),
     }
 }
+
+/// Objects above this are listed with an icon instead of a thumbnail. A row is
+/// 22 pixels tall; fetching megabytes to fill it is not a trade worth making,
+/// and the bytes are billed.
+const THUMBNAIL_LIMIT: i64 = 512 * 1024;
 
 /// How much of an object a preview is allowed to fetch. Big enough for a photo,
 /// small enough that previewing a huge object is never a surprise download.
@@ -5449,6 +5539,7 @@ mod tests {
             confirm: None,
             form: None,
             clipboard: None,
+            thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
             palette: None,
@@ -5464,6 +5555,7 @@ mod tests {
             paging_task: None,
             op_task: None,
             caps_task: None,
+            thumb_task: None,
             tick_task: None,
             _appearance: None,
         };
