@@ -35,6 +35,18 @@ icons![
     "file", "folder", "info", "link", "pause", "play", "plus", "refresh", "trash", "upload",
 ];
 
+/// The UI typeface, embedded so every machine renders the same.
+///
+/// Bundled rather than named-and-hoped-for: the previous code asked for
+/// "SF Pro Text", which is not installed under that name on macOS, so the app
+/// spent its life in whatever the toolkit fell back to. A font that ships with
+/// the binary cannot be missing.
+///
+/// Inter is under the SIL Open Font Licence, which permits bundling in a
+/// commercial product; `Inter-LICENSE.txt` travels beside it because the
+/// licence requires the copyright notice to be distributed with the font.
+pub const UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/InterVariable.ttf");
+
 pub struct Assets;
 
 impl AssetSource for Assets {

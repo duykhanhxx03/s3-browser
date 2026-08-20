@@ -290,6 +290,9 @@ pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
     chrome: Chrome,
+    /// Resolved once at startup: which of the candidate fonts this machine has.
+    ui_font: SharedString,
+    mono_font: SharedString,
 
     profiles: Vec<StoredProfile>,
     active_profile: Option<usize>,
@@ -378,6 +381,19 @@ impl Browser {
         let chrome = Chrome::detect();
         let theme = Theme::from_window(window.appearance(), chrome);
 
+        // The UI font ships with the binary, so there is nothing to probe for:
+        // `all_font_names` lists what the *system* has installed and does not
+        // include fonts registered through `add_fonts`, so asking would fall
+        // through to a system font and quietly discard the bundled one.
+        let ui_font = SharedString::from(platform::BUNDLED_UI_FONT);
+        // Monospace is not bundled, so this one is a real choice among whatever
+        // the machine happens to have.
+        let mono_font = SharedString::from(platform::pick_font(
+            platform::mono_font_candidates(),
+            &cx.text_system().all_font_names(),
+        ));
+        debug_log!("font: {ui_font} / {mono_font}");
+
         // Follow the system between light and dark without a restart.
         let weak = cx.entity().downgrade();
         let appearance = window.observe_window_appearance(move |window, cx| {
@@ -407,6 +423,8 @@ impl Browser {
             focus: cx.focus_handle(),
             theme,
             chrome,
+            ui_font: ui_font.clone(),
+            mono_font,
             profiles,
             active_profile: None,
             store,
@@ -3634,7 +3652,7 @@ impl Browser {
                             .p_2()
                             .rounded_md()
                             .bg(theme.hover)
-                            .font_family("monospace")
+                            .font_family(self.mono_font.clone())
                             .text_color(theme.text_muted)
                             .child(text.clone())
                             .into_any_element(),
@@ -4580,7 +4598,7 @@ impl Render for Browser {
             .size_full()
             .flex()
             .flex_col()
-            .font_family(platform::ui_font_candidates()[0])
+            .font_family(self.ui_font.clone())
             .bg(theme.ground)
             .text_color(theme.text)
             // Nothing to browse without a profile, and the chrome behind a
@@ -5523,6 +5541,8 @@ mod tests {
             focus: cx.focus_handle(),
             theme: Theme::new(Mode::Dark, Chrome::Solid),
             chrome: Chrome::Solid,
+            ui_font: "Inter".into(),
+            mono_font: "monospace".into(),
             profiles: Vec::new(),
             active_profile: None,
             store: None,

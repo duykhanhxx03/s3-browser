@@ -131,13 +131,68 @@ pub fn toolbar_leading_inset() -> f32 {
 
 /// UI font stack. GPUI falls back through the list, so naming each platform's
 /// system face keeps text native-looking everywhere.
+/// The family name of the font compiled into the binary.
+///
+/// Used directly rather than looked up: a bundled font is registered with the
+/// text system at startup and is therefore always present, while
+/// `all_font_names` reports only what the operating system has installed.
+/// Probing for it finds nothing and falls through to a system font, discarding
+/// the very font that was bundled to avoid that.
+pub const BUNDLED_UI_FONT: &str = "Inter";
+
+/// Kept for the case where the bundled font fails to register: these are what
+/// the platform is likely to have.
 pub fn ui_font_candidates() -> &'static [&'static str] {
+    // Inter first everywhere: it is designed for screen UI at small sizes, has
+    // the tall x-height that keeps a dense file list readable, and its SIL Open
+    // Font Licence means shipping it later poses no licensing question.
+    //
+    // Then the platform's own UI font, then the safe fallbacks. The order is a
+    // preference, not a promise — `pick_font` drops anything not installed.
     if cfg!(target_os = "macos") {
-        &["SF Pro Text", "Helvetica Neue", "Helvetica"]
+        &[
+            "Inter",
+            // The real name of the macOS system font. "SF Pro Text" is what it
+            // is called in design tools and is *not* installed under that name,
+            // so asking for it silently fell through to gpui's default.
+            ".AppleSystemUIFont",
+            "Helvetica Neue",
+            "Helvetica",
+        ]
     } else if cfg!(target_os = "windows") {
-        &["Segoe UI Variable Text", "Segoe UI", "Arial"]
+        &["Inter", "Segoe UI Variable Text", "Segoe UI", "Arial"]
     } else {
         &["Inter", "Cantarell", "Ubuntu", "DejaVu Sans", "Noto Sans"]
+    }
+}
+
+/// The first candidate the system actually has.
+///
+/// Naming a font that is not installed is silent: the text still renders, in
+/// whatever the toolkit falls back to, so the app can spend its whole life in a
+/// font nobody chose. Checking turns that into a decision.
+pub fn pick_font(candidates: &[&str], available: &[String]) -> String {
+    candidates
+        .iter()
+        .find(|candidate| {
+            available
+                .iter()
+                .any(|font| font.eq_ignore_ascii_case(candidate))
+        })
+        .map(|found| (*found).to_string())
+        // Nothing matched: hand back the first preference and let the toolkit
+        // fall back, which is still better than an empty family name.
+        .unwrap_or_else(|| candidates.first().copied().unwrap_or("sans-serif").into())
+}
+
+/// Monospace for keys, checksums and previews, where alignment carries meaning.
+pub fn mono_font_candidates() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["SF Mono", "Menlo", "Monaco", "Courier New"]
+    } else if cfg!(target_os = "windows") {
+        &["Cascadia Mono", "Consolas", "Courier New"]
+    } else {
+        &["JetBrains Mono", "DejaVu Sans Mono", "monospace"]
     }
 }
 
@@ -224,6 +279,29 @@ mod tests {
             Chrome::decide(Some("maybe"), false, PlatformBlur::Available),
             Chrome::Glass
         );
+    }
+
+    #[test]
+    fn the_chosen_font_is_one_the_system_has() {
+        let installed = vec!["Inter".to_string(), "Helvetica".to_string()];
+
+        // First preference wins when present.
+        assert_eq!(pick_font(&["Inter", "Helvetica"], &installed), "Inter");
+        // Missing preferences are skipped rather than requested and ignored —
+        // the bug this exists for: the app asked for "SF Pro Text", which is
+        // not installed under that name, and silently rendered in something
+        // else for its whole life.
+        assert_eq!(
+            pick_font(&["SF Pro Text", "Helvetica"], &installed),
+            "Helvetica"
+        );
+        // Font names come back from the OS in whatever case it likes.
+        assert_eq!(pick_font(&["inter"], &installed), "inter");
+
+        // Nothing available: still return something nameable rather than an
+        // empty family, which renders as a blank run of text.
+        assert_eq!(pick_font(&["Nope", "Nada"], &installed), "Nope");
+        assert_eq!(pick_font(&[], &installed), "sans-serif");
     }
 
     #[test]

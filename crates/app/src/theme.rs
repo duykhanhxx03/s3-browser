@@ -56,50 +56,57 @@ impl Theme {
     pub fn new(mode: Mode, chrome: Chrome) -> Self {
         match mode {
             Mode::Dark => Self {
+                // Near-black with a slight cool cast rather than a blue-grey:
+                // a file list is mostly text, and a tinted ground tints every
+                // neutral sitting on it.
                 ground: if chrome.is_glass() {
-                    rgba(0x12151bdb).into()
+                    rgba(0x0e0f12db).into()
                 } else {
-                    rgb(0x12151b).into()
+                    rgb(0x0e0f12).into()
                 },
-                panel: rgba(0xffffff0d).into(),
-                modal: rgb(0x1c2029).into(),
-                hover: rgba(0xffffff14).into(),
-                selected: rgba(0x5ca8ff3d).into(),
-                drop_target: rgba(0x5ca8ff29).into(),
+                panel: rgba(0xffffff0a).into(),
+                modal: rgb(0x17191d).into(),
+                hover: rgba(0xffffff0f).into(),
+                selected: rgba(0x6e8bff2e).into(),
+                drop_target: rgba(0x6e8bff24).into(),
 
-                text: rgb(0xe6eaf0).into(),
-                text_muted: rgba(0xffffff9e).into(),
-                text_faint: rgba(0xffffff66).into(),
+                text: rgb(0xedeef0).into(),
+                text_muted: rgba(0xffffffa8).into(),
+                text_faint: rgba(0xffffff5c).into(),
                 text_on_accent: rgb(0xffffff).into(),
 
-                border: rgba(0xffffff17).into(),
-                border_strong: rgba(0xffffff2b).into(),
+                border: rgba(0xffffff14).into(),
+                border_strong: rgba(0xffffff26).into(),
 
-                accent: rgb(0x5ca8ff).into(),
-                danger: rgb(0xe5695b).into(),
+                // Indigo rather than sky blue. The old accent was light enough
+                // to read as disabled next to white text; this holds its own.
+                accent: rgb(0x6e8bff).into(),
+                danger: rgb(0xe5484d).into(),
             },
             Mode::Light => Self {
+                // Off-white, not pure white: a full-white ground under a full
+                // white panel leaves the panel invisible.
                 ground: if chrome.is_glass() {
-                    rgba(0xf2f4f8c7).into()
+                    rgba(0xf7f8f9c7).into()
                 } else {
-                    rgb(0xf2f4f8).into()
+                    rgb(0xf7f8f9).into()
                 },
                 // On a light ground the panels read as *lighter*, not darker.
-                panel: rgba(0xffffff8c).into(),
-                modal: rgb(0xfbfcfe).into(),
-                hover: rgba(0x1b243014).into(),
-                selected: rgba(0x0a6cdb26).into(),
-                drop_target: rgba(0x0a6cdb1f).into(),
+                panel: rgba(0xffffffb8).into(),
+                modal: rgb(0xffffff).into(),
+                hover: rgba(0x1c202412).into(),
+                selected: rgba(0x3a5ccc1f).into(),
+                drop_target: rgba(0x3a5ccc1a).into(),
 
-                text: rgb(0x1b2430).into(),
-                text_muted: rgba(0x1b2430a3).into(),
-                text_faint: rgba(0x1b243070).into(),
+                text: rgb(0x1c2024).into(),
+                text_muted: rgba(0x1c2024a8).into(),
+                text_faint: rgba(0x1c202470).into(),
                 text_on_accent: rgb(0xffffff).into(),
 
-                border: rgba(0x1b24301a).into(),
-                border_strong: rgba(0x1b24302e).into(),
+                border: rgba(0x1c202418).into(),
+                border_strong: rgba(0x1c20242e).into(),
 
-                accent: rgb(0x0a6cdb).into(),
+                accent: rgb(0x3a5ccc).into(),
                 danger: rgb(0xc03a2b).into(),
             },
         }

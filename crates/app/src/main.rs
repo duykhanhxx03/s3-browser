@@ -35,6 +35,15 @@ fn main() {
         // input that looks right and does nothing.
         gpui_component::init(cx);
 
+        // Before any window: a view built while the font is still unregistered
+        // measures its text in the fallback and lays out to the wrong widths.
+        if let Err(error) = cx
+            .text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(assets::UI_FONT)])
+        {
+            eprintln!("không nạp được font đi kèm: {error}");
+        }
+
         let chrome = Chrome::detect();
         let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
 
