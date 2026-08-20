@@ -4,9 +4,16 @@
 //! loses its resources renders every button blank, and that failure would only
 //! show up after packaging — long after the code looked correct.
 //!
-//! The set is hand-authored on one grid: 24×24, 1.75 stroke, round caps and
-//! joins, `currentColor` so the theme tints them. Mixing icons drawn to
-//! different weights is what makes an interface look assembled from parts.
+//! The set is hand-authored on one grid: 24×24, solid fills in the iOS-glyph
+//! style, `currentColor` so the theme tints them. Mixing filled and outlined
+//! icons, or icons drawn at different weights, is what makes an interface look
+//! assembled from parts.
+//!
+//! Drawn here rather than taken from an icon library because this is a
+//! commercial product: the obvious sets are free only with attribution, and
+//! bundling them without a licence is a legal problem rather than a design one.
+//! The loader keys on file name, so a licensed set can replace these files with
+//! no code change.
 
 use std::borrow::Cow;
 
@@ -24,8 +31,8 @@ macro_rules! icons {
 }
 
 icons![
-    "arrow-up", "check", "close", "download", "external", "eye", "file", "folder", "info", "link",
-    "pause", "play", "plus", "refresh", "trash", "upload",
+    "arrow-up", "check", "chevron-down", "chevron-up", "close", "download", "external", "eye",
+    "file", "folder", "info", "link", "pause", "play", "plus", "refresh", "trash", "upload",
 ];
 
 pub struct Assets;
@@ -68,9 +75,12 @@ mod tests {
                 "{path} does not follow the text colour"
             );
             // One grid for all of them; a stray viewBox makes an icon render at
-            // a different visual weight beside its neighbours.
+            // a different visual size beside its neighbours.
             assert!(text.contains(r#"viewBox="0 0 24 24""#), "{path} is off-grid");
-            assert!(text.contains(r#"stroke-width="1.75""#), "{path} is off-weight");
+            // Solid, not outlined. One outlined icon among filled ones is the
+            // single most visible way for a set to look mismatched.
+            assert!(text.contains(r#"fill="currentColor""#), "{path} is not filled");
+            assert!(!text.contains("stroke-width"), "{path} is outlined, not filled");
         }
     }
 

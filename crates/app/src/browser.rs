@@ -3116,26 +3116,31 @@ impl Browser {
         let sort = self.sort;
 
         let header = |key: SortKey, label: &'static str| {
-            let arrow = if sort.key == key {
-                if sort.ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
+            let active = sort.key == key;
             div()
                 .id(SharedString::from(format!("col-{label}")))
+                .flex()
+                .items_center()
+                .gap_1()
                 .cursor_pointer()
                 .text_xs()
-                .text_color(if sort.key == key {
-                    theme.text
-                } else {
-                    theme.text_faint
-                })
+                .text_color(if active { theme.text } else { theme.text_faint })
                 .hover(|this| this.text_color(theme.text))
-                .child(SharedString::from(format!("{label}{arrow}")))
+                .child(label)
+                // A drawn chevron rather than ▲: a text glyph among drawn icons
+                // renders at a different weight and size, which is the same
+                // mismatch the emoji had.
+                .when(active, |this| {
+                    this.child(sized_icon(
+                        if sort.ascending {
+                            "chevron-up"
+                        } else {
+                            "chevron-down"
+                        },
+                        12.,
+                        theme.text_muted,
+                    ))
+                })
         };
 
         div()
@@ -4768,9 +4773,15 @@ fn elide_middle(value: &str, max_chars: usize) -> String {
 /// 16px is the size the set is drawn for; scaling a 24-grid stroke much beyond
 /// that makes the line weight visibly different from its neighbours.
 fn icon(name: &'static str, color: gpui::Hsla) -> impl IntoElement {
+    sized_icon(name, 16., color)
+}
+
+/// An icon at a chosen size. 16px suits a button; a chevron sitting inline with
+/// 12px label text needs to be smaller or it overpowers the word beside it.
+fn sized_icon(name: &'static str, size: f32, color: gpui::Hsla) -> impl IntoElement {
     gpui::svg()
         .path(SharedString::from(format!("icons/{name}.svg")))
-        .size(px(16.))
+        .size(px(size))
         .text_color(color)
 }
 
