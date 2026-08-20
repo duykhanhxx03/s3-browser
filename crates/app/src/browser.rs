@@ -12,6 +12,7 @@ use gpui::{
     UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputState};
+use gpui_component::menu::ContextMenuExt;
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
@@ -63,6 +64,32 @@ const BUTTON_HEIGHT: f32 = 22.;
 const SIDEBAR_WIDTH: f32 = 214.;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
+
+gpui::actions!(
+    s3browser,
+    [
+        /// Every file operation the context menu offers.
+        ///
+        /// Real gpui actions rather than closures: the menu component dispatches
+        /// actions through the focus tree, and having them named means the menu
+        /// and the keyboard reach the same handler instead of two copies that
+        /// drift apart.
+        ActionCopy,
+        ActionCut,
+        ActionPaste,
+        ActionRename,
+        ActionDuplicate,
+        ActionDelete,
+        ActionDownload,
+        ActionShare,
+        ActionInspect,
+        ActionSelectAll,
+        ActionRefresh,
+        ActionNewFolder,
+        ActionPreview,
+        ActionOpenExternally,
+    ]
+);
 
 /// The one input that still belongs inline: a filter narrows what is already on
 /// screen, so putting it in a dialog would hide the thing being filtered.
@@ -3211,6 +3238,10 @@ impl Browser {
                             .get(&entry.key)
                             .cloned()
                             .flatten();
+                        // What the menu may offer depends on the row and on the
+                        // clipboard, so it is decided per row rather than once.
+                        let single = this.selection.len() <= 1;
+                        let can_paste = this.clipboard.is_some();
                         object_row(position, entry, selected, thumbnail, theme).on_click(cx.listener(
                             move |this, event: &ClickEvent, _window, cx| {
                                 // gpui 0.2.2 has no `on_double_click`, but the click
@@ -3222,6 +3253,43 @@ impl Browser {
                                 }
                             },
                         ))
+                        // Items the row cannot do are left out rather than shown
+                        // greyed: a menu of mostly-dead entries is harder to read
+                        // than a short live one.
+                        .context_menu(move |menu, _window, _cx| {
+                            let menu = menu
+                                .menu("Chép", Box::new(ActionCopy))
+                                .menu("Cắt", Box::new(ActionCut))
+                                .menu_with_enable("Dán", Box::new(ActionPaste), can_paste)
+                                .separator();
+
+                            let menu = if single {
+                                menu.menu("Đổi tên", Box::new(ActionRename))
+                                    .menu_with_enable(
+                                        "Nhân bản",
+                                        Box::new(ActionDuplicate),
+                                        !is_folder,
+                                    )
+                            } else {
+                                menu
+                            };
+
+                            // A folder has no metadata of its own and cannot be
+                            // shared as a link, so those never appear on one.
+                            let menu = if is_folder {
+                                menu
+                            } else {
+                                menu.menu("Xem trước", Box::new(ActionPreview))
+                                    .menu("Mở bằng app", Box::new(ActionOpenExternally))
+                                    .menu("Chia sẻ", Box::new(ActionShare))
+                                    .menu("Chi tiết", Box::new(ActionInspect))
+                            };
+
+                            menu.menu("Tải xuống", Box::new(ActionDownload))
+                                .separator()
+                                .menu("Xoá", Box::new(ActionDelete))
+                        })
+                        .into_any_element()
                     })
                     .collect::<Vec<_>>()
             }),
@@ -4595,6 +4663,42 @@ impl Render for Browser {
             .id("root")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|this, _: &ActionCopy, _window, cx| {
+                this.copy_to_clipboard_selection(false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionCut, _window, cx| {
+                this.copy_to_clipboard_selection(true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionPaste, _window, cx| this.paste(cx)))
+            .on_action(cx.listener(|this, _: &ActionRename, window, cx| {
+                this.start_rename(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionDuplicate, window, cx| {
+                this.start_duplicate(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionDelete, _window, cx| {
+                this.ask_delete_selection(cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionDownload, _window, cx| {
+                this.download_selection(cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionShare, _window, cx| this.start_share(cx)))
+            .on_action(cx.listener(|this, _: &ActionInspect, _window, cx| {
+                this.toggle_inspector(cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionSelectAll, _window, cx| this.select_all(cx)))
+            .on_action(cx.listener(|this, _: &ActionRefresh, _window, cx| {
+                if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
+                    this.open(bucket, prefix, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActionNewFolder, window, cx| {
+                this.open_form(FormKind::NewFolder, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionPreview, _window, cx| this.quick_look(cx)))
+            .on_action(cx.listener(|this, _: &ActionOpenExternally, _window, cx| {
+                this.open_externally(cx)
+            }))
             .size_full()
             .flex()
             .flex_col()
