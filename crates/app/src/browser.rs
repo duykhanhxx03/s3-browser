@@ -3258,18 +3258,28 @@ impl Browser {
                         // than a short live one.
                         .context_menu(move |menu, _window, _cx| {
                             let menu = menu
-                                .menu("Chép", Box::new(ActionCopy))
-                                .menu("Cắt", Box::new(ActionCut))
-                                .menu_with_enable("Dán", Box::new(ActionPaste), can_paste)
+                                .menu_with_icon("Chép", menu_icon("copy"), Box::new(ActionCopy))
+                                .menu_with_icon("Cắt", menu_icon("cut"), Box::new(ActionCut))
+                                .menu_with_icon_and_disabled(
+                                    "Dán",
+                                    menu_icon("paste"),
+                                    Box::new(ActionPaste),
+                                    !can_paste,
+                                )
                                 .separator();
 
                             let menu = if single {
-                                menu.menu("Đổi tên", Box::new(ActionRename))
-                                    .menu_with_enable(
-                                        "Nhân bản",
-                                        Box::new(ActionDuplicate),
-                                        !is_folder,
-                                    )
+                                menu.menu_with_icon(
+                                    "Đổi tên",
+                                    menu_icon("rename"),
+                                    Box::new(ActionRename),
+                                )
+                                .menu_with_icon_and_disabled(
+                                    "Nhân bản",
+                                    menu_icon("duplicate"),
+                                    Box::new(ActionDuplicate),
+                                    is_folder,
+                                )
                             } else {
                                 menu
                             };
@@ -3279,15 +3289,31 @@ impl Browser {
                             let menu = if is_folder {
                                 menu
                             } else {
-                                menu.menu("Xem trước", Box::new(ActionPreview))
-                                    .menu("Mở bằng app", Box::new(ActionOpenExternally))
-                                    .menu("Chia sẻ", Box::new(ActionShare))
-                                    .menu("Chi tiết", Box::new(ActionInspect))
+                                menu.menu_with_icon(
+                                    "Xem trước",
+                                    menu_icon("eye"),
+                                    Box::new(ActionPreview),
+                                )
+                                .menu_with_icon(
+                                    "Mở bằng app",
+                                    menu_icon("external"),
+                                    Box::new(ActionOpenExternally),
+                                )
+                                .menu_with_icon("Chia sẻ", menu_icon("link"), Box::new(ActionShare))
+                                .menu_with_icon(
+                                    "Chi tiết",
+                                    menu_icon("info"),
+                                    Box::new(ActionInspect),
+                                )
                             };
 
-                            menu.menu("Tải xuống", Box::new(ActionDownload))
-                                .separator()
-                                .menu("Xoá", Box::new(ActionDelete))
+                            menu.menu_with_icon(
+                                "Tải xuống",
+                                menu_icon("download"),
+                                Box::new(ActionDownload),
+                            )
+                            .separator()
+                            .menu_with_icon("Xoá", menu_icon("trash"), Box::new(ActionDelete))
                         })
                         .into_any_element()
                     })
@@ -4896,6 +4922,15 @@ fn elide_middle(value: &str, max_chars: usize) -> String {
 /// that makes the line weight visibly different from its neighbours.
 fn icon(name: &'static str, color: gpui::Hsla) -> impl IntoElement {
     sized_icon(name, 16., color)
+}
+
+/// One of this app's icons, in the shape the menu component wants.
+///
+/// `Icon::empty().path(..)` rather than the library's own `IconName`: that enum
+/// points at an icon set this app does not ship, so using it would render
+/// blanks beside every menu label.
+fn menu_icon(name: &'static str) -> gpui_component::Icon {
+    gpui_component::Icon::empty().path(SharedString::from(format!("icons/{name}.svg")))
 }
 
 /// An icon at a chosen size. 16px suits a button; a chevron sitting inline with
