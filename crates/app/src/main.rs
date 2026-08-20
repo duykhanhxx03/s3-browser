@@ -25,6 +25,10 @@ fn main() {
     // Before anything else: a panic during setup should still leave a report.
     crash::install();
 
+    // Before any runtime or window exists: reading the system timezone is only
+    // sound while the process is single-threaded.
+    s3core::set_local_offset(s3core::detect_local_offset());
+
     Application::new()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {

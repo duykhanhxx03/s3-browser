@@ -1756,12 +1756,74 @@ pub fn format_size(bytes: i64) -> String {
     }
 }
 
-/// `2026-08-18 15:16` in local-independent UTC, which is what S3 reports.
-pub fn format_timestamp(epoch: i64) -> String {
-    // Civil-from-days, so we avoid pulling in a date library for one label.
-    let days = epoch.div_euclid(86_400);
-    let seconds = epoch.rem_euclid(86_400);
+/// Seconds to add to a UTC timestamp to get local time.
+///
+/// Captured once at startup rather than read on demand: reading the system
+/// timezone is only sound while the process is single-threaded, and by the time
+/// a listing renders there are runtime threads everywhere. Zero means nobody
+/// set it, so times show as UTC — wrong-looking, but never a wrong date.
+static LOCAL_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Call once, early, before any thread is spawned.
+pub fn set_local_offset(seconds: i32) {
+    LOCAL_OFFSET.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reads the machine's timezone offset. Only valid before threads exist.
+pub fn detect_local_offset() -> i32 {
+    time::UtcOffset::current_local_offset()
+        .map(|offset| offset.whole_seconds())
+        .unwrap_or(0)
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A timestamp as a person would say it.
+///
+/// S3 reports UTC; showing that unconverted puts a file uploaded at nine in the
+/// morning at "02:43", which reads as a different day's work. And an absolute
+/// date for something saved minutes ago makes the reader do arithmetic to
+/// answer "is this the one I just uploaded?" — which is the question a file
+/// list is usually being asked.
+pub fn format_timestamp(epoch: i64) -> String {
+    format_timestamp_at(
+        epoch,
+        now_epoch(),
+        LOCAL_OFFSET.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The pure form: `now` and `offset` are passed in so every branch is testable
+/// without waiting for a particular day.
+pub fn format_timestamp_at(epoch: i64, now: i64, offset: i32) -> String {
+    let local = epoch + offset as i64;
+    let today = (now + offset as i64).div_euclid(86_400);
+    let day = local.div_euclid(86_400);
+
+    let seconds = local.rem_euclid(86_400);
+    let clock = format!("{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60);
+
+    let (year, month, date) = civil_from_days(day);
+    let (this_year, _, _) = civil_from_days(today);
+
+    match today - day {
+        0 => format!("Hôm nay {clock}"),
+        1 => format!("Hôm qua {clock}"),
+        // Within the current year the year adds nothing, and dropping it keeps
+        // the column narrow enough to scan.
+        _ if year == this_year => format!("{date} thg {month} {clock}"),
+        _ => format!("{date} thg {month}, {year}"),
+    }
+}
+
+/// Civil date from a day number. Written out rather than pulled from a date
+/// library because it is the only calendar arithmetic in the crate.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -1769,15 +1831,10 @@ pub fn format_timestamp(epoch: i64) -> String {
     let year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
+    let date = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
-
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60
-    )
+    (year, month, date)
 }
 
 #[cfg(test)]
@@ -1951,12 +2008,45 @@ mod tests {
     }
 
     #[test]
-    fn formats_timestamps() {
-        assert_eq!(format_timestamp(0), "1970-01-01 00:00");
-        assert_eq!(format_timestamp(1_787_073_380), "2026-08-18 17:16");
-        // Leap day, and the last second before a year rolls over.
-        assert_eq!(format_timestamp(1_709_208_000), "2024-02-29 12:00");
-        assert_eq!(format_timestamp(1_767_225_599), "2025-12-31 23:59");
+    fn timestamps_read_the_way_a_person_would_say_them() {
+        // 2026-08-19 09:43 in UTC+7, and "now" two hours later the same day.
+        let noon = 1_787_107_380;
+        let vn = 7 * 3600;
+
+        // Today and yesterday are what a file list is usually asked about, so
+        // they are named rather than dated.
+        assert_eq!(format_timestamp_at(noon, noon + 7200, vn), "Hôm nay 09:43");
+        assert_eq!(
+            format_timestamp_at(noon, noon + 86_400, vn),
+            "Hôm qua 09:43"
+        );
+
+        // Further back in the same year: the year adds nothing and would only
+        // widen the column.
+        let older = format_timestamp_at(noon, noon + 30 * 86_400, vn);
+        assert!(older.starts_with("19 thg 8"), "{older}");
+        assert!(!older.contains("2026"), "{older}");
+
+        // A different year needs the year, and drops the clock — nobody reads
+        // the minute of something from last year.
+        let ancient = format_timestamp_at(noon, noon + 400 * 86_400, vn);
+        assert_eq!(ancient, "19 thg 8, 2026");
+    }
+
+    #[test]
+    fn the_offset_moves_the_day_not_just_the_clock() {
+        // 23:30 UTC is already the next morning in Vietnam. Showing the raw UTC
+        // day would put a file under yesterday for anyone east of Greenwich.
+        let late = 1_787_182_200;
+        let utc = format_timestamp_at(late, late, 0);
+        let vn = format_timestamp_at(late, late, 7 * 3600);
+
+        assert!(utc.starts_with("Hôm nay 23:"), "{utc}");
+        assert!(vn.starts_with("Hôm nay 06:"), "{vn}");
+
+        // And a zero offset must still produce a valid label rather than
+        // nothing, since that is what an unset timezone falls back to.
+        assert!(!utc.is_empty());
     }
 
     #[test]

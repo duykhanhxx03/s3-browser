@@ -327,3 +327,38 @@ tập trung. Làm khi có khách hàng thật yêu cầu, không làm trước.
 M6 trước, vì có một lỗi im lặng và ba thứ P0. M7 tiếp theo vì M6 phụ thuộc nó
 cho checksum. Rồi M9 nếu mục tiêu là khác biệt hoá, hoặc M8 nếu mục tiêu là bán
 được cho người đang dùng AWS Console.
+
+---
+
+## 7. Đợt hoàn thiện giao diện (21/08/2026)
+
+Xong: bộ icon vẽ theo phong cách iOS glyph, font Inter đi kèm binary, bảng màu
+kiểu Radix, thumbnail ảnh, clipboard copy/cắt/dán, ngày tháng theo giờ địa
+phương và diễn đạt tương đối.
+
+Năm mục còn lại, làm lần lượt:
+
+### 7.1 Menu chuột phải
+Giờ khả thi vì gpui-component đã tích hợp; gpui 0.2.2 trần không có. Menu theo
+ngữ cảnh: chuột phải trên một dòng đưa ra đúng các lệnh áp dụng được cho nó, và
+tự ẩn thứ provider không hỗ trợ như panel ACL đang làm.
+
+### 7.2 Điều hướng bằng phím mũi tên
+Lên/xuống đổi dòng đang chọn, Enter mở, Backspace lên một cấp, Shift để chọn
+dải. Cần cuộn theo lựa chọn — đây cũng chính là thứ command palette còn thiếu,
+nên làm chung một cơ chế.
+
+### 7.3 Trạng thái đang tải theo từng vùng
+Hiện chỉ có một dòng ở thanh trạng thái. Danh sách, inspector và sidebar cần
+trạng thái riêng, vì chúng tải độc lập và một dòng chung không nói được cái nào
+đang bận.
+
+### 7.4 Thông báo lỗi thao tác được
+Lỗi hiện là chữ đỏ ở đáy màn hình, không thao tác được và tự biến mất khi có
+thông báo sau. Cần giữ lại, cho phép xem chi tiết, và với lỗi có cách sửa rõ
+ràng thì kèm luôn nút — như ca token R2 không liệt kê được bucket.
+
+### 7.5 Tìm kiếm file và bucket
+Bộ lọc hiện chỉ lọc trang đang tải. Tìm kiếm thật phải quét theo prefix trên
+toàn bucket, có huỷ giữa chừng, và nói rõ đang quét dở hay đã xong — quét một
+bucket lớn tốn tiền LIST nên không được âm thầm.
