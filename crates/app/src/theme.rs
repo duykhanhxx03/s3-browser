@@ -67,8 +67,8 @@ impl Theme {
                 panel: rgba(0xffffff0a).into(),
                 modal: rgb(0x17191d).into(),
                 hover: rgba(0xffffff0f).into(),
-                selected: rgba(0x6e8bff2e).into(),
-                drop_target: rgba(0x6e8bff24).into(),
+                selected: rgba(0x3b82f62e).into(),
+                drop_target: rgba(0x3b82f624).into(),
 
                 text: rgb(0xedeef0).into(),
                 text_muted: rgba(0xffffffa8).into(),
@@ -78,9 +78,12 @@ impl Theme {
                 border: rgba(0xffffff14).into(),
                 border_strong: rgba(0xffffff26).into(),
 
-                // Indigo rather than sky blue. The old accent was light enough
-                // to read as disabled next to white text; this holds its own.
-                accent: rgb(0x6e8bff).into(),
+                // A true blue, not the indigo this used to be and not the pale
+                // sky blue before that — that one was light enough next to
+                // white text to read as disabled. `selected` and `drop_target`
+                // are the same hue at low alpha, so a highlighted row and the
+                // accent on it never look like two different blues.
+                accent: rgb(0x3b82f6).into(),
                 danger: rgb(0xe5484d).into(),
             },
             Mode::Light => Self {
@@ -95,8 +98,8 @@ impl Theme {
                 panel: rgba(0xffffffb8).into(),
                 modal: rgb(0xffffff).into(),
                 hover: rgba(0x1c202412).into(),
-                selected: rgba(0x3a5ccc1f).into(),
-                drop_target: rgba(0x3a5ccc1a).into(),
+                selected: rgba(0x2563eb1f).into(),
+                drop_target: rgba(0x2563eb1a).into(),
 
                 text: rgb(0x1c2024).into(),
                 text_muted: rgba(0x1c2024a8).into(),
@@ -106,7 +109,9 @@ impl Theme {
                 border: rgba(0x1c202418).into(),
                 border_strong: rgba(0x1c20242e).into(),
 
-                accent: rgb(0x3a5ccc).into(),
+                // Deeper than the dark-mode blue: the same colour that reads
+                // clearly on near-black disappears into an off-white ground.
+                accent: rgb(0x2563eb).into(),
                 danger: rgb(0xc03a2b).into(),
             },
         }
@@ -165,6 +170,28 @@ mod tests {
                 1.0,
                 "{mode:?} solid ground must be opaque, or the desktop shows through unblurred"
             );
+        }
+    }
+
+    #[test]
+    fn the_accent_is_blue_and_visible_in_both_modes() {
+        // gpui keeps hue as 0..1; blue runs from roughly 200° to 250°.
+        for mode in [Mode::Light, Mode::Dark] {
+            let theme = Theme::new(mode, Chrome::Solid);
+            assert!(
+                (0.55..=0.70).contains(&theme.accent.h),
+                "{mode:?} accent is not blue: h={}",
+                theme.accent.h
+            );
+            // Visible against its own ground, which is the whole job: an accent
+            // that matches the ground's lightness is a colour nobody can see.
+            assert!(
+                (theme.accent.l - theme.ground.l).abs() > 0.2,
+                "{mode:?} accent does not stand off its ground"
+            );
+            // The row highlight is the same hue, so a selected row and the
+            // folder icon on it are one colour rather than two blues arguing.
+            assert!((theme.selected.h - theme.accent.h).abs() < 0.02);
         }
     }
 

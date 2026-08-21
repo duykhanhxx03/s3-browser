@@ -508,7 +508,7 @@ impl Browser {
         });
 
         let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Lọc, Enter để tìm cả bucket"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
         // Live rather than on Enter: the list is right there, and making someone
         // commit a filter to find out whether it matched anything is a round
         // trip through their own attention for no reason.
@@ -3805,6 +3805,19 @@ impl Browser {
                     ),
                 )
             })
+            // Enter starts the scan, but a shortcut is not a way in. Shown only
+            // with something typed, because with an empty field there is
+            // nothing to go looking for.
+            .when(!self.filter.is_empty() && self.bucket.is_some(), |this| {
+                this.child(
+                    action_button("search-run", "Tìm cả bucket", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| {
+                            let query = this.filter.clone();
+                            this.start_search(query, cx);
+                        },
+                    )),
+                )
+            })
             .when(bucket.is_some(), |this| {
                 this.child(
                     action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
@@ -3844,6 +3857,15 @@ impl Browser {
                         })),
                 )
             })
+            // Every command, reachable with a mouse. The palette holds the ones
+            // with no button of their own — new bucket, empty bucket, select
+            // all, sign in with SSO, the error log — and until this existed the
+            // only door to them was ⌘K, which is to say no door at all for
+            // anyone who does not already know it is there.
+            .child(
+                icon_button("commands", "more", theme)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.open_palette(cx))),
+            )
     }
 
     /// What fills the object pane when there is nothing to list. A blank area
@@ -4362,27 +4384,33 @@ impl Browser {
                         m = platform::primary_modifier()
                     ))),
             )
-            .when(!queue_label.is_empty(), |this| {
+            // Always, not only while something is transferring. Hiding it when
+            // the queue is idle meant the finished and failed jobs — the ones
+            // worth going back to look at — were behind ⌘J and nothing else.
+            .child({
                 let open = self.drawer_open;
-                this.child(
-                    div()
-                        .id("queue-toggle")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(if open { theme.selected } else { theme.hover })
-                        .text_color(theme.text)
-                        .hover(|this| this.bg(theme.selected))
-                        .child(SharedString::from(format!(
-                            "{} {queue_label}",
-                            if open { "▾" } else { "▴" }
-                        )))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.drawer_open = !this.drawer_open;
-                            cx.notify();
-                        })),
-                )
+                let label = if queue_label.is_empty() {
+                    "hàng đợi".to_string()
+                } else {
+                    queue_label
+                };
+                div()
+                    .id("queue-toggle")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if open { theme.selected } else { theme.hover })
+                    .text_color(theme.text)
+                    .hover(|this| this.bg(theme.selected))
+                    .child(SharedString::from(format!(
+                        "{} {label}",
+                        if open { "▾" } else { "▴" }
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.drawer_open = !this.drawer_open;
+                        cx.notify();
+                    }))
             })
     }
 
