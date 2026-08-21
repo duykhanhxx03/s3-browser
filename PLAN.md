@@ -715,3 +715,50 @@ vẫn hỏng mới báo. Mình báo region đúng rồi để người dùng t�
 ### Không học
 
 Monaco (là WebView, GPUI không có — xem "Đề nghị không làm" ở §9), MUI, Next.js.
+
+### 10.10 Layout còn học được gì nữa
+
+§9 lấy tab và modal xem trước. Đọc lại `components/layout/`, `navigation/PathBar`,
+`app/page.tsx` và `app/uploads/page.tsx` thì còn:
+
+**a. Breadcrumb phải tự rút gọn.** Của họ `maxItems={5} itemsBeforeCollapse={2}`:
+giữ đầu, `…`, giữ hai khúc cuối. Của mình vẽ **hết** mọi khúc trong một khung
+`overflow_hidden`. Đã dựng thử `demo-bucket/du-an/khach-hang/2026/quy-3/thang-8/
+hop-dong/ban-nhap/` — bảy cấp, không có gì lạ — và breadcrumb **ăn mất nút cuối
+của toolbar**. Tệ hơn: cắt thì cắt phần **đuôi**, tức là đúng khúc nói mình đang
+đứng đâu. `elide_middle` đã dùng cho nơi đã ghim ở sidebar rồi, chỉ là chưa dùng
+ở đây.
+
+**b. Thanh đường dẫn gợi ý nơi vừa tới.** `⌘L` của họ là một autocomplete lấy
+`recentPaths` làm options, mỗi dòng có icon đồng hồ, và cuối danh sách có link
+"xoá lịch sử". Mình vừa dựng đúng cái kho dữ liệu đó (§9.3) mà thanh đường dẫn
+vẫn gõ chay. Placeholder của họ còn dạy luôn cú pháp:
+`s3://bucket@region/folder/`.
+
+**c. Danh sách bucket đáng có một *trang*, không chỉ một cột sidebar.** Home của
+họ là bảng: Bucket | Region | Created | Total Size. Region và Created có sẵn
+trong `ListBuckets`, không tốn thêm request nào. Mình chỉ có tên trong sidebar.
+**Học ngược một chỗ:** `total_size` phía Rust của họ **luôn là `None`** — một cột
+vĩnh viễn hiện `—`. Cột không bao giờ có dữ liệu là đồ đạc chết, đừng chép.
+
+**d. Hàng đợi gom theo thư mục.** Tải lên một thư mục 200 tệp là **một dòng mở
+được**, không phải 200 dòng. Ngăn kéo của mình đang phẳng.
+
+**e. Mục điều hướng mờ đi kèm tooltip, thay vì biến mất.** Chưa có profile thì
+Home/Favorites/Recent/Downloads/Uploads vẫn nằm đó, xám, tooltip "Create a profile
+first". Cách này dạy hình dáng ứng dụng trước khi dùng được nó.
+
+**f. Thanh trạng thái mang nhiều hơn.** Trạng thái cache ("Cached 5m ago" /
+"● Live"), một dòng nhắc tiền ("S3 API calls incur charges"), số phiên bản, và
+region **hiện khác đi khi nó là do tự dò** chứ không phải do gõ vào. Mình có
+profile · region · phím tắt.
+
+**g. Hộp thoại About** có số phiên bản và link. Trong UI của mình **không chỗ nào**
+nói đang chạy bản nào.
+
+**h. Ô lọc có nút `×` ngay trong ô.** Mình chỉ có "Xoá bộ lọc" ở trạng thái rỗng,
+tức là chỉ thấy khi lọc đã ăn sạch danh sách.
+
+**i. Uploads và Downloads tách hai trang**, mỗi trang gom theo trạng thái
+(đang chạy / xong / hỏng / đã huỷ). Tách theo chiều thì chưa chắc hơn ngăn kéo một
+chỗ, nhưng **gom theo trạng thái** thì hơn.
