@@ -50,6 +50,73 @@ pub struct Theme {
 
     pub accent: Hsla,
     pub danger: Hsla,
+
+    /// The liquid-glass light model for floating surfaces.
+    pub glass: GlassSpec,
+}
+
+/// How light falls on a floating pane of glass, per mode.
+///
+/// gpui has no per-element backdrop blur and no shader hook, so real
+/// refraction is off the table — and this file's own tests forbid translucent
+/// dialogs, because without a blur behind them the content underneath reads
+/// straight through the text. What *can* be computed is the lighting: a pane
+/// of glass under a key light from above shows a bright top rim, a soft sheen
+/// down its face, a shaded thickness at its bottom edge, and it throws a deep
+/// soft shadow. Each of those is one cheap layer, and every value derives from
+/// one question — which way round are ground and light in this mode.
+#[derive(Clone, Copy, Debug)]
+pub struct GlassSpec {
+    /// The hairline border. Opposite polarity to the ground: light glass on a
+    /// dark ground catches light at its edge, dark-rimmed glass on a light
+    /// ground reads as a cut edge.
+    pub rim: Hsla,
+    /// A 1px specular line inside the top edge — the key light's reflection.
+    ///
+    /// Zero alpha in light mode, deliberately: a white specular line on a
+    /// white dialog is invisible, and painting it anyway is furniture.
+    pub edge: Hsla,
+    /// The face sheen, drawn as a top-down gradient to transparent.
+    ///
+    /// Zero in light mode, same rule as `edge`: white over a white dialog is
+    /// invisible, and the one trace it *did* leave was wrong — gpui's gradient
+    /// shader interpolates straight (non-premultiplied) RGBA, so white fading
+    /// to transparent black passes through grey, and the "sheen" rendered as a
+    /// faint darkening veil. The opposite sign of light.
+    pub sheen: Hsla,
+    /// The shaded thickness along the bottom inside edge, gradient upward.
+    /// Always dark: glass thickness reads as shade in both modes.
+    pub keel: Hsla,
+    /// The drop shadow's colour. Stronger in the dark, where the panel needs
+    /// separating from a ground nearly its own colour; light mode gets a
+    /// fainter, wider throw because shadows on white read louder per unit of
+    /// alpha.
+    pub shadow: Hsla,
+    /// Shadow geometry, in pixels: (y offset, blur, spread).
+    pub shadow_geometry: (f32, f32, f32),
+}
+
+impl GlassSpec {
+    fn new(mode: Mode) -> Self {
+        match mode {
+            Mode::Dark => Self {
+                rim: rgba(0xffffff2b).into(),
+                edge: rgba(0xffffff4d).into(),
+                sheen: rgba(0xffffff12).into(),
+                keel: rgba(0x00000038).into(),
+                shadow: rgba(0x00000094).into(),
+                shadow_geometry: (12., 36., -6.),
+            },
+            Mode::Light => Self {
+                rim: rgba(0x1c202426).into(),
+                edge: rgba(0xffffff00).into(),
+                sheen: rgba(0xffffff00).into(),
+                keel: rgba(0x0000000d).into(),
+                shadow: rgba(0x0000004a).into(),
+                shadow_geometry: (14., 44., -8.),
+            },
+        }
+    }
 }
 
 impl Theme {
@@ -85,6 +152,8 @@ impl Theme {
                 // accent on it never look like two different blues.
                 accent: rgb(0x3b82f6).into(),
                 danger: rgb(0xe5484d).into(),
+
+                glass: GlassSpec::new(Mode::Dark),
             },
             Mode::Light => Self {
                 // Off-white, not pure white: a full-white ground under a full
@@ -119,6 +188,8 @@ impl Theme {
                 // clearly on near-black disappears into an off-white ground.
                 accent: rgb(0x2563eb).into(),
                 danger: rgb(0xc03a2b).into(),
+
+                glass: GlassSpec::new(Mode::Light),
             },
         }
     }
@@ -208,6 +279,54 @@ mod tests {
             // folder icon on it are one colour rather than two blues arguing.
             assert!((theme.selected.h - theme.accent.h).abs() < 0.02);
         }
+    }
+
+    #[test]
+    fn glass_light_falls_from_above_and_actually_paints() {
+        let dark = GlassSpec::new(Mode::Dark);
+        let light = GlassSpec::new(Mode::Light);
+
+        for (mode, glass) in [("dark", dark), ("light", light)] {
+            // The sheen is painted *under* the content, so this cap is about
+            // the panel's own face: past it the face reads tinted rather than
+            // lit, and the layer stops being light on glass.
+            assert!(glass.sheen.a <= 0.12, "{mode} sheen too strong");
+            // Thickness reads as shade in both modes — a bright keel would
+            // mean the light comes from below, which nothing else agrees with.
+            assert_eq!(glass.keel.l, 0.0, "{mode} keel must be dark");
+            // And it must actually paint: rgba(0,0,0,0) has l == 0 too, and a
+            // spec of zeroes would pass every cap in this test while drawing
+            // no glass at all. The floors are what make the model real.
+            assert!(glass.keel.a > 0.03, "{mode} keel must be visible");
+            assert!(glass.rim.a > 0.05, "{mode} rim must be visible");
+
+            let (y, blur, spread) = glass.shadow_geometry;
+            assert!(y > 0., "{mode} shadow must fall downward");
+            assert!(blur > 0., "{mode} shadow must be soft, not a hard offset");
+            // Negative spread keeps the blur from leaking past the corners as
+            // a visible halo ring.
+            assert!(spread < 0., "{mode} shadow spread should be negative");
+        }
+
+        // The rim is the opposite polarity of the ground: an edge catching
+        // light on near-black, a cut edge on white.
+        assert!(dark.rim.l > 0.9, "dark rim catches light");
+        assert!(light.rim.l < 0.2, "light rim reads as a cut edge");
+
+        // The specular layers only exist where they can be seen. White on a
+        // white dialog is invisible, and painting it anyway is furniture — and
+        // in the sheen's case it was worse than furniture: gpui interpolates
+        // gradients in straight alpha, so white-to-transparent-black passes
+        // through grey and the layer rendered as a *darkening* veil.
+        assert!(dark.edge.a > 0.2);
+        assert!(dark.sheen.a > 0.04, "dark sheen is the one that must paint");
+        assert_eq!(light.edge.a, 0.0);
+        assert_eq!(light.sheen.a, 0.0);
+
+        // Dark needs the stronger shadow — the panel is nearly the ground's
+        // own colour; light gets a wider, fainter throw instead.
+        assert!(dark.shadow.a > light.shadow.a);
+        assert!(light.shadow_geometry.1 > dark.shadow_geometry.1);
     }
 
     #[test]

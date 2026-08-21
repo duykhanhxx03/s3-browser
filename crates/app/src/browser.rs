@@ -5053,6 +5053,27 @@ impl Browser {
             }
         }
 
+        // The panel dialogs close on Escape like everything else that floats.
+        // Each already closes from its scrim and its Xong button, but those are
+        // mouse paths — and a dialog the keyboard opened (⌘K → "Cài đặt") that
+        // only the mouse can close is a trap with two entrances and one exit.
+        if self.settings_open || self.about_open || self.profiles_open || self.failures_open {
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.settings_open = false;
+                    self.about_open = false;
+                    self.profiles_open = false;
+                    self.failures_open = false;
+                    cx.notify();
+                }
+                // The palette stays reachable — it paints over every dialog by
+                // design, and it is how the keyboard got in here.
+                "k" if primary => return self.open_palette(window, cx),
+                _ => {}
+            }
+            return;
+        }
+
         if primary {
             match keystroke.key.as_str() {
                 "f" => return self.focus_filter(window, cx),
@@ -5710,10 +5731,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -5881,10 +5899,7 @@ impl Browser {
                 .py_1()
                 .flex()
                 .flex_col()
-                .rounded_md()
-                .bg(theme.modal)
-                .border_1()
-                .border_color(theme.border_strong)
+                .liquid_glass_flush(theme)
                 .children(places.into_iter().enumerate().map(|(index, place)| {
                     let target = place.clone();
                     let active = self.path_choice == Some(index);
@@ -6259,10 +6274,7 @@ impl Browser {
                         .max_h(px(PREVIEW_HEIGHT))
                         .flex()
                         .flex_col()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass_flush(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -6528,10 +6540,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Cài đặt"))
                         .child(settings_group("GIAO DIỆN", theme))
@@ -6762,10 +6771,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Giới thiệu"))
                         .child(setting_row(
@@ -6830,10 +6836,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Profile"))
                         .child(
@@ -8452,10 +8455,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -8673,10 +8673,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child(form.kind.title()))
                         // The preset comes first, because it decides what two
@@ -8815,10 +8812,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         .child(div().text_color(theme.text).child("Đăng nhập AWS SSO"))
                         .when(flow.waiting, |this| {
                             this
@@ -8923,10 +8917,7 @@ impl Browser {
                         .h(px(PALETTE_HEIGHT))
                         .flex()
                         .flex_col()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass_flush(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -9033,10 +9024,7 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .rounded_lg()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .liquid_glass(theme)
                         // Clicks inside the dialog must not reach the scrim.
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
@@ -10084,6 +10072,107 @@ fn queue_badge(stats: &transfer::Stats) -> Option<SharedString> {
     }
     None
 }
+
+/// Paints an element as a floating pane of liquid glass.
+///
+/// One method rather than a wrapper element, so the eleven dialogs that share
+/// this shape keep their own structure and only trade four style lines for one
+/// call. The light model lives in [`crate::theme::GlassSpec`]; this is just the
+/// brush that applies it: rim border, drop shadow, then three light overlays
+/// added as *first* children so every caller's own content paints on top of
+/// them.
+trait LiquidGlass: Styled + ParentElement + Sized {
+    fn liquid_glass(self, theme: Theme) -> Self {
+        self.glass_layers(theme, true)
+    }
+
+    /// The same pane without the keel, for containers whose content runs flush
+    /// to the bottom edge — the suggestion popover, the preview body, the
+    /// palette list. The keel was tuned on `p_4` dialogs, where it lives inside
+    /// the bottom padding; under a flush list it showed through the last row's
+    /// transparent background as a dimmer strip nothing above it had.
+    fn liquid_glass_flush(self, theme: Theme) -> Self {
+        self.glass_layers(theme, false)
+    }
+
+    fn glass_layers(self, theme: Theme, keel: bool) -> Self {
+        let glass = theme.glass;
+        let (shadow_y, shadow_blur, shadow_spread) = glass.shadow_geometry;
+        self.rounded_lg()
+            .bg(theme.modal)
+            .border_1()
+            .border_color(glass.rim)
+            .shadow(vec![
+                gpui::BoxShadow {
+                    color: glass.shadow,
+                    offset: gpui::point(px(0.), px(shadow_y)),
+                    blur_radius: px(shadow_blur),
+                    spread_radius: px(shadow_spread),
+                },
+                // A tight contact shadow under the big soft one: the soft
+                // throw says "floating", this says "an edge is here". Either
+                // alone reads as a glow or a sticker.
+                gpui::BoxShadow {
+                    color: glass.shadow,
+                    offset: gpui::point(px(0.), px(1.)),
+                    blur_radius: px(3.),
+                    spread_radius: px(0.),
+                },
+            ])
+            // The sheen: the key light down the face. Top third only — glass
+            // lit evenly all the way down is a screenshot filter, not a light.
+            // It fades to *its own colour* at zero alpha, never to transparent
+            // black: gpui interpolates gradients in straight alpha, so a fade
+            // toward transparent black passes through grey on the way and the
+            // highlight renders as a shadow.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_lg()
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(glass.sheen, 0.),
+                        gpui::linear_color_stop(glass.sheen.opacity(0.), 0.38),
+                    )),
+            )
+            // The specular line inside the top edge — the light's reflection.
+            // Inset past the corner radius so its square ends stay inside the
+            // curve. Its alpha is zero in light mode, which paints nothing.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(1.))
+                    .left(px(9.))
+                    .right(px(9.))
+                    .h(px(1.))
+                    .bg(glass.edge),
+            )
+            // The keel: the pane's thickness, shaded, along the bottom edge.
+            // Same rule as the sheen: fade to its own colour at zero alpha.
+            // Chosen with `if`, not `when` — that helper is not on this
+            // trait's bounds — and the flush case paints an empty div rather
+            // than an invisible layer, because "no keel" is the point of it.
+            .child(if keel {
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(10.))
+                    .rounded_b_lg()
+                    .bg(gpui::linear_gradient(
+                        0.,
+                        gpui::linear_color_stop(glass.keel, 0.),
+                        gpui::linear_color_stop(glass.keel.opacity(0.), 1.),
+                    ))
+            } else {
+                div()
+            })
+    }
+}
+
+impl<T: Styled + ParentElement> LiquidGlass for T {}
 
 /// A hairline between two groups on the status bar.
 ///

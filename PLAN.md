@@ -877,3 +877,45 @@ việc đang chạy, hoặc "n lỗi" khi có việc hỏng; "xong" không phả
 đáng đánh dấu, vì nó đúng mãi mãi. Tốc độ và thời gian còn lại vẫn ở thanh trạng
 thái nhưng **chỉ khi đang chạy** — một hàng 214px không chứa nổi "2 đang chạy,
 3 chờ, 5 MB/s, còn 2 phút".
+
+### 10.14 Liquid glass (21/08/2026)
+
+Yêu cầu: giao diện liquid glass, "bằng thuật toán". Nói thẳng giới hạn trước:
+gpui 0.2.2 **không có backdrop-filter theo phần tử và không có shader hook**,
+nên khúc xạ thật của Liquid Glass (Apple, macOS 26) là ngoài tầm — và test của
+chính `theme.rs` cấm hộp thoại trong suốt, vì không có blur sau lưng thì nội
+dung bên dưới xuyên thẳng qua chữ. Cái tính được là **ánh sáng**: một tấm kính
+dưới nguồn sáng từ trên cao có vành sáng ở mép trên, một lớp sheen trượt xuống
+mặt, độ dày đổ râm ở mép dưới, và ném một bóng sâu mềm. Mỗi thứ là một lớp rẻ.
+
+Mô hình nằm ở `GlassSpec` trong `theme.rs` — mọi giá trị suy từ đúng một câu
+hỏi: mode này thì nền và nguồn sáng nằm phía nào. Test ghim các phán quyết:
+sheen ≤ 0.12 (quá nữa là sương mù đè nội dung chứ không phải ánh sáng trên
+kính); keel luôn tối (keel sáng nghĩa là nguồn sáng từ dưới, mâu thuẫn mọi lớp
+khác); vành ngược cực với nền (bắt sáng trên nền tối, cạnh cắt trên nền sáng);
+vạch specular chỉ có ở dark — trắng-trên-trắng là vô hình, vẽ nó vẫn là đồ đạc;
+bóng dark đậm hơn (panel gần màu nền), bóng light rộng và nhạt hơn.
+
+Cọ vẽ là trait `LiquidGlass` trong `browser.rs`: một lời gọi thay bốn dòng style
+ở 11 chỗ hộp thoại/popover; ba lớp sáng chèn làm con *đầu tiên* nên nội dung của
+mọi caller vẽ đè lên trên. Bóng hai tầng: một tầng mềm sâu nói "đang nổi", một
+tầng sát mép nói "có cạnh ở đây" — mỗi tầng đứng riêng đều đọc thành glow hoặc
+sticker.
+
+Tiện thể vá một bẫy lộ ra khi chụp màn hình: các hộp thoại panel (Cài đặt, Giới
+thiệu, profile, nhật ký lỗi) không đóng bằng Escape — mở bằng bàn phím mà chỉ
+chuột đóng được là cái bẫy hai cửa vào một cửa ra. Giờ Escape đóng, và ⌘K vẫn
+xuyên qua được vì palette vẽ đè mọi hộp thoại theo thiết kế.
+
+Một vòng review đối kháng tìm ra chỗ hay nhất của cả đợt: **sheen light mode bị
+đảo dấu**. Shader gradient của gpui nội suy RGBA *thẳng* (không premultiply),
+nên trắng phai về `transparent_black` đi **qua xám** giữa đường — dấu vết duy
+nhất của "vệt sáng" trên hộp thoại trắng là một tấm màn *tối* phủ 38% trên.
+Quy tắc rút ra, ghim vào cả comment lẫn test: **gradient phai về chính màu của
+nó ở alpha 0**, không bao giờ về transparent đen; và sheen light về 0 hẳn theo
+đúng luật đã áp cho vạch specular — trắng-trên-trắng là đồ đạc. Review cũng bắt
+được: keel 10px tô lên hàng cuối của ba khung chạy sát đáy (popover gợi ý, thân
+xem trước, danh sách palette) — thêm `liquid_glass_flush` không keel cho ba chỗ
+đó; radius popover lệch giữa vỏ và lớp phủ — bỏ override `rounded_md`; và test
+chỉ ghim trần chứ không ghim sàn, nên một spec toàn số 0 — không vẽ tí kính nào
+— vẫn qua được bài test tự nhận là ghim mô hình ánh sáng. Đã thêm sàn alpha.
