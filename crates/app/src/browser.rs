@@ -1927,6 +1927,16 @@ impl Browser {
             form.provider_select = Some(select);
         }
 
+        // Focus the first field. Nothing did this before, so every dialog
+        // opened with no caret anywhere: typing went to the root handler, which
+        // swallows everything except Escape and Enter, and Enter then submitted
+        // a form that looked filled in and was not. Survivable with a mouse,
+        // because clicking a field fixes it — and invisible for exactly that
+        // reason.
+        if let Some(field) = form.fields.first() {
+            field.state.update(cx, |state, cx| state.focus(window, cx));
+        }
+
         self.form = Some(form);
         cx.notify();
     }
@@ -2326,6 +2336,11 @@ impl Browser {
             Command::Errors => {
                 self.failures_open = true;
                 cx.notify();
+            }
+            Command::EditHeaders => {
+                if let Some(window) = window {
+                    self.edit_headers_for_selection(window, cx);
+                }
             }
             Command::Filter => {
                 if let Some(window) = window {
@@ -5679,6 +5694,7 @@ impl Browser {
         let form = self.form.as_ref()?;
         let theme = self.theme;
         let is_profile = form.kind == FormKind::NewProfile;
+        let label_width = form_label_width(&form.kind);
 
         Some(
             div()
@@ -5726,7 +5742,7 @@ impl Browser {
                                         .gap_2()
                                         .child(
                                             div()
-                                                .w(px(84.))
+                                                .w(px(label_width))
                                                 .text_xs()
                                                 .text_color(theme.text_faint)
                                                 .child("Dịch vụ"),
@@ -5746,7 +5762,8 @@ impl Browser {
                                 .gap_2()
                                 .child(
                                     div()
-                                        .w(px(84.))
+                                        .w(px(label_width))
+                                        .flex_shrink_0()
                                         .text_xs()
                                         .text_color(theme.text_faint)
                                         .child(field.label),
@@ -7325,6 +7342,25 @@ fn search_summary(
 /// lines. Re-wrapping that at a column produces a line of prose followed by a
 /// stub of three words, over and over, which looks like a rendering fault. What
 /// gets copied to the clipboard stays exactly as the provider wrote it.
+/// How wide the label column of a form has to be.
+///
+/// Fixed at 84 it was fine until a form arrived with `Content-Disposition` in
+/// it, which wrapped onto two lines and pushed its own input out of line with
+/// every other row. Measured from the longest label instead, so the next long
+/// one costs nothing.
+fn form_label_width(kind: &FormKind) -> f32 {
+    // Inter at this size, rounded up: a label that wraps is worse than a column
+    // a few pixels wider than it needed to be.
+    const CHAR_WIDTH: f32 = 6.6;
+    let longest = kind
+        .fields()
+        .iter()
+        .map(|(label, _, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    (longest as f32 * CHAR_WIDTH + 8.0).max(84.)
+}
+
 /// An empty field means "send no header", which is how a header gets removed.
 fn some_if_filled(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
@@ -7409,6 +7445,10 @@ pub enum Command {
     /// Opens the failure log. Also reachable by clicking the summary in the
     /// status bar, but that one is only there while something has gone wrong.
     Errors,
+    /// Rewriting HTTP headers on the selection. Also on the context menu, but
+    /// that one needs a row under the pointer; this reaches a selection made
+    /// any other way.
+    EditHeaders,
     GoUp,
     Filter,
     NewFolder,
@@ -7441,6 +7481,7 @@ impl Command {
             Command::GoUp => ("Lên một cấp", "⌘↑"),
             Command::Filter => ("Lọc", "⌘F"),
             Command::Errors => ("Xem lỗi", ""),
+            Command::EditHeaders => ("Sửa header", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -7463,7 +7504,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 23] {
+    fn all() -> [Command; 24] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -7488,6 +7529,7 @@ impl Command {
             Command::SsoSignIn,
             Command::NewProfile,
             Command::Errors,
+            Command::EditHeaders,
         ]
     }
 }
@@ -8420,7 +8462,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 23);
+        assert_eq!(all.len(), 24);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -8492,6 +8534,19 @@ mod tests {
             browser.selection.clear();
             assert!(browser.selected_object_keys().is_empty());
         });
+    }
+
+    #[test]
+    fn a_long_field_label_widens_the_column_instead_of_wrapping() {
+        // `Content-Disposition` wrapped onto two lines at the old fixed width
+        // and dragged its own input out of line with every other row.
+        let short = form_label_width(&FormKind::NewFolder);
+        let long = form_label_width(&FormKind::EditHeaders(vec!["a".into()]));
+
+        // A one-word label keeps the old floor rather than shrinking the column
+        // to nothing.
+        assert_eq!(short, 84.);
+        assert!(long > 120., "{long}");
     }
 
     #[test]

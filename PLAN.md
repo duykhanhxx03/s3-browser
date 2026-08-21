@@ -467,8 +467,7 @@ tính năng sau.
    nhật ký chứ không phải một dòng đỏ mỗi key. Đường đơn lẻ và đường hàng loạt là
    cùng một đường, để phần báo cáo không trôi ra hai kiểu.
 
-   Còn nợ kiểm chứng với server thật: Docker trên máy này hỏng vì ổ đầy đúng lúc
-   làm phần này.
+   Đã kiểm chứng với MinIO thật: chọn 5 object, gõ `image/png`, cả 5 đổi đúng.
 
 ### Vừa sức, nhưng chưa gấp
 
