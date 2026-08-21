@@ -721,7 +721,7 @@ Monaco (là WebView, GPUI không có — xem "Đề nghị không làm" ở §9)
 §9 lấy tab và modal xem trước. Đọc lại `components/layout/`, `navigation/PathBar`,
 `app/page.tsx` và `app/uploads/page.tsx` thì còn:
 
-**a. Breadcrumb phải tự rút gọn.** Của họ `maxItems={5} itemsBeforeCollapse={2}`:
+**a. ~~Breadcrumb phải tự rút gọn~~** — xong (21/08/2026). Của họ `maxItems={5} itemsBeforeCollapse={2}`:
 giữ đầu, `…`, giữ hai khúc cuối. Của mình vẽ **hết** mọi khúc trong một khung
 `overflow_hidden`. Đã dựng thử `demo-bucket/du-an/khach-hang/2026/quy-3/thang-8/
 hop-dong/ban-nhap/` — bảy cấp, không có gì lạ — và breadcrumb **ăn mất nút cuối

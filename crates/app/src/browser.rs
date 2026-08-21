@@ -90,6 +90,10 @@ const BUCKET_CACHE_TTL: i64 = 30 * 60;
 const ACTIONS_WIDTH: f32 = 72.;
 /// Fixed, so tabs do not resize under the pointer as their titles change.
 const TAB_WIDTH: f32 = 132.;
+/// How many trailing prefix levels the breadcrumb draws before it collapses the
+/// rest into `…`. Three plus the bucket is four things on screen, which is
+/// about what fits beside the filter box and the toolbar buttons.
+const CRUMBS_SHOWN: usize = 3;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
 /// the log without bound otherwise, and nobody reads the fiftieth copy.
 const FAILURE_LIMIT: usize = 50;
@@ -6268,6 +6272,7 @@ impl Browser {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let bucket = self.bucket.clone();
+        let (collapsed, shown) = visible_crumbs(self.breadcrumbs(), CRUMBS_SHOWN);
 
         div()
             .h(px(TOOLBAR_HEIGHT))
@@ -6309,7 +6314,21 @@ impl Browser {
                                 })),
                         )
                     })
-                    .children(self.breadcrumbs().into_iter().map(|(name, prefix)| {
+                    // `…` for the levels that were dropped. Not dead text: it
+                    // opens the path box, which is the one place the whole path
+                    // is both visible and editable. Expanding back in place
+                    // would only put the overflow back.
+                    .when(collapsed, |this| {
+                        this.child(div().text_color(theme.text_faint).text_sm().child("/"))
+                            .child(
+                                crumb("crumb-more".into(), "…".into(), theme).on_click(
+                                    cx.listener(|this, _event, window, cx| {
+                                        this.edit_path(window, cx)
+                                    }),
+                                ),
+                            )
+                    })
+                    .children(shown.into_iter().map(|(name, prefix)| {
                         let bucket = bucket.clone();
                         div()
                             .flex()
@@ -8967,6 +8986,36 @@ fn icon_button(id: &'static str, name: &'static str, theme: Theme) -> gpui::Stat
         .cursor_pointer()
         .hover(|this| this.bg(theme.hover))
         .child(icon(name, theme.text_muted))
+}
+
+/// The trailing crumbs to draw, and whether anything was dropped.
+///
+/// **The end of the path, never the start.** The last segment is where you are
+/// standing and the one before it is the usual way back; the middle of a long
+/// prefix is the part nobody reads. Drawing all of them inside an
+/// `overflow_hidden` row did the opposite of this: at seven levels —
+/// `du-an/khach-hang/2026/quy-3/thang-8/hop-dong/ban-nhap/`, nothing exotic —
+/// the crumbs pushed the toolbar's own buttons off the right edge, and what got
+/// clipped was the tail, which is the one part that had to survive.
+///
+/// The bucket is not in here; it is drawn separately and always shows, because
+/// "which bucket" is the one question a clipped path must still answer.
+///
+/// Counting rather than measuring is on purpose: pixel-fitting means laying the
+/// row out to find out what fits, and the answer would then change as the
+/// window resizes under a name. A count is the same every time. It does leave
+/// one case standing — three segments each forty characters long still overflow
+/// — and `overflow_hidden` remains the backstop for that.
+fn visible_crumbs(
+    crumbs: Vec<(SharedString, String)>,
+    keep: usize,
+) -> (bool, Vec<(SharedString, String)>) {
+    let keep = keep.max(1);
+    if crumbs.len() <= keep {
+        return (false, crumbs);
+    }
+    let dropped = crumbs.len() - keep;
+    (true, crumbs.into_iter().skip(dropped).collect())
 }
 
 fn crumb(id: SharedString, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
@@ -11736,6 +11785,60 @@ mod tests {
         // And what the app *can* draw still gets drawn.
         assert!(matches!(preview_kind("anh.png", None), PreviewKind::Image));
         assert!(matches!(preview_kind("ghi-chu.txt", None), PreviewKind::Text));
+    }
+
+    #[test]
+    fn a_deep_path_keeps_its_tail_and_drops_its_middle() {
+        let crumbs = |names: &[&str]| -> Vec<(SharedString, String)> {
+            let mut out = Vec::new();
+            let mut acc = String::new();
+            for name in names {
+                acc.push_str(name);
+                acc.push('/');
+                out.push((SharedString::from(name.to_string()), acc.clone()));
+            }
+            out
+        };
+
+        // Short enough to draw whole: nothing dropped, nothing to say about it.
+        let (collapsed, shown) = visible_crumbs(crumbs(&["a", "b", "c"]), 3);
+        assert!(!collapsed);
+        assert_eq!(shown.len(), 3);
+
+        // One over, and the *oldest* goes. What survives is where you are and
+        // the way back — the reverse of what an overflow_hidden row does.
+        let (collapsed, shown) = visible_crumbs(crumbs(&["a", "b", "c", "d"]), 3);
+        assert!(collapsed);
+        assert_eq!(
+            shown.iter().map(|(name, _)| name.as_ref()).collect::<Vec<_>>(),
+            ["b", "c", "d"]
+        );
+
+        // The real case: seven levels, and the last three are still the last
+        // three. The prefix each one carries stays correct, or clicking a crumb
+        // would navigate somewhere that is not what it says.
+        let deep = crumbs(&["du-an", "khach-hang", "2026", "quy-3", "thang-8", "hop-dong", "ban-nhap"]);
+        let (collapsed, shown) = visible_crumbs(deep, 3);
+        assert!(collapsed);
+        assert_eq!(
+            shown.iter().map(|(name, _)| name.as_ref()).collect::<Vec<_>>(),
+            ["thang-8", "hop-dong", "ban-nhap"]
+        );
+        assert_eq!(
+            shown.last().unwrap().1,
+            "du-an/khach-hang/2026/quy-3/thang-8/hop-dong/ban-nhap/"
+        );
+
+        // A bucket root has no segments at all, and must not report a collapse
+        // — an `…` with nothing behind it is a lie with a click target on it.
+        let (collapsed, shown) = visible_crumbs(Vec::new(), 3);
+        assert!(!collapsed);
+        assert!(shown.is_empty());
+
+        // `keep` of zero would otherwise drop everything and leave only `…`.
+        let (collapsed, shown) = visible_crumbs(crumbs(&["a", "b"]), 0);
+        assert!(collapsed);
+        assert_eq!(shown.len(), 1);
     }
 
     #[test]
