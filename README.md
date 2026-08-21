@@ -30,7 +30,7 @@ hoá luôn cái kho khoá.
 
 | Phím | Việc |
 |---|---|
-| `⌘F` | Lọc theo tên (gõ để lọc dần, Esc để xoá) |
+| `⌘F` | Đưa con trỏ vào ô lọc trên thanh công cụ (Esc để xoá và trả phím về danh sách) |
 | `⌘N` / `⌘⇧N` | Thư mục mới / bucket mới |
 | `⌘R` | Tải lại prefix hiện tại |
 | `⌘⌫` | Xoá các mục đang chọn |

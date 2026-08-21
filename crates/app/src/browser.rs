@@ -11,7 +11,8 @@ use gpui::{
     FocusHandle, KeyDownEvent, Modifiers, SharedString, Subscription, Task,
     UniformListScrollHandle, Window,
 };
-use gpui_component::input::{Input, InputState};
+use gpui::Focusable as _;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::ContextMenuExt;
 use gpui_tokio::Tokio;
 use s3core::{
@@ -62,6 +63,10 @@ const PROGRESS_HEIGHT: f32 = 4.;
 /// than the bar holding it, so buttons in the same row did not match.
 const BUTTON_HEIGHT: f32 = 22.;
 const SIDEBAR_WIDTH: f32 = 214.;
+/// The filter field. Wide enough for a real file name, narrow enough that the
+/// breadcrumb keeps most of the bar.
+const FILTER_WIDTH: f32 = 196.;
+const FIELD_HEIGHT: f32 = 26.;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
 
@@ -90,13 +95,6 @@ gpui::actions!(
         ActionOpenExternally,
     ]
 );
-
-/// The one input that still belongs inline: a filter narrows what is already on
-/// screen, so putting it in a dialog would hide the thing being filtered.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Prompt {
-    Filter,
-}
 
 /// What a form asks for.
 ///
@@ -346,9 +344,17 @@ pub struct Browser {
     generation: u64,
 
     sort: Sort,
+    /// What the filter field holds, mirrored here so the list can be narrowed
+    /// without reading the widget on every frame.
     filter: String,
-    prompt: Option<Prompt>,
-    prompt_text: String,
+    /// The filter field itself. A real input rather than a key-capture bar: it
+    /// is on screen all the time now, and a permanent field that cannot take a
+    /// paste or a cursor key is a worse lie than no field at all.
+    ///
+    /// Optional because building an `InputState` needs a `Window`, and the view
+    /// tests deliberately run without one. Everything that touches it copes
+    /// with `None` rather than the tests giving up on covering this file.
+    filter_input: Option<Entity<InputState>>,
     selection: HashSet<String>,
     /// Which row the keyboard is sitting on, held as an object key rather than
     /// a row number: filtering and sorting renumber the rows, and a cursor that
@@ -415,6 +421,9 @@ pub struct Browser {
     thumb_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
+    /// Kept alive, not read: dropping it would silently stop the filter from
+    /// reacting to what is typed into it.
+    _filter_events: Option<Subscription>,
 }
 
 impl Browser {
@@ -445,6 +454,24 @@ impl Browser {
             });
         });
 
+        let filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
+        // Live rather than on Enter: the list is right there, and making someone
+        // commit a filter to find out whether it matched anything is a round
+        // trip through their own attention for no reason.
+        let filter_events = cx.subscribe(
+            &filter_input,
+            |this: &mut Self, state, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                this.filter = state.read(cx).value().to_string();
+                this.resort_and_filter();
+                this.status = this.listing_summary();
+                cx.notify();
+            },
+        );
+
         let store = ProfileStore::default_location().ok();
         let profiles = store
             .as_ref()
@@ -460,8 +487,16 @@ impl Browser {
             .or_else(|| TransferEngine::in_memory().ok())
             .expect("an in-memory queue always opens");
 
+        // Explicit, because nothing else does it: with no focused handle the
+        // window has nowhere to send a key press, so the shortcuts and the
+        // arrow keys are dead until something is clicked. It used to survive on
+        // whatever gpui focused by default, which stopped being the list the
+        // moment a real text field appeared in the toolbar.
+        let focus = cx.focus_handle();
+        window.focus(&focus);
+
         let mut this = Self {
-            focus: cx.focus_handle(),
+            focus,
             theme,
             chrome,
             ui_font: ui_font.clone(),
@@ -482,8 +517,7 @@ impl Browser {
             generation: 0,
             sort: Sort::default(),
             filter: String::new(),
-            prompt: None,
-            prompt_text: String::new(),
+            filter_input: Some(filter_input),
             selection: HashSet::new(),
             cursor: None,
             anchor: None,
@@ -516,6 +550,7 @@ impl Browser {
             thumb_task: None,
             tick_task: None,
             _appearance: Some(appearance),
+            _filter_events: Some(filter_events),
         };
 
         if !this.profiles.is_empty() {
@@ -1524,7 +1559,11 @@ impl Browser {
                 }
             }
             Command::GoUp => self.go_up(cx),
-            Command::Filter => self.start_prompt(Prompt::Filter, cx),
+            Command::Filter => {
+                if let Some(window) = window {
+                    self.focus_filter(window, cx);
+                }
+            }
             Command::NewFolder => {
                 if let Some(window) = window {
                     self.open_form(FormKind::NewFolder, window, cx);
@@ -2728,27 +2767,35 @@ impl Browser {
 
     // ------------------------------------------------------------------ input
 
-    fn start_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
-        self.prompt_text = self.filter.clone();
-        self.prompt = Some(prompt);
+    /// Whether what is typed goes to the filter field rather than to the list.
+    fn filter_focused(&self, window: &Window, cx: &App) -> bool {
+        self.filter_input
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// Puts the caret in the filter field. What ⌘F now means: the field is
+    /// always on screen, so there is nothing to open, only somewhere to go.
+    fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.filter_input.clone() {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
         cx.notify();
     }
 
-    fn commit_prompt(&mut self, cx: &mut Context<Self>) {
-        // The filter is applied while typing, so committing just dismisses it.
-        self.prompt = None;
-        self.prompt_text.clear();
-        cx.notify();
-    }
-
-    fn cancel_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.prompt == Some(Prompt::Filter) {
+    /// Empties the filter and hands the keyboard back to the list.
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.filter_input.clone() {
+            // Setting the value emits `Change`, which is what actually clears
+            // `self.filter` and re-runs the filter — one path in, so the field
+            // and the list can never disagree about what is being filtered.
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        } else {
             self.filter.clear();
             self.resort_and_filter();
             self.status = self.listing_summary();
         }
-        self.prompt = None;
-        self.prompt_text.clear();
+        self.focus.focus(window);
         cx.notify();
     }
 
@@ -2841,7 +2888,7 @@ impl Browser {
 
         if primary {
             match keystroke.key.as_str() {
-                "f" => return self.start_prompt(Prompt::Filter, cx),
+                "f" => return self.focus_filter(window, cx),
                 "n" if keystroke.modifiers.shift => {
                     return self.open_form(FormKind::NewBucket, window, cx)
                 }
@@ -2871,64 +2918,40 @@ impl Browser {
             }
         }
 
-        if self.prompt.is_none() && keystroke.key == "space" && !self.selection.is_empty() {
-            return self.quick_look(cx);
-        }
-
-        // Plain Enter and Backspace only: the modified forms are taken above,
-        // by rename and by delete, and reaching them from here would fire both.
-        if self.prompt.is_none() && !primary {
-            match keystroke.key.as_str() {
-                "enter" => return self.open_cursor(cx),
-                "backspace" => return self.go_up(cx),
-                _ => {}
-            }
-        }
-
-        // Arrows work whether or not a filter is being typed: they produce no
-        // character, so narrowing the list and then walking it is one gesture
-        // rather than two modes.
+        // Arrows and Enter reach the list even while the caret is in the filter
+        // field. A one-line input has nothing to do with up and down, and
+        // narrowing the list then walking it should be one gesture rather than
+        // a trip back to the mouse to change which thing has focus.
         if !primary {
             match keystroke.key.as_str() {
                 "down" => return self.move_cursor(true, keystroke.modifiers.shift, cx),
                 "up" => return self.move_cursor(false, keystroke.modifiers.shift, cx),
+                "enter" => return self.open_cursor(cx),
                 _ => {}
             }
         }
 
-        if self.prompt.is_some() {
-            match keystroke.key.as_str() {
-                "escape" => return self.cancel_prompt(cx),
-                "enter" => return self.commit_prompt(cx),
-                "backspace" => {
-                    self.prompt_text.pop();
-                }
-                _ => {
-                    // `key_char` is what the platform's layout produced, so this
-                    // handles non-US layouts and accented characters correctly.
-                    match keystroke.key_char.as_deref() {
-                        Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => {
-                            self.prompt_text.push_str(text)
-                        }
-                        _ => return,
-                    }
-                }
+        // Everything below is for the list, so it must not steal the keys that
+        // are being typed into the field.
+        if self.filter_focused(window, cx) {
+            if keystroke.key == "escape" {
+                return self.clear_filter(window, cx);
             }
-
-            if self.prompt == Some(Prompt::Filter) {
-                self.filter = self.prompt_text.clone();
-                self.resort_and_filter();
-                self.status = self.listing_summary();
-            }
-            cx.notify();
             return;
         }
 
+        if keystroke.key == "space" && !self.selection.is_empty() {
+            return self.quick_look(cx);
+        }
+
+        // Plain Backspace only: the modified form is taken above by delete, and
+        // reaching it from here would fire both.
+        if !primary && keystroke.key == "backspace" {
+            return self.go_up(cx);
+        }
+
         if keystroke.key == "escape" && !self.filter.is_empty() {
-            self.filter.clear();
-            self.resort_and_filter();
-            self.status = self.listing_summary();
-            cx.notify();
+            self.clear_filter(window, cx);
         }
     }
 
@@ -3244,16 +3267,20 @@ impl Browser {
                             )
                     })),
             )
-            .when(!self.filter.is_empty() && self.prompt.is_none(), |this| {
+            // On screen always, not behind ⌘F. A filter you cannot see is a
+            // filter you forget is on, and then the list is missing rows for no
+            // reason you can point at. ⌘F now moves the caret here rather than
+            // opening anything.
+            .when_some(self.filter_input.clone(), |this, input| {
                 this.child(
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .bg(theme.selected)
-                        .text_xs()
-                        .text_color(theme.text)
-                        .child(SharedString::from(format!("lọc: {}", self.filter))),
+                    div().w(px(FILTER_WIDTH)).flex_shrink_0().child(
+                        Input::new(&input)
+                            .h(px(FIELD_HEIGHT))
+                            .prefix(sized_icon("search", 13., theme.text_faint))
+                            // An × inside the field, so clearing it does not
+                            // mean selecting the text and deleting it.
+                            .cleanable(true),
+                    ),
                 )
             })
             .when(bucket.is_some(), |this| {
@@ -3476,13 +3503,7 @@ impl Browser {
             .when(filtered_out, |this| {
                 this.child(
                     action_button("empty-clear-filter", "Xoá bộ lọc", theme).on_click(
-                        cx.listener(|this, _event, _window, cx| {
-                            this.filter.clear();
-                            this.prompt_text.clear();
-                            this.resort_and_filter();
-                            this.status = this.listing_summary();
-                            cx.notify();
-                        }),
+                        cx.listener(|this, _event, window, cx| this.clear_filter(window, cx)),
                     ),
                 )
             })
@@ -4933,44 +4954,6 @@ impl Browser {
                     ),
             )
     }
-
-    fn render_prompt(&self) -> Option<impl IntoElement> {
-        let theme = self.theme;
-        self.prompt.as_ref()?;
-
-        Some(
-            div()
-                .h(px(CONTROL_BAR_HEIGHT))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .bg(theme.selected)
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.text_muted)
-                        .child("Lọc"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_sm()
-                        .text_color(theme.text)
-                        // A block cursor keeps it obvious that typing goes here,
-                        // since this is a key-capture field, not a real input.
-                        .child(SharedString::from(format!("{}▏", self.prompt_text))),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.text_faint)
-                        .child("Enter để xác nhận, Esc để huỷ"),
-                ),
-        )
-    }
 }
 
 impl Render for Browser {
@@ -5030,7 +5013,6 @@ impl Render for Browser {
             })
             .when(!self.profiles.is_empty(), |this| {
                 this.child(self.render_toolbar(cx))
-                    .children(self.render_prompt())
             .child(
                 div()
                     .flex_1()
@@ -6199,8 +6181,7 @@ mod tests {
             generation: 0,
             sort: Sort::default(),
             filter: String::new(),
-            prompt: None,
-            prompt_text: String::new(),
+            filter_input: None,
             selection: HashSet::new(),
             cursor: None,
             anchor: None,
@@ -6233,6 +6214,7 @@ mod tests {
             thumb_task: None,
             tick_task: None,
             _appearance: None,
+            _filter_events: None,
         };
         browser.resort_and_filter();
         browser
