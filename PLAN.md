@@ -550,7 +550,8 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
 9. **Sửa tệp tại chỗ.** Brows3 nhúng Monaco. Với GPUI thì không có sẵn editor,
    nhưng `Input` nhiều dòng đủ cho JSON và text nhỏ — đó cũng là phần lớn ca dùng.
    Cần khoá theo kích thước và cảnh báo ghi đè.
-10. **Preview audio, video, PDF.** Hiện chỉ ảnh, text và bảng.
+10. **Preview audio, video, PDF.** Hiện chỉ ảnh, text và bảng — nhưng đã ra
+    modal riêng (21/08/2026) nên chỗ để hiển thị đã có sẵn.
 11. **Trần cho tìm kiếm sâu.** Phần quét ở §7.5 dừng được nhưng không có trần tự
     động. Brows3 đặt sẵn 100.000 mục / 100 LIST / 10.000 kết quả. Nên có, vì người
     bấm tìm không phải người nhìn hoá đơn.

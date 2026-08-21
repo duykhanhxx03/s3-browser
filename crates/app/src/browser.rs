@@ -59,6 +59,10 @@ const DIALOG_WIDTH: f32 = 460.;
 /// need room, and eliding either of them in the field where it is being typed
 /// is the one place eliding is unacceptable.
 const PROFILE_DIALOG_WIDTH: f32 = 560.;
+/// The preview overlay. Wide, because the point of taking it out of the 320px
+/// inspector was to be able to see the thing.
+const PREVIEW_WIDTH: f32 = 760.;
+const PREVIEW_HEIGHT: f32 = 560.;
 /// Right-hand inspector.
 const INSPECTOR_WIDTH: f32 = 320.;
 /// Tall enough for every command without scrolling; it scrolls anyway once a
@@ -244,15 +248,33 @@ pub struct Inspection {
     /// Only fetched where the bucket actually has ACLs enabled.
     acl: Option<ObjectAcl>,
     loading: bool,
-    preview: Option<Preview>,
     /// Only populated for versioned buckets — asking elsewhere is a request that
     /// can only ever come back with the one version you already know about.
     versions: Vec<ObjectVersion>,
 }
 
-/// What the inspector can show of an object's contents. Only ever holds the
-/// first `PREVIEW_LIMIT` bytes: a preview must never turn into an accidental
-/// download of a multi-gigabyte object.
+/// A preview, on its own over the window.
+///
+/// Its own surface rather than a panel inside the inspector, which is 320
+/// pixels wide: an image or a table shown in a column that narrow is proof the
+/// file exists rather than a look at it.
+///
+/// Independent of the inspector in state too, and that fixes two things. Space
+/// used to preview whatever the inspector already had open, so moving to
+/// another object and pressing it showed the previous one's contents. And
+/// opening the inspector and previewing in the same gesture read `head` before
+/// the HEAD request had returned, so the size came back zero and the preview
+/// gave up. The size is in the listing already; nothing needs to be asked.
+pub struct Previewing {
+    key: String,
+    name: SharedString,
+    /// `None` while the bytes are on their way.
+    content: Option<Preview>,
+}
+
+/// What a preview can show of an object's contents. Only ever holds the first
+/// `PREVIEW_LIMIT` bytes: a preview must never turn into an accidental download
+/// of a multi-gigabyte object.
 pub enum Preview {
     Image(std::sync::Arc<gpui::Image>),
     Text(SharedString),
@@ -608,6 +630,9 @@ pub struct Browser {
     /// Which tab's state is the live one.
     active_tab: usize,
     next_tab_id: u64,
+    /// The preview overlay, when one is open.
+    previewing: Option<Previewing>,
+    preview_task: Option<Task<()>>,
     /// Loading the rest of a prefix so the current sort is exact.
     completing: Option<Completing>,
     /// An operation running over a selection.
@@ -836,6 +861,8 @@ impl Browser {
             }],
             active_tab: 0,
             next_tab_id: 1,
+            previewing: None,
+            preview_task: None,
             completing: None,
             bulk: None,
             search: None,
@@ -3176,7 +3203,6 @@ impl Browser {
             tags: Vec::new(),
             acl: None,
             loading: true,
-            preview: None,
             versions: Vec::new(),
         });
         self.load_inspection(key, cx);
@@ -3239,58 +3265,94 @@ impl Browser {
 
     /// Fetches the first slice of the object and decides what it is. Runs only
     /// on demand: a preview of every selected row would be a download per click.
-    fn load_preview(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket), Some(inspector)) = (
-            self.client.clone(),
-            self.bucket.clone(),
-            self.inspector.as_ref(),
-        ) else {
+    /// Opens the preview overlay on whatever is selected.
+    ///
+    /// Reads the selection every time rather than trusting the inspector.
+    /// Trusting it is what made Space show the last object's contents after
+    /// moving to another one.
+    fn open_preview(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
             return;
         };
-        let key = inspector.key.clone();
-        let key_for_format = key.clone();
-        let size = inspector.head.as_ref().map(|head| head.size).unwrap_or(0);
-        let kind = preview_kind(&key, inspector.head.as_ref().and_then(|h| h.content_type.as_deref()));
-
-        if kind == PreviewKind::None {
-            if let Some(inspector) = self.inspector.as_mut() {
-                inspector.preview = Some(Preview::Unsupported);
-            }
-            cx.notify();
+        // The one selected object, or the row the cursor is on when the mouse
+        // has not been near the list at all.
+        let target = self
+            .selected_object_keys()
+            .first()
+            .cloned()
+            .or_else(|| self.cursor.clone())
+            .filter(|key| !key.ends_with('/'));
+        let Some(key) = target else {
             return;
-        }
+        };
+
+        // The size comes from the listing, which already has it. Waiting for a
+        // HEAD here is what made a preview opened in the same gesture as the
+        // inspector see size zero and give up.
+        let size = self
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.size)
+            .unwrap_or(0);
+        // The content type is only known when the inspector happens to have
+        // this object open; otherwise the extension decides, which is what a
+        // file manager does and costs no request.
+        let content_type = self
+            .inspector
+            .as_ref()
+            .filter(|inspector| inspector.key == key)
+            .and_then(|inspector| inspector.head.as_ref())
+            .and_then(|head| head.content_type.clone());
+        let kind = preview_kind(&key, content_type.as_deref());
+
+        self.previewing = Some(Previewing {
+            key: key.clone(),
+            name: entry_name_of(&key).into(),
+            content: None,
+        });
 
         // An image has to arrive whole to decode, so an oversized one is refused
         // rather than fetched and shown broken. Text is fine truncated.
-        if kind == PreviewKind::Image && size > PREVIEW_LIMIT as i64 {
-            if let Some(inspector) = self.inspector.as_mut() {
-                inspector.preview = Some(Preview::Unsupported);
+        let refusal = match kind {
+            PreviewKind::None => Some(Preview::Unsupported),
+            PreviewKind::Image if size > PREVIEW_LIMIT as i64 => {
+                self.status = "Ảnh quá lớn để xem trước".into();
+                Some(Preview::Unsupported)
             }
-            self.status = "Ảnh quá lớn để xem trước".into();
+            _ if size <= 0 => Some(Preview::Unsupported),
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            if let Some(previewing) = self.previewing.as_mut() {
+                previewing.content = Some(refusal);
+            }
             cx.notify();
             return;
         }
 
-        let wanted = (size.max(0) as u64).min(PREVIEW_LIMIT);
-        if wanted == 0 {
-            if let Some(inspector) = self.inspector.as_mut() {
-                inspector.preview = Some(Preview::Unsupported);
-            }
-            cx.notify();
-            return;
-        }
-
+        let wanted = (size as u64).min(PREVIEW_LIMIT);
+        let fetch_key = key.clone();
         let fetching = Tokio::spawn(cx, async move {
-            client.get_range(&bucket, &key, 0..wanted, None).await
+            client.get_range(&bucket, &fetch_key, 0..wanted, None).await
         });
 
-        self.op_task = Some(cx.spawn(async move |this, cx| {
+        self.preview_task = Some(cx.spawn(async move |this, cx| {
             let outcome = fetching.await;
             _ = this.update(cx, |this, cx| {
+                // A different object may have been opened while this was in
+                // flight, and its bytes are not these.
+                let stale = this
+                    .previewing
+                    .as_ref()
+                    .is_none_or(|previewing| previewing.key != key);
+                if stale {
+                    return;
+                }
                 match outcome {
                     Ok(Ok(bytes)) => {
-                        if let Some(inspector) = this.inspector.as_mut() {
-                            inspector.preview = Some(build_preview(kind, &key_for_format, bytes));
+                        if let Some(previewing) = this.previewing.as_mut() {
+                            previewing.content = Some(build_preview(kind, &key, bytes));
                         }
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
@@ -3299,10 +3361,15 @@ impl Browser {
                 cx.notify();
             });
         }));
+        cx.notify();
     }
 
-    /// Downloads the object to a temporary file and hands it to whatever the OS
-    /// opens that file type with.
+    fn close_preview(&mut self, cx: &mut Context<Self>) {
+        self.previewing = None;
+        self.preview_task = None;
+        cx.notify();
+    }
+
     fn open_externally(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(bucket), Some(inspector)) = (
             self.client.clone(),
@@ -3344,15 +3411,15 @@ impl Browser {
         }));
     }
 
-    /// Space opens the inspector on the selection and previews it in one go —
-    /// the Finder gesture, which is what people reach for.
+    /// Space: the Finder gesture. Opens the preview on whatever is selected
+    /// now, and closes it if it is already showing that object.
     fn quick_look(&mut self, cx: &mut Context<Self>) {
-        if self.inspector.is_none() {
-            self.open_inspector(cx);
+        let showing = self.previewing.as_ref().map(|previewing| previewing.key.clone());
+        let selected = self.selected_object_keys().first().cloned();
+        if showing.is_some() && showing == selected {
+            return self.close_preview(cx);
         }
-        if self.inspector.is_some() {
-            self.load_preview(cx);
-        }
+        self.open_preview(cx)
     }
 
     /// The most destructive thing the app can do, so the dialog names the bucket
@@ -4264,6 +4331,10 @@ impl Browser {
             }
         }
 
+        if self.previewing.is_some() && keystroke.key == "escape" {
+            return self.close_preview(cx);
+        }
+
         if self.path_editing {
             if keystroke.key == "escape" {
                 self.path_editing = false;
@@ -4721,6 +4792,97 @@ impl Browser {
                                             .text_color(theme.text_faint)
                                             .child("Chưa có lỗi nào"),
                                     )
+                                }),
+                        ),
+                ),
+        )
+    }
+
+    /// The preview overlay.
+    fn render_preview(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let previewing = self.previewing.as_ref()?;
+        let theme = self.theme;
+
+        Some(
+            div()
+                .id("preview-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.55))
+                .on_click(cx.listener(|this, _event, _window, cx| this.close_preview(cx)))
+                .child(
+                    div()
+                        .id("preview")
+                        .w(px(PREVIEW_WIDTH))
+                        .max_h(px(PREVIEW_HEIGHT))
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .h(px(HEADER_HEIGHT))
+                                .flex_shrink_0()
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.text)
+                                        .child(previewing.name.clone()),
+                                )
+                                .child(
+                                    icon_button("preview-close", "close", theme).on_click(
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.close_preview(cx)
+                                        }),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("preview-body")
+                                .flex_1()
+                                .min_h(px(0.))
+                                .overflow_scroll()
+                                .p_3()
+                                .child(match previewing.content.as_ref() {
+                                    None => div()
+                                        .text_xs()
+                                        .text_color(theme.text_faint)
+                                        .child("Đang tải…")
+                                        .into_any_element(),
+                                    Some(Preview::Image(image)) => gpui::img(image.clone())
+                                        .max_w_full()
+                                        .into_any_element(),
+                                    Some(Preview::Text(text)) => div()
+                                        .font_family(self.mono_font.clone())
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child(text.clone())
+                                        .into_any_element(),
+                                    Some(Preview::Table(table)) => {
+                                        render_table(table, self.mono_font.clone(), theme)
+                                            .into_any_element()
+                                    }
+                                    Some(Preview::Unsupported) => div()
+                                        .text_xs()
+                                        .text_color(theme.text_faint)
+                                        .child("Không xem trước được kiểu này")
+                                        .into_any_element(),
                                 }),
                         ),
                 ),
@@ -5925,7 +6087,7 @@ impl Browser {
                             .child(
                                 action_button("preview", "Xem trước", theme).on_click(
                                     cx.listener(|this, _event, _window, cx| {
-                                        this.load_preview(cx)
+                                        this.open_preview(cx)
                                     }),
                                 ),
                             )
@@ -5937,108 +6099,6 @@ impl Browser {
                                 ),
                             ),
                     )
-                    .children(inspector.preview.as_ref().map(|preview| match preview {
-                        Preview::Image(image) => gpui::img(image.clone())
-                            .max_w_full()
-                            .max_h(px(220.))
-                            .into_any_element(),
-                        Preview::Text(text) => div()
-                            .id("preview-text")
-                            .max_h(px(220.))
-                            .overflow_hidden()
-                            .p_2()
-                            .rounded_md()
-                            .bg(theme.hover)
-                            .font_family(self.mono_font.clone())
-                            .text_color(theme.text_muted)
-                            .child(text.clone())
-                            .into_any_element(),
-                        Preview::Table(table) => {
-                            let widths = table_column_widths(table);
-                            let cell = move |text: &String, width: f32, color: gpui::Hsla| {
-                                div()
-                                    .w(px(width))
-                                    .flex_shrink_0()
-                                    .pr_2()
-                                    .overflow_hidden()
-                                    // Without this a cell whose text is a few
-                                    // pixels wider than its computed box wraps
-                                    // onto a second line and every column after
-                                    // it stops lining up. The width is derived
-                                    // from a character count, and a character
-                                    // count is never exactly a pixel count.
-                                    .whitespace_nowrap()
-                                    .text_color(color)
-                                    .child(SharedString::from(elide_middle(
-                                        text,
-                                        TABLE_CELL_CHARS,
-                                    )))
-                            };
-                            div()
-                                .id("preview-table")
-                                .max_h(px(220.))
-                                // Both axes: a table is wide as often as it is
-                                // long, and clipping a column is losing data
-                                // with no way to ask for it back.
-                                .overflow_scroll()
-                                .p_2()
-                                .rounded_md()
-                                .bg(theme.hover)
-                                .font_family(self.mono_font.clone())
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .pb_1()
-                                                .mb_1()
-                                                .border_b_1()
-                                                .border_color(theme.border)
-                                                .children(
-                                                    table.headers.iter().enumerate().map(
-                                                        |(ix, text)| {
-                                                            cell(
-                                                                text,
-                                                                widths[ix],
-                                                                theme.text,
-                                                            )
-                                                        },
-                                                    ),
-                                                ),
-                                        )
-                                        .children(table.rows.iter().map(|row| {
-                                            div().flex().children(
-                                                row.iter().enumerate().map(|(ix, text)| {
-                                                    cell(text, widths[ix], theme.text_muted)
-                                                }),
-                                            )
-                                        }))
-                                        // Said out loud, because a preview that
-                                        // silently stops looks like a file that
-                                        // ends there.
-                                        .when(
-                                            table.hidden_rows > 0 || table.hidden_columns > 0,
-                                            |this| {
-                                                this.child(
-                                                    div()
-                                                        .pt_1()
-                                                        .text_color(theme.text_faint)
-                                                        .child(SharedString::from(
-                                                            hidden_note(table),
-                                                        )),
-                                                )
-                                            },
-                                        ),
-                                )
-                                .into_any_element()
-                        }
-                        Preview::Unsupported => div()
-                            .text_color(theme.text_faint)
-                            .child("Không xem trước được kiểu này")
-                            .into_any_element(),
-                    }))
                     .when(
                         !inspector.versions.is_empty()
                             && self.supports(|caps| caps.versioning),
@@ -7129,6 +7189,7 @@ impl Render for Browser {
             .children(self.render_form(cx))
             .children(self.render_profiles_dialog(cx))
             .children(self.render_failures(cx))
+            .children(self.render_preview(cx))
     }
 }
 
@@ -7771,6 +7832,63 @@ fn parse_table(text: &str, delimiter: char) -> Table {
         hidden_rows,
         hidden_columns,
     }
+}
+
+/// A parsed table, laid out in columns.
+fn render_table(table: &Table, mono: SharedString, theme: Theme) -> impl IntoElement {
+    let widths = table_column_widths(table);
+    let cell = move |text: &String, width: f32, color: gpui::Hsla| {
+        div()
+            .w(px(width))
+            .flex_shrink_0()
+            .pr_2()
+            .overflow_hidden()
+            // Without this a cell whose text is a few pixels wider than its
+            // computed box wraps onto a second line and every column after it
+            // stops lining up. The width comes from a character count, and a
+            // character count is never exactly a pixel count.
+            .whitespace_nowrap()
+            .text_color(color)
+            .child(SharedString::from(elide_middle(text, TABLE_CELL_CHARS)))
+    };
+
+    div()
+        .font_family(mono)
+        .text_xs()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .pb_1()
+                .mb_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .children(
+                    table
+                        .headers
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, text)| cell(text, widths[ix], theme.text)),
+                ),
+        )
+        .children(table.rows.iter().map(|row| {
+            div().flex().children(
+                row.iter()
+                    .enumerate()
+                    .map(|(ix, text)| cell(text, widths[ix], theme.text_muted)),
+            )
+        }))
+        // Said out loud, because a preview that silently stops looks like a file
+        // that ends there.
+        .when(table.hidden_rows > 0 || table.hidden_columns > 0, |this| {
+            this.child(
+                div()
+                    .pt_1()
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(hidden_note(table))),
+            )
+        })
 }
 
 /// Column widths in pixels, from the longest cell in each column.
@@ -8588,6 +8706,8 @@ mod tests {
             }],
             active_tab: 0,
             next_tab_id: 1,
+            previewing: None,
+            preview_task: None,
             completing: None,
             bulk: None,
             search: None,
