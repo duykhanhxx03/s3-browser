@@ -712,6 +712,22 @@ Họ: upload hỏng → dò region thật của bucket → nếu khác thì th�
 vẫn hỏng mới báo. Mình báo region đúng rồi để người dùng tự sửa. Hai cách đều
 đúng; cách của họ đỡ một vòng thao tác cho trường hợp thường gặp nhất.
 
+### 10.11 Sidebar: một hình dạng dòng duy nhất (21/08/2026)
+
+Không phải học từ Brows3 mà là góp ý trực tiếp, nhưng cùng một chủ đề. Sidebar
+đang có **ba** kiểu dòng và **hai** kiểu tiêu đề nhóm:
+
+- Dòng điều hướng có icon, dòng bucket **không có** — nên chữ của bucket bắt đầu
+  đúng chỗ *icon* của mọi dòng khác, để lại một mép trái lởm chởm chạy suốt cột.
+- Danh sách đã ghim nhỏ hơn một bậc (`text_xs`, icon 11px), theo một lý thuyết
+  về "danh sách con" mà nhìn vào chỉ thấy như một tai nạn.
+- "ĐÃ GHIM" đệm `pt_2`, "BUCKETS" đệm `py_1` — lệch nhau vài pixel theo chiều
+  dọc, loại khác biệt không ai gọi tên được mà ai cũng thấy.
+
+Giờ tất cả đi qua một `sidebar_item`. Thêm icon `bucket` — bản đầu vẽ cái xô,
+rồi đặt cạnh `trash.svg` mới thấy nắp cộng thân thuôn là đúng hình cái thùng
+rác, nên vẽ lại thành hình trụ khoét vành trên.
+
 ### Không học
 
 Monaco (là WebView, GPUI không có — xem "Đề nghị không làm" ở §9), MUI, Next.js.
