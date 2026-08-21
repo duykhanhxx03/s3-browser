@@ -919,3 +919,39 @@ xem trước, danh sách palette) — thêm `liquid_glass_flush` không keel cho
 đó; radius popover lệch giữa vỏ và lớp phủ — bỏ override `rounded_md`; và test
 chỉ ghim trần chứ không ghim sàn, nên một spec toàn số 0 — không vẽ tí kính nào
 — vẫn qua được bài test tự nhận là ghim mô hình ánh sáng. Đã thêm sàn alpha.
+
+### 10.15 Liquid glass thật: fork gpui (21/08/2026)
+
+§10.14 dừng ở "gpui không có backdrop-filter nên khúc xạ thật là ngoài tầm".
+Câu hỏi tiếp theo là: kể cả sửa gpui? Trả lời: được, và đã làm. gpui giờ được
+vendor tại `vendor/gpui` (8MB, Apache-2.0, patch qua `[patch.crates-io]`) với
+đúng **một** năng lực mới: primitive `BackdropGlass` — đến lượt nó trong thứ tự
+vẽ, renderer dừng lại, chụp khung hình đã vẽ ra texture, blur hai lượt gaussian
+ở nửa độ phân giải, rồi vẽ tấm kính lấy mẫu texture đó: mặt nạ SDF bo góc,
+**khúc xạ** đẩy toạ độ mẫu dọc gradient SDF trong dải một-blur-radius sát mép
+(thấu kính thật gom cong ở vành, giữa tấm phẳng tuyệt đối), phủ tint. Đúng cơ
+chế BackdropFilter của Flutter.
+
+Vài chỗ đã phải trả giá để biết:
+
+- Nhánh `Paths` của renderer **đã làm sẵn** động tác cắt pass giữa khung hình
+  (end encoder → pass phụ → mở lại với `Load`) — không phải phát minh gì, chỉ
+  nối thêm một bước blit + hai pass blur vào giữa.
+- `CAMetalLayer.framebufferOnly` mặc định cấm đọc ngược drawable — tắt nó là
+  giá vé vào cửa của mọi backdrop filter.
+- cbindgen sinh `scene.h` từ struct Rust: `[f32; 2]` thành mảng C chứ không
+  phải `float2`, shader phải tự ghép vector.
+- NSGlassEffectView không phải đường tắt: cả UI nằm trong một CAMetalLayer,
+  view kính native đặt lên trên sẽ đè lên *cả nội dung dialog*.
+
+Phía app, `liquid_glass` bỏ nền đục: con đầu tiên giờ là một `canvas` gọi
+`paint_backdrop_glass`, tint là màu modal ở alpha `frost` (dark 0.72, light
+0.78 — light đậm sương hơn vì chữ tối cần nền vững hơn chữ sáng; test ghim sàn
+0.6 và trần <1.0, vì frost 1.0 là cái panel đục trả tiền cho một cú chụp mà nó
+che mất). Các lớp §10.14 (vành, sheen, keel, bóng) giữ nguyên bên trên — giờ
+chúng là ánh sáng *trên* kính thật thay vì đứng thay kính.
+
+Đã nhìn thật cả hai mode: hộp thoại Cài đặt và palette đều cho dòng danh sách
+ghosting xuyên qua lớp sương; kính-chồng-kính (palette đè dialog) đúng thứ tự.
+Chưa đo: chi phí GPU của capture+blur mỗi khung hình có kính (một blit + hai
+pass nửa độ phân giải + N quad — dự là không đáng kể, nhưng là *dự*).

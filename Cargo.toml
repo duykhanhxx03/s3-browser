@@ -34,3 +34,10 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+
+# gpui is forked in-tree to add one thing the stock renderer cannot do: a
+# backdrop primitive — capture what is already drawn, blur it, and hand it to a
+# glass shader. Real liquid glass needs to sample the content behind a panel,
+# and upstream gpui has no per-element backdrop filter and no shader hook.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

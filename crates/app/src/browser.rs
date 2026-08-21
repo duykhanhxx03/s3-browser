@@ -10098,10 +10098,30 @@ trait LiquidGlass: Styled + ParentElement + Sized {
     fn glass_layers(self, theme: Theme, keel: bool) -> Self {
         let glass = theme.glass;
         let (shadow_y, shadow_blur, shadow_spread) = glass.shadow_geometry;
+        // The pane itself: real backdrop glass from the forked renderer, not a
+        // painted colour. The canvas is the first child, so it captures and
+        // blurs everything already on screen and every later child — the
+        // dialog's own content — paints on top of the pane.
+        let mut frost = theme.modal;
+        frost.a = glass.frost;
         self.rounded_lg()
-            .bg(theme.modal)
             .border_1()
             .border_color(glass.rim)
+            .child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        window.paint_backdrop_glass(
+                            bounds,
+                            gpui::Corners::all(px(8.)),
+                            px(22.),
+                            frost,
+                        );
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
             .shadow(vec![
                 gpui::BoxShadow {
                     color: glass.shadow,
