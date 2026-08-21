@@ -865,6 +865,11 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
         command_encoder.set_fragment_texture(0, Some(blurred));
+        // The unblurred capture rides along for the rim: refraction bends
+        // sharp imagery, and bending the blur instead reads as mush.
+        if let Some(capture) = self.glass_capture_texture.as_ref() {
+            command_encoder.set_fragment_texture(1, Some(capture));
+        }
 
         let glass_bytes_len = mem::size_of_val(glasses);
         let buffer_contents =

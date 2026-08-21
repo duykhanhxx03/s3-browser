@@ -955,3 +955,28 @@ chúng là ánh sáng *trên* kính thật thay vì đứng thay kính.
 ghosting xuyên qua lớp sương; kính-chồng-kính (palette đè dialog) đúng thứ tự.
 Chưa đo: chi phí GPU của capture+blur mỗi khung hình có kính (một blit + hai
 pass nửa độ phân giải + N quad — dự là không đáng kể, nhưng là *dự*).
+
+### 10.16 Từ sương đục thành kính (21/08/2026)
+
+Bản đầu của §10.15 nhìn vẫn chưa "liquid": frost 0.72/0.78 trên nền blur là
+**frosted plastic** — tấm nhựa mờ, không phải kính. Bốn thứ làm nên chất liệu
+của Apple, giờ đều nằm trong fragment shader:
+
+1. **Frost mỏng đi một nửa** (dark 0.45, light 0.52). Thứ gánh độ đọc của chữ
+   ở frost thấp là lớp blur bên dưới, không phải lớp tint. Test đổi theo: sàn
+   0.35, trần 0.6 — trần cũ 1.0 giờ chính là định nghĩa của cái sai cũ.
+2. **Vibrancy**: đẩy bão hoà qua trung tính (×1.45) để màu phía sau bừng qua
+   sương thay vì chết thành xám. Mọi material của Apple đều làm; blur không có
+   nó là sương mù, không phải kính.
+3. **Vành bẻ cong ảnh *sắc nét***: khúc xạ giờ lấy mẫu từ capture chưa blur
+   (texture thứ hai đi kèm), ba tap lệch nhau một sợi tóc cho tán sắc — viền
+   màu mờ ở đúng mép mà mắt không gọi tên được nhưng đọc ra "thấu kính".
+   Khúc xạ trên ảnh đã blur chỉ ra nhão.
+4. **Cả tấm là một thấu kính yếu**: backdrop phóng đại ~5% về tâm tấm. Nội
+   dung *trượt khác tốc độ* dưới tấm so với cạnh tấm — cái này, hơn cả blur,
+   là thứ đọc ra "một tấm vật liệu" thay vì một filter ảnh chụp.
+   Kèm specular trong shader ở cạnh ngửa lên nguồn sáng (−normal.y).
+
+Đã nhìn thật cả hai mode, kể cả kính-chồng-kính: palette nổi trên hộp Cài đặt,
+đọc được chữ của dialog ghosting qua tấm, phóng nhẹ, mép mềm. Cũng dọn hai
+warning `float_literal_f32_fallback` ở `taffy.rs` của upstream cho build sạch.

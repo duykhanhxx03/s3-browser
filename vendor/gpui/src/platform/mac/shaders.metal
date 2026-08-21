@@ -1279,7 +1279,8 @@ fragment float4 backdrop_glass_fragment(
     constant BackdropGlass *glasses [[buffer(BackdropGlassInputIndex_Glasses)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(BackdropGlassInputIndex_ViewportSize)]],
-    texture2d<float> blurred [[texture(0)]]) {
+    texture2d<float> blurred [[texture(0)]],
+    texture2d<float> sharp [[texture(1)]]) {
   constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
                                  address::clamp_to_edge);
   BackdropGlass glass = glasses[input.glass_id];
@@ -1303,20 +1304,49 @@ fragment float4 backdrop_glass_fragment(
   float gradient_len = length(gradient);
   float2 normal = gradient_len > 0. ? gradient / gradient_len : float2(0.);
 
-  // The lens lives in a band inside the edge, one blur radius wide. The curve
-  // is quadratic so the middle of the pane is perfectly flat and the bend
-  // gathers at the rim, which is where a slab of glass actually bends light.
-  float band = max(glass.blur_radius, 1.);
-  float rim = saturate(1. + distance / band);
-  float2 refraction = normal * rim * rim * band * 0.6;
-
   float2 viewport = float2(float(viewport_size->width),
                            float(viewport_size->height));
-  float2 uv = (pos + refraction) / viewport;
-  float4 sample = blurred.sample(blur_sampler, uv);
+  float2 uv = pos / viewport;
 
+  // The whole pane is a weak lens: the backdrop is magnified a few percent
+  // toward the pane's centre. This, more than the blur, is what reads as a
+  // slab of *material* rather than a screenshot filter — content slides
+  // differently under the pane than beside it.
+  float2 center = float2(glass.bounds.origin.x + glass.bounds.size.width / 2.,
+                         glass.bounds.origin.y + glass.bounds.size.height / 2.) /
+                  viewport;
+  float2 lens_uv = center + (uv - center) / 1.05;
+  float4 base = blurred.sample(blur_sampler, lens_uv);
+
+  // Vibrancy: push saturation past neutral so the colours behind glow through
+  // the frost instead of dying into grey. Every Apple material does this; a
+  // blur without it reads as fog, not glass.
+  float luma = dot(base.rgb, float3(0.299, 0.587, 0.114));
+  base.rgb = clamp(mix(float3(luma), base.rgb, 1.45), 0., 1.);
+
+  // The rim bends *sharp* imagery, not the blur. A refracted blur is mush; a
+  // real slab shows a crisp, stretched band of what lies just outside its
+  // edge. Quadratic falloff keeps the middle perfectly flat. The three taps a
+  // hair apart are chromatic dispersion — the faint colour fringing at the
+  // very edge that says "lens" to an eye that never names it.
+  float band = max(glass.blur_radius, 1.);
+  float rim = saturate(1. + distance / band);
+  float bend = rim * rim;
+  float2 shift = normal * bend * band * 1.1 / viewport;
+  float3 rim_rgb = float3(sharp.sample(blur_sampler, uv + shift * 1.06).r,
+                          sharp.sample(blur_sampler, uv + shift).g,
+                          sharp.sample(blur_sampler, uv + shift * 0.94).b);
+  float3 color = mix(base.rgb, rim_rgb, bend * 0.8);
+
+  // The frost, thin enough to stay glass.
   float4 tint = hsla_to_rgba(glass.tint);
-  float3 color = mix(sample.rgb, tint.rgb, tint.a);
+  color = mix(color, tint.rgb, tint.a);
+
+  // Specular on the rim where the edge faces the key light from above: the
+  // outward normal's -y is exactly "how much this edge looks up".
+  float specular = saturate(-normal.y) * bend;
+  color += specular * 0.20;
+
   return float4(color * coverage, coverage);
 }
 

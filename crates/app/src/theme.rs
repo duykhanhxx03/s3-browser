@@ -95,9 +95,10 @@ pub struct GlassSpec {
     /// Shadow geometry, in pixels: (y offset, blur, spread).
     pub shadow_geometry: (f32, f32, f32),
     /// How frosted the pane is: the alpha of the modal colour composited over
-    /// the blurred backdrop. Below ~0.6 the content underneath fights the
-    /// content on top; at 1.0 the pane is an opaque panel that paid for a
-    /// capture it hides.
+    /// the blurred backdrop. Liquid glass is *thin* frost — the first cut used
+    /// 0.72/0.78 and read as frosted plastic, not glass; what carries text
+    /// legibility at low frost is the blur underneath, not the tint. At 1.0
+    /// the pane is an opaque panel that paid for a capture it hides.
     pub frost: f32,
 }
 
@@ -111,7 +112,7 @@ impl GlassSpec {
                 keel: rgba(0x00000038).into(),
                 shadow: rgba(0x00000094).into(),
                 shadow_geometry: (12., 36., -6.),
-                frost: 0.72,
+                frost: 0.45,
             },
             Mode::Light => Self {
                 rim: rgba(0x1c202426).into(),
@@ -120,7 +121,7 @@ impl GlassSpec {
                 keel: rgba(0x0000000d).into(),
                 shadow: rgba(0x0000004a).into(),
                 shadow_geometry: (14., 44., -8.),
-                frost: 0.78,
+                frost: 0.52,
             },
         }
     }
@@ -335,12 +336,13 @@ mod tests {
         assert!(dark.shadow.a > light.shadow.a);
         assert!(light.shadow_geometry.1 > dark.shadow_geometry.1);
 
-        // Frost has a floor and a ceiling. Below it the backdrop fights the
-        // dialog's own text; at 1.0 the pane is opaque and the whole capture
-        // was for nothing. Light frosts harder because dark text needs a
-        // steadier ground than light text does.
+        // Frost has a floor and a ceiling. Below the floor the backdrop
+        // fights the dialog's own text even through the blur; near 1.0 the
+        // pane is frosted plastic and the whole capture was for nothing —
+        // which is exactly what the first cut at 0.72/0.78 looked like. Light
+        // frosts harder because dark text needs a steadier ground.
         for (mode, glass) in [("dark", dark), ("light", light)] {
-            assert!(glass.frost >= 0.6 && glass.frost < 1.0, "{mode} frost");
+            assert!(glass.frost >= 0.35 && glass.frost <= 0.6, "{mode} frost");
         }
         assert!(light.frost > dark.frost);
     }
