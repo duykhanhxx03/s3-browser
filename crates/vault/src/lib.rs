@@ -107,8 +107,47 @@ impl ProfileStore {
     }
 }
 
-/// Reads the secret key for a profile from the OS credential store.
+/// The environment variable that supplies a secret without touching the
+/// credential store. Development only — see [`dev_secret`].
+pub const DEV_SECRET_VAR: &str = "S3BROWSER_DEV_SECRET";
+
+/// A secret handed in through the environment instead of read from the
+/// credential store.
+///
+/// **Why this exists.** On macOS the Keychain grants access by code signature,
+/// and an unsigned debug build gets a new one from every `cargo build`. So each
+/// rebuild asks for the login-keychain password before the app can list
+/// anything — which is enough friction that running the app to look at a change
+/// stops happening, and changes go out unlooked-at.
+///
+/// **Debug builds only, deliberately.** A shipped binary must never take a
+/// credential from its environment: anything able to set a variable on the
+/// process could then point it at a server of its choosing without ever
+/// touching the credential store, and the store is the whole reason secrets are
+/// not in the config file. `cfg!(debug_assertions)` is what separates the two,
+/// so the check cannot be forgotten at release time.
+fn dev_secret() -> Option<String> {
+    resolve_dev_secret(std::env::var(DEV_SECRET_VAR).ok(), cfg!(debug_assertions))
+}
+
+/// The decision, split out so both halves can be tested — a `cfg!` cannot be
+/// flipped from within one test run.
+fn resolve_dev_secret(value: Option<String>, debug_build: bool) -> Option<String> {
+    if !debug_build {
+        return None;
+    }
+    // An empty variable is someone clearing it, not a secret that happens to be
+    // the empty string; treating it as one would fail to sign with a confusing
+    // error rather than falling back to the store.
+    value.filter(|secret| !secret.is_empty())
+}
+
+/// Reads the secret key for a profile from the OS credential store, or from
+/// [`DEV_SECRET_VAR`] in a debug build.
 pub fn secret_key(profile_id: &str) -> Result<String> {
+    if let Some(secret) = dev_secret() {
+        return Ok(secret);
+    }
     entry(profile_id)?
         .get_password()
         .with_context(|| format!("no stored secret for profile {profile_id}"))
@@ -206,6 +245,24 @@ mod tests {
             relaxed_checksums: false,
             access_key: "AKIA".into(),
         }
+    }
+
+    #[test]
+    fn the_dev_secret_never_applies_to_a_release_build() {
+        let secret = || Some("minioadmin".to_string());
+
+        // In development it is the point of the thing: no Keychain prompt on
+        // every rebuild.
+        assert_eq!(resolve_dev_secret(secret(), true).as_deref(), Some("minioadmin"));
+
+        // In a shipped binary it must not exist at all. A credential taken from
+        // the environment defeats the credential store: whoever can set a
+        // variable on the process picks the key it signs with.
+        assert_eq!(resolve_dev_secret(secret(), false), None);
+
+        // Unset and empty both mean "use the store", not "sign with nothing".
+        assert_eq!(resolve_dev_secret(None, true), None);
+        assert_eq!(resolve_dev_secret(Some(String::new()), true), None);
     }
 
     #[test]

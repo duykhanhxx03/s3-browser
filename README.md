@@ -10,10 +10,19 @@ Kế hoạch đầy đủ: [PLAN.md](PLAN.md).
 ```bash
 scripts/minio-dev.sh start --large    # MinIO local + dữ liệu mẫu (cần Docker)
 cargo run -p vault --example dev_profile   # tạo sẵn profile "MinIO local"
-cargo run -p s3browser
+S3BROWSER_DEV_SECRET=minioadmin cargo run -p s3browser
 ```
 
-Lần đầu chạy mà chưa có profile nào, sidebar sẽ hiện hai nút: **Nhập từ ~/.aws** và **Thêm MinIO local**.
+Lần đầu chạy mà chưa có profile nào, màn hình chào mở ba lối vào: **Nhập thủ công**,
+**MinIO trên máy** và **Đăng nhập AWS SSO**.
+
+`S3BROWSER_DEV_SECRET` là để khỏi phải gõ mật khẩu chuỗi khoá mỗi lần build lại.
+Keychain của macOS cấp quyền theo chữ ký mã, mà bản debug chưa ký thì mỗi lần
+`cargo build` lại là một chữ ký khác, nên lần chạy nào cũng bị hỏi mật khẩu — đủ
+phiền để người ta thôi chạy thử, và thay đổi giao diện thì đi ra mà chẳng ai nhìn.
+Biến này **chỉ có tác dụng trong bản debug**: bản phát hành mà nhận khoá từ môi
+trường thì ai đặt được biến cho tiến trình là chọn được khoá nó ký, tức là vô hiệu
+hoá luôn cái kho khoá.
 
 ### Phím tắt
 
@@ -26,8 +35,14 @@ Lần đầu chạy mà chưa có profile nào, sidebar sẽ hiện hai nút: **
 | `⌘R` | Tải lại prefix hiện tại |
 | `⌘⌫` | Xoá các mục đang chọn |
 | `⌘↑` | Lên một cấp |
-| Nhấp đúp | Vào thư mục |
+| `↑` `↓` | Đổi dòng đang chọn |
+| `⇧↑` `⇧↓` | Chọn dải liên tiếp |
+| `Enter` | Mở: thư mục thì vào, tệp thì xem trước |
+| `⌫` | Lên một cấp |
+| `Space` | Xem nhanh |
+| Nhấp đúp | Vào thư mục, hoặc xem trước tệp |
 | `⌘`+nhấp | Chọn thêm |
+| `⇧`+nhấp | Chọn dải liên tiếp |
 
 ### Cờ dòng lệnh
 
@@ -37,9 +52,10 @@ Lần đầu chạy mà chưa có profile nào, sidebar sẽ hiện hai nút: **
 | `--verify-glass` | Hỏi AppKit xem hiệu ứng glass có thật sự được gắn, in báo cáo rồi thoát (macOS) |
 | `S3BROWSER_DEBUG=1` | Bật log chẩn đoán (kết nối, số mục, phân trang) |
 | `S3BROWSER_GLASS=0/1` | Ép chế độ solid / glass, ghi đè mặc định theo platform |
+| `S3BROWSER_DEV_SECRET=…` | Khoá bí mật lấy thẳng từ môi trường, bỏ qua chuỗi khoá. Chỉ bản debug |
 
 ```bash
-cargo test    # 28 test; test MinIO tự bỏ qua nếu chưa chạy Docker
+cargo test    # 132 test; test MinIO tự bỏ qua nếu chưa chạy Docker
 ```
 
 ## Yêu cầu môi trường

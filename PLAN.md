@@ -338,15 +338,24 @@ phương và diễn đạt tương đối.
 
 Năm mục còn lại, làm lần lượt:
 
-### 7.1 Menu chuột phải
-Giờ khả thi vì gpui-component đã tích hợp; gpui 0.2.2 trần không có. Menu theo
-ngữ cảnh: chuột phải trên một dòng đưa ra đúng các lệnh áp dụng được cho nó, và
-tự ẩn thứ provider không hỗ trợ như panel ACL đang làm.
+### 7.1 Menu chuột phải — xong
+Menu theo ngữ cảnh qua `Action` của gpui, nên menu và phím tắt cùng chạm tới một
+handler. Mục không áp dụng được thì bỏ hẳn, trừ Dán: nó phụ thuộc clipboard chứ
+không phụ thuộc dòng đang bấm, nên hiện mờ thay vì nhấp nháy giữa các lần mở.
 
-### 7.2 Điều hướng bằng phím mũi tên
-Lên/xuống đổi dòng đang chọn, Enter mở, Backspace lên một cấp, Shift để chọn
-dải. Cần cuộn theo lựa chọn — đây cũng chính là thứ command palette còn thiếu,
-nên làm chung một cơ chế.
+### 7.2 Điều hướng bằng phím mũi tên — xong
+Con trỏ bàn phím giữ theo *key* của object chứ không theo số dòng: lọc và sắp xếp
+đánh số lại các dòng, giữ số dòng thì con trỏ tự trượt sang tệp khác mà không ai
+bấm phím nào, và Enter tiếp theo mở nhầm thứ.
+
+Cuộn theo con trỏ: `scroll_to_item` của gpui không có chiến lược "gần nhất", nên
+chiều di chuyển chọn mép — xuống thì canh mép dưới, lên thì canh mép trên. Chọn
+nhầm mép biến một bước một dòng thành một cú nhảy cả trang. Command palette dùng
+chung cơ chế đó, nên phần nó còn thiếu cũng xong luôn.
+
+Đã xem tận mắt trên MinIO: mũi tên đi đúng dòng, danh sách cuộn từng dòng một khi
+con trỏ chạm mép, `⇧↑` chọn đúng dải liên tiếp. Phím giả lập tới được GPUI, khác
+với chuột giả lập ở §5.
 
 ### 7.3 Trạng thái đang tải theo từng vùng
 Hiện chỉ có một dòng ở thanh trạng thái. Danh sách, inspector và sidebar cần

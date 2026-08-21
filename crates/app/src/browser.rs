@@ -346,6 +346,13 @@ pub struct Browser {
     prompt: Option<Prompt>,
     prompt_text: String,
     selection: HashSet<String>,
+    /// Which row the keyboard is sitting on, held as an object key rather than
+    /// a row number: filtering and sorting renumber the rows, and a cursor that
+    /// silently slides onto a different file when the filter changes is worse
+    /// than no cursor at all.
+    cursor: Option<String>,
+    /// Where a Shift-range started. A key too, and for the same reason.
+    anchor: Option<String>,
 
     scroll: UniformListScrollHandle,
     status: SharedString,
@@ -370,6 +377,9 @@ pub struct Browser {
     palette: Option<String>,
     /// Which row the palette has highlighted.
     palette_selected: usize,
+    /// The palette's own scroll handle. Same mechanism as the object list, so
+    /// arrow keys scroll the highlighted row into view in both places.
+    palette_scroll: UniformListScrollHandle,
     /// The share panel: which key it is for, and the URL once it exists.
     share: Option<Share>,
     inspector: Option<Inspection>,
@@ -470,6 +480,8 @@ impl Browser {
             prompt: None,
             prompt_text: String::new(),
             selection: HashSet::new(),
+            cursor: None,
+            anchor: None,
             scroll: UniformListScrollHandle::new(),
             status: "Chọn một profile để bắt đầu".into(),
             error: None,
@@ -484,6 +496,7 @@ impl Browser {
             sso: None,
             palette: None,
             palette_selected: 0,
+            palette_scroll: UniformListScrollHandle::new(),
             share: None,
             inspector: None,
             bucket_versioned: false,
@@ -664,6 +677,8 @@ impl Browser {
         self.entries.clear();
         self.visible.clear();
         self.selection.clear();
+        self.cursor = None;
+        self.anchor = None;
         self.continuation = None;
         self.loading = true;
         self.error = None;
@@ -781,6 +796,116 @@ impl Browser {
             return;
         }
         self.open(bucket, parent, cx);
+    }
+
+    // ------------------------------------------------------ keyboard cursor
+
+    /// The cursor's row number, if the key it names is still on screen. `None`
+    /// after a filter hides it, which is why every caller has to cope with it.
+    fn cursor_position(&self) -> Option<usize> {
+        let cursor = self.cursor.as_deref()?;
+        self.row_of(cursor)
+    }
+
+    fn row_of(&self, key: &str) -> Option<usize> {
+        self.visible
+            .iter()
+            .position(|&index| self.entries[index].key == key)
+    }
+
+    /// Moves the cursor one row and takes the selection with it.
+    fn move_cursor(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        if self.visible.is_empty() {
+            return;
+        }
+        let last = self.visible.len() - 1;
+        let next = match self.cursor_position() {
+            // Nothing under the cursor yet — the first press lands on the end
+            // the key points at rather than moving from a position we do not
+            // have.
+            None => {
+                if down {
+                    0
+                } else {
+                    last
+                }
+            }
+            // Clamped, not wrapping: jumping from the last row back to the
+            // first reads as the selection vanishing rather than as movement.
+            Some(current) if down => (current + 1).min(last),
+            Some(current) => current.saturating_sub(1),
+        };
+        self.place_cursor(next, extend, cx);
+    }
+
+    /// Puts the cursor on a row, updates the selection to match, and scrolls it
+    /// into view.
+    fn place_cursor(&mut self, position: usize, extend: bool, cx: &mut Context<Self>) {
+        let Some(&entry_index) = self.visible.get(position) else {
+            return;
+        };
+        let key = self.entries[entry_index].key.clone();
+        let previous = self.cursor_position();
+
+        if extend {
+            // Without an anchor the first Shift press has nothing to stretch
+            // from, so the range starts where the cursor already was.
+            if self.anchor.is_none() {
+                self.anchor = self.cursor.clone().or_else(|| Some(key.clone()));
+            }
+            self.select_range_to(position);
+        } else {
+            self.selection.clear();
+            self.selection.insert(key.clone());
+            self.anchor = Some(key.clone());
+        }
+        self.cursor = Some(key);
+
+        self.scroll.scroll_to_item(
+            position,
+            scroll_edge(previous.is_none_or(|old| position >= old)),
+        );
+        cx.notify();
+    }
+
+    /// Selects every row between the anchor and `position`, replacing what was
+    /// selected rather than adding to it: a Shift-range is one contiguous run,
+    /// so shrinking it back has to actually deselect.
+    fn select_range_to(&mut self, position: usize) {
+        let anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|key| self.row_of(key))
+            .unwrap_or(position);
+        let (low, high) = if anchor <= position {
+            (anchor, position)
+        } else {
+            (position, anchor)
+        };
+
+        self.selection.clear();
+        for row in low..=high {
+            if let Some(&index) = self.visible.get(row) {
+                self.selection.insert(self.entries[index].key.clone());
+            }
+        }
+    }
+
+    /// What Enter does: a folder opens, a file previews. The same two outcomes
+    /// as double-clicking, on purpose — one gesture should not reach somewhere
+    /// the other cannot.
+    fn open_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(position) = self.cursor_position() else {
+            return;
+        };
+        let Some(&entry_index) = self.visible.get(position) else {
+            return;
+        };
+        if self.entries[entry_index].is_folder {
+            self.enter(entry_index, cx);
+        } else {
+            self.quick_look(cx);
+        }
     }
 
     /// `photos/2026/` → [("photos", "photos/"), ("2026", "photos/2026/")]
@@ -2649,11 +2774,15 @@ impl Browser {
                     // wrapping past the end reads as the selection vanishing.
                     self.palette_selected =
                         (self.palette_selected + 1).min(matches.len().saturating_sub(1));
+                    self.palette_scroll
+                        .scroll_to_item(self.palette_selected, scroll_edge(true));
                     cx.notify();
                     return;
                 }
                 "up" => {
                     self.palette_selected = self.palette_selected.saturating_sub(1);
+                    self.palette_scroll
+                        .scroll_to_item(self.palette_selected, scroll_edge(false));
                     cx.notify();
                     return;
                 }
@@ -2662,6 +2791,8 @@ impl Browser {
                     query.pop();
                     self.palette = Some(query);
                     self.palette_selected = 0;
+                    self.palette_scroll
+                        .scroll_to_item(0, gpui::ScrollStrategy::Top);
                     cx.notify();
                     return;
                 }
@@ -2670,6 +2801,8 @@ impl Browser {
                         if !text.is_empty() && !text.chars().any(char::is_control) {
                             self.palette = Some(format!("{query}{text}"));
                             self.palette_selected = 0;
+                            self.palette_scroll
+                                .scroll_to_item(0, gpui::ScrollStrategy::Top);
                             cx.notify();
                         }
                     }
@@ -2724,6 +2857,27 @@ impl Browser {
             return self.quick_look(cx);
         }
 
+        // Plain Enter and Backspace only: the modified forms are taken above,
+        // by rename and by delete, and reaching them from here would fire both.
+        if self.prompt.is_none() && !primary {
+            match keystroke.key.as_str() {
+                "enter" => return self.open_cursor(cx),
+                "backspace" => return self.go_up(cx),
+                _ => {}
+            }
+        }
+
+        // Arrows work whether or not a filter is being typed: they produce no
+        // character, so narrowing the list and then walking it is one gesture
+        // rather than two modes.
+        if !primary {
+            match keystroke.key.as_str() {
+                "down" => return self.move_cursor(true, keystroke.modifiers.shift, cx),
+                "up" => return self.move_cursor(false, keystroke.modifiers.shift, cx),
+                _ => {}
+            }
+        }
+
         if self.prompt.is_some() {
             match keystroke.key.as_str() {
                 "escape" => return self.cancel_prompt(cx),
@@ -2760,19 +2914,36 @@ impl Browser {
         }
     }
 
-    fn click_row(&mut self, entry_index: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.get(entry_index) else {
+    /// Takes a row number rather than an index into `entries`, because a
+    /// Shift-range is a run of rows on screen and the two numbering schemes
+    /// diverge the moment a filter is on.
+    fn click_row(&mut self, position: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
+        let Some(&entry_index) = self.visible.get(position) else {
             return;
         };
-        let key = entry.key.clone();
+        let key = self.entries[entry_index].key.clone();
 
-        if is_primary(&modifiers) {
-            if !self.selection.remove(&key) {
-                self.selection.insert(key);
+        if modifiers.shift {
+            // The mouse half of Shift-arrow. Without it a range could only ever
+            // be built one row at a time from the keyboard.
+            if self.anchor.is_none() {
+                self.anchor = self.cursor.clone().or_else(|| Some(key.clone()));
             }
+            self.select_range_to(position);
+            self.cursor = Some(key);
+        } else if is_primary(&modifiers) {
+            if !self.selection.remove(&key) {
+                self.selection.insert(key.clone());
+            }
+            // The cursor follows the click either way, so arrow keys carry on
+            // from what was just touched instead of from wherever they left off.
+            self.cursor = Some(key.clone());
+            self.anchor = Some(key);
         } else {
             self.selection.clear();
-            self.selection.insert(key);
+            self.selection.insert(key.clone());
+            self.cursor = Some(key.clone());
+            self.anchor = Some(key);
         }
         cx.notify();
     }
@@ -3231,6 +3402,7 @@ impl Browser {
                         let entry_index = this.visible[position];
                         let entry = &this.entries[entry_index];
                         let selected = this.selection.contains(&entry.key);
+                        let is_cursor = this.cursor.as_deref() == Some(entry.key.as_str());
                         let is_folder = entry.is_folder;
 
                         let thumbnail = this
@@ -3242,14 +3414,25 @@ impl Browser {
                         // clipboard, so it is decided per row rather than once.
                         let single = this.selection.len() <= 1;
                         let can_paste = this.clipboard.is_some();
-                        object_row(position, entry, selected, thumbnail, theme).on_click(cx.listener(
+                        object_row(position, entry, selected, is_cursor, thumbnail, theme)
+                            .on_click(cx.listener(
                             move |this, event: &ClickEvent, _window, cx| {
                                 // gpui 0.2.2 has no `on_double_click`, but the click
                                 // event carries the count, so both gestures live here.
-                                if is_folder && click_count(event) >= 2 {
-                                    this.enter(entry_index, cx);
+                                if click_count(event) >= 2 {
+                                    // Selecting first means the preview and the
+                                    // inspector act on the row just opened.
+                                    this.click_row(position, event.modifiers(), cx);
+                                    if is_folder {
+                                        this.enter(entry_index, cx);
+                                    } else {
+                                        // A double-clicked file used to do
+                                        // nothing but select, which no file
+                                        // manager does.
+                                        this.quick_look(cx);
+                                    }
                                 } else {
-                                    this.click_row(entry_index, event.modifiers(), cx);
+                                    this.click_row(position, event.modifiers(), cx);
                                 }
                             },
                         ))
@@ -4303,7 +4486,6 @@ impl Browser {
         let query = self.palette.as_ref()?;
         let theme = self.theme;
         let matches = self.palette_matches();
-        let selected = self.palette_selected;
 
         Some(
             div()
@@ -4349,39 +4531,6 @@ impl Browser {
                             div()
                                 .id("palette-list")
                                 .flex_1()
-                                // Scrollable: without it the commands past the
-                                // fold were unreachable, and the last visible
-                                // row was sliced through the middle.
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .children(matches.iter().enumerate().map(|(ix, command)| {
-                                    let (label, shortcut) = command.label();
-                                    let command = *command;
-                                    div()
-                                        .id(("cmd", ix))
-                                        .h(px(HEADER_HEIGHT))
-                                        .px_3()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_xs()
-                                        .when(ix == selected, |row| row.bg(theme.selected))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .text_color(theme.text)
-                                                .child(label),
-                                        )
-                                        .child(
-                                            div().text_color(theme.text_faint).child(shortcut),
-                                        )
-                                        .on_click(cx.listener(
-                                            move |this, _event, window, cx| {
-                                                this.run_command(command, Some(window), cx)
-                                            },
-                                        ))
-                                }))
                                 .when(matches.is_empty(), |this| {
                                     this.child(
                                         div()
@@ -4389,6 +4538,54 @@ impl Browser {
                                             .text_xs()
                                             .text_color(theme.text_faint)
                                             .child("Không có lệnh nào khớp"),
+                                    )
+                                })
+                                // A uniform list rather than a scrolling div,
+                                // so the same `scroll_to_item` that follows the
+                                // cursor in the object list follows the
+                                // highlight here. The div scrolled, but nothing
+                                // could tell it where to go, so arrowing past
+                                // the fold walked the highlight off screen.
+                                .when(!matches.is_empty(), |this| {
+                                    this.child(
+                                        uniform_list(
+                                            "palette-rows",
+                                            matches.len(),
+                                            cx.processor(
+                                                move |this: &mut Self,
+                                                      range: Range<usize>,
+                                                      _window,
+                                                      cx| {
+                                                    let matches = this.palette_matches();
+                                                    let selected = this.palette_selected;
+                                                    let theme = this.theme;
+                                                    range
+                                                        .filter_map(|ix| {
+                                                            let command = *matches.get(ix)?;
+                                                            Some(
+                                                                palette_row(
+                                                                    ix,
+                                                                    command,
+                                                                    ix == selected,
+                                                                    theme,
+                                                                )
+                                                                .on_click(cx.listener(
+                                                                    move |this, _event, window, cx| {
+                                                                        this.run_command(
+                                                                            command,
+                                                                            Some(window),
+                                                                            cx,
+                                                                        )
+                                                                    },
+                                                                )),
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                },
+                                            ),
+                                        )
+                                        .track_scroll(self.palette_scroll.clone())
+                                        .h_full(),
                                     )
                                 }),
                         ),
@@ -5026,6 +5223,7 @@ fn object_row(
     position: usize,
     entry: &Entry,
     selected: bool,
+    cursor: bool,
     thumbnail: Option<std::sync::Arc<gpui::Image>>,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
@@ -5052,6 +5250,16 @@ fn object_row(
         .gap_2()
         .text_sm()
         .cursor_pointer()
+        // Every row carries the bar so that turning it on does not shift the
+        // text sideways; only the cursor row gets a colour. Selection alone is
+        // not enough to show it — ⌘-clicking selects rows the cursor is not on,
+        // and the next arrow key moves from the cursor, not from the click.
+        .border_l_2()
+        .border_color(if cursor {
+            theme.accent
+        } else {
+            gpui::transparent_black()
+        })
         .when(selected, |this| this.bg(theme.selected))
         .hover(|this| this.bg(theme.hover))
         .child(
@@ -5099,6 +5307,48 @@ fn object_row(
 /// Bandwidth presets the drawer button cycles through, in bytes per second.
 /// Zero is unlimited and comes last, so one more click always gets back to it.
 const BANDWIDTH_PRESETS: [u64; 4] = [1_000_000, 5_000_000, 20_000_000, 0];
+
+/// Which end of the viewport to align a row against when scrolling it into
+/// view.
+///
+/// gpui's non-strict `scroll_to_item` has no "nearest" strategy: once the row
+/// is off screen it aligns to whichever end the strategy names, so naming the
+/// wrong one turns a one-row step into a full-page jump — arrowing down with
+/// `Top` throws the row to the top of the list and everything under it out of
+/// sight. The direction of travel picks the end, and then the minimal
+/// adjustment and the strategy agree on the same one-row scroll.
+fn scroll_edge(down: bool) -> gpui::ScrollStrategy {
+    if down {
+        gpui::ScrollStrategy::Bottom
+    } else {
+        gpui::ScrollStrategy::Top
+    }
+}
+
+/// One command in the palette. Pulled out of the render so the uniform list's
+/// processor stays readable.
+fn palette_row(
+    position: usize,
+    command: Command,
+    selected: bool,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let (label, shortcut) = command.label();
+    div()
+        .id(position)
+        .h(px(HEADER_HEIGHT))
+        .w_full()
+        .px_3()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .cursor_pointer()
+        .when(selected, |row| row.bg(theme.selected))
+        .hover(|row| row.bg(theme.hover))
+        .child(div().flex_1().text_color(theme.text).child(label))
+        .child(div().text_color(theme.text_faint).child(shortcut))
+}
 
 fn bandwidth_label(limit: u64) -> String {
     if limit == 0 {
@@ -5700,6 +5950,8 @@ mod tests {
             prompt: None,
             prompt_text: String::new(),
             selection: HashSet::new(),
+            cursor: None,
+            anchor: None,
             scroll: UniformListScrollHandle::new(),
             status: "test".into(),
             error: None,
@@ -5714,6 +5966,7 @@ mod tests {
             sso: None,
             palette: None,
             palette_selected: 0,
+            palette_scroll: UniformListScrollHandle::new(),
             share: None,
             inspector: None,
             bucket_versioned: false,
@@ -5787,6 +6040,229 @@ mod tests {
             browser.resort_and_filter();
             assert_eq!(browser.visible.len(), 3, "clearing restores every row");
         });
+    }
+
+    /// The row names in cursor order, so a test can say what is where without
+    /// reaching through two levels of indices every time.
+    fn row_names(browser: &Browser) -> Vec<&str> {
+        browser
+            .visible
+            .iter()
+            .map(|&ix| browser.entries[ix].name.as_str())
+            .collect()
+    }
+
+    fn selected_names(browser: &Browser) -> Vec<&str> {
+        let mut names: Vec<_> = browser
+            .visible
+            .iter()
+            .map(|&ix| &browser.entries[ix])
+            .filter(|entry| browser.selection.contains(&entry.key))
+            .map(|entry| entry.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[gpui::test]
+    fn arrows_walk_the_rows_and_stop_at_both_ends(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("alpha.txt", false, 1),
+                    entry("beta.txt", false, 2),
+                    entry("gamma.txt", false, 3),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            assert_eq!(row_names(browser), vec!["alpha.txt", "beta.txt", "gamma.txt"]);
+            // Nothing under the cursor yet: the first press has to land
+            // somewhere rather than move from a position we do not have.
+            assert_eq!(browser.cursor_position(), None);
+
+            browser.move_cursor(true, false, cx);
+            assert_eq!(browser.cursor_position(), Some(0));
+            browser.move_cursor(true, false, cx);
+            assert_eq!(browser.cursor_position(), Some(1));
+
+            // The selection travels with the cursor, and only the cursor row
+            // stays selected — an arrow key is a move, not an addition.
+            assert_eq!(selected_names(browser), vec!["beta.txt"]);
+
+            browser.move_cursor(true, false, cx);
+            browser.move_cursor(true, false, cx);
+            // Clamped, not wrapping: landing back on the first row after the
+            // last one reads as the selection disappearing.
+            assert_eq!(browser.cursor_position(), Some(2));
+
+            browser.move_cursor(false, false, cx);
+            browser.move_cursor(false, false, cx);
+            browser.move_cursor(false, false, cx);
+            assert_eq!(browser.cursor_position(), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn the_first_press_upwards_starts_at_the_bottom(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![entry("a.txt", false, 1), entry("b.txt", false, 2)],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            // Starting at the top for an upward press would mean the key did
+            // nothing visible on a list nobody has touched yet.
+            browser.move_cursor(false, false, cx);
+            assert_eq!(browser.cursor_position(), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn shift_stretches_one_run_and_shrinking_it_deselects(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("a.txt", false, 1),
+                    entry("b.txt", false, 2),
+                    entry("c.txt", false, 3),
+                    entry("d.txt", false, 4),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            browser.move_cursor(true, false, cx);
+            browser.move_cursor(true, false, cx);
+            assert_eq!(selected_names(browser), vec!["b.txt"]);
+
+            browser.move_cursor(true, true, cx);
+            browser.move_cursor(true, true, cx);
+            assert_eq!(selected_names(browser), vec!["b.txt", "c.txt", "d.txt"]);
+
+            // Coming back has to actually deselect. A range that only ever
+            // grows would leave rows selected that are no longer in it, and the
+            // next delete would take them along.
+            browser.move_cursor(false, true, cx);
+            assert_eq!(selected_names(browser), vec!["b.txt", "c.txt"]);
+
+            // Past the anchor the run flips direction rather than emptying.
+            browser.move_cursor(false, true, cx);
+            browser.move_cursor(false, true, cx);
+            assert_eq!(selected_names(browser), vec!["a.txt", "b.txt"]);
+        });
+    }
+
+    #[gpui::test]
+    fn a_plain_arrow_after_a_range_collapses_it(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("a.txt", false, 1),
+                    entry("b.txt", false, 2),
+                    entry("c.txt", false, 3),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            browser.move_cursor(true, false, cx);
+            browser.move_cursor(true, true, cx);
+            assert_eq!(selected_names(browser), vec!["a.txt", "b.txt"]);
+
+            // Letting go of Shift and pressing again starts a new selection;
+            // the old anchor must not keep stretching a run behind it.
+            browser.move_cursor(true, false, cx);
+            assert_eq!(selected_names(browser), vec!["c.txt"]);
+            browser.move_cursor(false, true, cx);
+            assert_eq!(selected_names(browser), vec!["b.txt", "c.txt"]);
+        });
+    }
+
+    #[gpui::test]
+    fn the_cursor_stays_on_its_file_when_the_rows_are_renumbered(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("apple.txt", false, 1),
+                    entry("report.txt", false, 2),
+                    entry("zebra.txt", false, 3),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            browser.move_cursor(true, false, cx);
+            browser.move_cursor(true, false, cx);
+            assert_eq!(browser.cursor.as_deref(), Some("report.txt"));
+            assert_eq!(browser.cursor_position(), Some(1));
+
+            // Filtering renumbers the rows. Holding a row number here would
+            // slide the cursor onto a different file without anyone touching a
+            // key, and the next Enter would open the wrong thing.
+            browser.filter = "rep".into();
+            browser.resort_and_filter();
+            assert_eq!(row_names(browser), vec!["report.txt"]);
+            assert_eq!(browser.cursor_position(), Some(0));
+            assert_eq!(browser.cursor.as_deref(), Some("report.txt"));
+
+            // Filtered out entirely, the cursor has no row. That is not an
+            // error; the next press starts from an end again.
+            browser.filter = "zeb".into();
+            browser.resort_and_filter();
+            assert_eq!(browser.cursor_position(), None);
+            browser.move_cursor(true, false, cx);
+            assert_eq!(browser.cursor.as_deref(), Some("zebra.txt"));
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_moves_the_cursor_so_arrows_carry_on_from_there(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("a.txt", false, 1),
+                    entry("b.txt", false, 2),
+                    entry("c.txt", false, 3),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            browser.click_row(2, Modifiers::default(), cx);
+            assert_eq!(browser.cursor.as_deref(), Some("c.txt"));
+
+            // The whole point: the keyboard picks up where the mouse left off
+            // rather than from wherever it last was.
+            browser.move_cursor(false, false, cx);
+            assert_eq!(selected_names(browser), vec!["b.txt"]);
+
+            // Shift-click is the mouse half of the same range mechanism.
+            browser.click_row(0, Modifiers::shift(), cx);
+            assert_eq!(selected_names(browser), vec!["a.txt", "b.txt"]);
+        });
+    }
+
+    #[test]
+    fn scrolling_aligns_to_the_end_being_moved_toward() {
+        // gpui has no "nearest" strategy, so the direction of travel has to
+        // pick the end. Getting it backwards is not a subtle wrongness: the row
+        // arrowed onto is thrown to the far edge and a one-row step scrolls a
+        // whole page.
+        assert_eq!(scroll_edge(true), gpui::ScrollStrategy::Bottom);
+        assert_eq!(scroll_edge(false), gpui::ScrollStrategy::Top);
     }
 
     #[gpui::test]
