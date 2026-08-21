@@ -8199,6 +8199,8 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
+        sync_component_theme(theme_mode(self.settings.theme, self.appearance), window, cx);
+
         // The one place that has both a window and the current location. Not
         // while it has focus: overwriting what someone is halfway through
         // typing is worse than a box that lags a navigation they did not make.
@@ -9514,10 +9516,33 @@ fn row_action(
 
 /// The palette to paint: the setting when it names one, the system otherwise.
 fn theme_for(choice: ThemeChoice, appearance: gpui::WindowAppearance, chrome: Chrome) -> Theme {
+    match theme_mode(choice, appearance) {
+        crate::theme::Mode::Light => Theme::new(crate::theme::Mode::Light, chrome),
+        crate::theme::Mode::Dark => Theme::new(crate::theme::Mode::Dark, chrome),
+    }
+}
+
+fn theme_mode(choice: ThemeChoice, appearance: gpui::WindowAppearance) -> crate::theme::Mode {
     match choice {
-        ThemeChoice::System => Theme::from_window(appearance, chrome),
-        ThemeChoice::Light => Theme::new(crate::theme::Mode::Light, chrome),
-        ThemeChoice::Dark => Theme::new(crate::theme::Mode::Dark, chrome),
+        ThemeChoice::System => crate::theme::Mode::from_appearance(appearance),
+        ThemeChoice::Light => crate::theme::Mode::Light,
+        ThemeChoice::Dark => crate::theme::Mode::Dark,
+    }
+}
+
+/// Puts the component library on the same side of light and dark as the app.
+///
+/// It keeps its own palette for the widgets it draws — inputs, menus, the
+/// select — and nothing was ever telling it which one to use. So the text
+/// fields stayed dark while everything around them turned light: a black box
+/// with white text in the middle of a white toolbar.
+fn sync_component_theme(mode: crate::theme::Mode, window: &mut Window, cx: &mut App) {
+    let mode = match mode {
+        crate::theme::Mode::Light => gpui_component::ThemeMode::Light,
+        crate::theme::Mode::Dark => gpui_component::ThemeMode::Dark,
+    };
+    if gpui_component::Theme::global(cx).mode != mode {
+        gpui_component::Theme::change(mode, Some(window), cx);
     }
 }
 

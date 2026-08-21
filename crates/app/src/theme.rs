@@ -89,8 +89,14 @@ impl Theme {
             Mode::Light => Self {
                 // Off-white, not pure white: a full-white ground under a full
                 // white panel leaves the panel invisible.
+                // Nearly opaque, unlike the dark ground's 86%. A translucent
+                // light surface sits over whatever the desktop happens to be,
+                // and most desktops are darker than it — at 78% the whole window
+                // came out a muddy grey and only the opaque dialogs looked
+                // right. Dark mode hid this because a dark ground over a dark
+                // desktop is still dark.
                 ground: if chrome.is_glass() {
-                    rgba(0xf7f8f9c7).into()
+                    rgba(0xf7f8f9f5).into()
                 } else {
                     rgb(0xf7f8f9).into()
                 },
@@ -117,9 +123,6 @@ impl Theme {
         }
     }
 
-    pub fn from_window(appearance: WindowAppearance, chrome: Chrome) -> Self {
-        Self::new(Mode::from_appearance(appearance), chrome)
-    }
 }
 
 #[cfg(test)]
@@ -143,19 +146,31 @@ mod tests {
     #[test]
     fn dialogs_are_opaque_in_both_modes() {
         for chrome in [Chrome::Glass, Chrome::Solid] {
-            for appearance in [WindowAppearance::Dark, WindowAppearance::Light] {
-                let theme = Theme::from_window(appearance, chrome);
+            for mode in [Mode::Dark, Mode::Light] {
+                let theme = Theme::new(mode, chrome);
                 // A dialog floats over content. Any transparency here and the
                 // list underneath reads through the text on top of it.
                 assert_eq!(
                     theme.modal.a, 1.0,
-                    "modal must be opaque for {chrome:?}/{appearance:?}"
+                    "modal must be opaque for {chrome:?}/{mode:?}"
                 );
                 // The panel is deliberately not opaque; if these ever became
                 // the same value the distinction would have been lost.
                 assert!(theme.panel.a < 1.0);
             }
         }
+    }
+
+    #[test]
+    fn a_light_ground_lets_far_less_through_than_a_dark_one() {
+        // The desktop behind the window is whatever the user set, and most of
+        // them are darker than an off-white panel. Dark mode can afford to be
+        // see-through because dark over dark is still dark; light cannot, and
+        // at the alpha dark mode uses the whole window came out muddy grey.
+        let light = Theme::new(Mode::Light, Chrome::Glass).ground.a;
+        let dark = Theme::new(Mode::Dark, Chrome::Glass).ground.a;
+        assert!(light > dark, "light={light} dark={dark}");
+        assert!(light > 0.9, "light ground is too see-through: {light}");
     }
 
     #[test]
