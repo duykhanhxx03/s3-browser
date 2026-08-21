@@ -5625,18 +5625,15 @@ impl Browser {
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().text_sm().text_color(theme.text).child("Gần đây"))
-                    // Beside the title, not stacked under it: the count is the
-                    // same kind of aside as the "5 mục" under the listing, and
-                    // a second line here would make this header taller than the
-                    // toolbar it stands in for.
+                    // No count beside it. The rows are right there to be
+                    // counted, and a number nobody asked for reads as filler.
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .text_xs()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(recent_summary(recent.len()))),
+                            .text_sm()
+                            .text_color(theme.text)
+                            .child("Gần đây"),
                     )
                     .when(!recent.is_empty(), |this| {
                         this.child(
@@ -10081,15 +10078,6 @@ fn type_badge_of(name: &str) -> Option<SharedString> {
     Some(extension.to_uppercase().into())
 }
 
-/// How many places the history page has, in words.
-fn recent_summary(count: usize) -> String {
-    if count == 0 {
-        "Chưa có nơi nào".to_string()
-    } else {
-        format!("{count} nơi đã đi qua")
-    }
-}
-
 /// Which tab a number key selects.
 ///
 /// `9` means the last one rather than the ninth: with three tabs open, ⌘9 has to
@@ -11736,12 +11724,6 @@ mod tests {
         // And what the app *can* draw still gets drawn.
         assert!(matches!(preview_kind("anh.png", None), PreviewKind::Image));
         assert!(matches!(preview_kind("ghi-chu.txt", None), PreviewKind::Text));
-    }
-
-    #[test]
-    fn the_history_page_counts_what_it_is_showing() {
-        assert_eq!(recent_summary(0), "Chưa có nơi nào");
-        assert_eq!(recent_summary(3), "3 nơi đã đi qua");
     }
 
     #[test]
