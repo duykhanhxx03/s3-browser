@@ -23,6 +23,7 @@ use s3core::{
 use transfer::{Job, JobState, TransferEngine};
 use vault::{ProfileStore, StoredProfile};
 
+use crate::failure::{Failure, Fix};
 use crate::platform::{self, Chrome};
 use crate::theme::Theme;
 
@@ -63,6 +64,13 @@ const PROGRESS_HEIGHT: f32 = 4.;
 /// than the bar holding it, so buttons in the same row did not match.
 const BUTTON_HEIGHT: f32 = 22.;
 const SIDEBAR_WIDTH: f32 = 214.;
+/// How many failures to keep. A retry loop against a dead endpoint would grow
+/// the log without bound otherwise, and nobody reads the fiftieth copy.
+const FAILURE_LIMIT: usize = 50;
+/// How much of one provider error the log shows before clipping. Enough for the
+/// sentence that says what happened, not so much that one failure fills the
+/// panel and hides the four behind it.
+const DETAIL_HEIGHT: f32 = 108.;
 /// The filter field. Wide enough for a real file name, narrow enough that the
 /// breadcrumb keeps most of the bar.
 const FILTER_WIDTH: f32 = 196.;
@@ -366,7 +374,16 @@ pub struct Browser {
 
     scroll: UniformListScrollHandle,
     status: SharedString,
-    error: Option<SharedString>,
+    /// Everything that has gone wrong, newest last.
+    ///
+    /// A list rather than one slot: the old single `error` was overwritten by
+    /// whatever failed next, so a burst of failures during a batch delete left
+    /// exactly one of them on screen and no way to reach the rest. Kept until
+    /// dismissed, because an error that clears itself while it is being read is
+    /// an error nobody reads.
+    failures: Vec<Failure>,
+    /// Whether the failure log is open.
+    failures_open: bool,
 
     transfers: TransferEngine,
     drawer_open: bool,
@@ -523,7 +540,8 @@ impl Browser {
             anchor: None,
             scroll: UniformListScrollHandle::new(),
             status: "Chọn một profile để bắt đầu".into(),
-            error: None,
+            failures: Vec::new(),
+            failures_open: false,
             transfers,
             drawer_open: false,
 
@@ -569,13 +587,21 @@ impl Browser {
                 .map(|store| store.save(&self.profiles))
                 .unwrap_or(Ok(())),
         ) {
-            self.error = Some(format!("Không lưu được {}: {error}", store.path().display()).into());
+            self.fail(Failure::known(
+                "Không lưu được danh sách profile",
+                format!("{}: {error}", store.path().display()),
+                None,
+            ));
         }
     }
 
     fn add_profile(&mut self, profile: StoredProfile, secret: &str, cx: &mut Context<Self>) {
         if let Err(error) = vault::set_secret_key(&profile.id, secret) {
-            self.error = Some(format!("Không lưu được khoá bí mật: {error}").into());
+            self.fail(Failure::known(
+                "Không lưu được khoá bí mật vào chuỗi khoá",
+                format!("{error}"),
+                None,
+            ));
             return;
         }
         self.profiles.push(profile);
@@ -605,7 +631,11 @@ impl Browser {
         let secret = match vault::secret_key(&stored.id) {
             Ok(secret) => secret,
             Err(error) => {
-                self.error = Some(format!("Không đọc được khoá bí mật: {error}").into());
+                self.fail(Failure::known(
+                    "Không đọc được khoá bí mật từ chuỗi khoá",
+                    format!("{error}"),
+                    Some(Fix::EditProfile),
+                ));
                 cx.notify();
                 return;
             }
@@ -617,7 +647,6 @@ impl Browser {
         self.bucket = None;
         self.entries.clear();
         self.visible.clear();
-        self.error = None;
         self.connecting = true;
         self.status = format!("Đang kết nối {}…", stored.name).into();
 
@@ -655,10 +684,21 @@ impl Browser {
                             }
                             Err(error) => {
                                 debug_log!("ListBuckets failed: {error}");
-                                // Say what to do next, not just what broke.
-                                this.status =
-                                    "Không liệt kê được bucket. Token có thể chỉ có quyền trên một bucket; bấm + ở BUCKETS để mở theo tên."
-                                        .into();
+                                // The request name goes into the text so the
+                                // classifier can reach the R2 case: a bare 403
+                                // says nothing, `ListBuckets` plus a 403 says
+                                // "bucket-scoped token", which is the setup
+                                // R2's own docs recommend.
+                                //
+                                // `or_fix` and not a fixed answer, because this
+                                // same call site also sees expired keys and
+                                // dead networks, and for those the classifier
+                                // names the real cause. Opening a bucket by
+                                // name is only the fallback.
+                                this.fail(
+                                    Failure::new(format!("ListBuckets: {error:?}"))
+                                        .or_fix(Fix::OpenBucketByName),
+                                );
                                 Vec::new()
                             }
                         };
@@ -676,7 +716,7 @@ impl Browser {
                             }
                         }
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -686,11 +726,50 @@ impl Browser {
         cx.notify();
     }
 
-    /// Surfaces a failure in the status bar and on stderr, so a user who runs
-    /// from a terminal sees it even after the next action clears the bar.
+    /// Classifies a raw provider error and records it.
+    ///
+    /// Callers pass `{error:?}` rather than `{error}` on purpose. `anyhow`'s
+    /// `Display` prints only the outermost context, so `.context("ListBuckets
+    /// failed")` throws away the provider's own words — the very text the
+    /// classifier reads and the only text worth pasting into a support ticket.
+    /// `Debug` keeps the whole chain.
     fn report(&mut self, message: String) {
-        eprintln!("[s3browser] error: {message}");
-        self.error = Some(message.into());
+        self.fail(Failure::new(message));
+    }
+
+    /// Records a failure. Also to stderr, so someone running from a terminal
+    /// has a copy that outlives the window.
+    fn fail(&mut self, failure: Failure) {
+        eprintln!("[s3browser] error: {}", failure.detail);
+        self.failures.push(failure);
+        // A cap, because a retry loop against a dead endpoint would otherwise
+        // grow this without limit. The oldest go first: the newest failure is
+        // the one being looked at.
+        if self.failures.len() > FAILURE_LIMIT {
+            let excess = self.failures.len() - FAILURE_LIMIT;
+            self.failures.drain(..excess);
+        }
+    }
+
+    /// Runs the one repair a failure offers.
+    fn apply_fix(&mut self, fix: Fix, window: &mut Window, cx: &mut Context<Self>) {
+        self.failures_open = false;
+        match fix {
+            Fix::OpenBucketByName => self.open_form(FormKind::OpenBucket, window, cx),
+            Fix::EditProfile => {
+                self.profiles_open = true;
+                cx.notify();
+            }
+            Fix::Retry => match (self.bucket.clone(), self.prefix.clone()) {
+                (Some(bucket), prefix) => self.open(bucket, prefix, cx),
+                // Nothing open yet, so the thing to retry is the connection.
+                (None, _) => {
+                    if let Some(index) = self.active_profile {
+                        self.connect(index, cx);
+                    }
+                }
+            },
+        }
     }
 
     // -------------------------------------------------------------- navigation
@@ -723,7 +802,6 @@ impl Browser {
         self.anchor = None;
         self.continuation = None;
         self.loading = true;
-        self.error = None;
         self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
 
         let listing = Tokio::spawn(cx, async move {
@@ -750,7 +828,7 @@ impl Browser {
                         this.resort_and_filter();
                         this.status = this.listing_summary();
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -807,7 +885,7 @@ impl Browser {
                         this.resort_and_filter();
                         this.status = this.listing_summary();
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -1013,7 +1091,7 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(_)) => this.open(reopen.0, reopen.1, cx),
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -1040,7 +1118,7 @@ impl Browser {
                         this.buckets = buckets.into_iter().map(SharedString::from).collect();
                         this.status = format!("{} bucket", this.buckets.len()).into();
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -1145,7 +1223,7 @@ impl Browser {
                 Ok(Ok(authorization)) => authorization,
                 Ok(Err(error)) => {
                     _ = this.update(cx, |this, cx| {
-                        this.report(format!("{error}"));
+                        this.report(format!("{error:?}"));
                         cx.notify();
                     });
                     return;
@@ -1204,7 +1282,7 @@ impl Browser {
                     }
                     Ok(Err(error)) => {
                         this.sso = None;
-                        this.report(format!("{error}"));
+                        this.report(format!("{error:?}"));
                     }
                     Err(error) => {
                         this.sso = None;
@@ -1263,7 +1341,7 @@ impl Browser {
                         this.sso = None;
                         this.status = "Đã đăng nhập bằng SSO".into();
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -1341,7 +1419,7 @@ impl Browser {
                             None => "Đã nhận role".into(),
                         };
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -1559,6 +1637,10 @@ impl Browser {
                 }
             }
             Command::GoUp => self.go_up(cx),
+            Command::Errors => {
+                self.failures_open = true;
+                cx.notify();
+            }
             Command::Filter => {
                 if let Some(window) = window {
                     self.focus_filter(window, cx);
@@ -1665,19 +1747,23 @@ impl Browser {
                         if report.errors.is_empty() {
                             this.status = format!("Đã xoá {} key", report.deleted).into();
                         } else {
-                            this.error = Some(
-                                format!(
-                                    "Xoá {} key, {} lỗi: {}",
+                            // The whole reason the log holds more than one:
+                            // a batch delete fails per key, and the summary
+                            // has to say how many while the detail keeps
+                            // every one of them.
+                            this.fail(Failure::known(
+                                &format!(
+                                    "Xoá được {} key, {} key lỗi",
                                     report.deleted,
-                                    report.errors.len(),
-                                    report.errors.join("; ")
-                                )
-                                .into(),
-                            );
+                                    report.errors.len()
+                                ),
+                                report.errors.join("\n"),
+                                None,
+                            ));
                         }
                         this.open(reopen.0, reopen.1, cx);
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -1716,7 +1802,7 @@ impl Browser {
                         debug_log!("queued {} uploads", ids.len());
                         this.status = format!("Đã xếp {} tệp vào hàng đợi", ids.len()).into();
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 this.start_ticking(cx);
@@ -1804,7 +1890,7 @@ impl Browser {
                             format!("Đang tải xuống {} tệp", ids.len()).into()
                         }
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 this.start_ticking(cx);
@@ -1896,7 +1982,7 @@ impl Browser {
                             inspector.versions = versions;
                             inspector.acl = acl;
                         }
-                        Ok(Err(error)) => this.report(format!("{error}")),
+                        Ok(Err(error)) => this.report(format!("{error:?}")),
                         Err(error) => this.report(format!("Task lỗi: {error}")),
                     }
                 }
@@ -1961,7 +2047,7 @@ impl Browser {
                             inspector.preview = Some(build_preview(kind, &key_for_format, bytes));
                         }
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2004,7 +2090,7 @@ impl Browser {
                         Ok(()) => this.status = format!("Đã mở {}", path.display()).into(),
                         Err(error) => this.report(format!("Không mở được: {error}")),
                     },
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2068,7 +2154,7 @@ impl Browser {
                         report.errors.len(),
                         report.errors.first().cloned().unwrap_or_default()
                     )),
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 this.open(reopen, String::new(), cx);
@@ -2100,7 +2186,7 @@ impl Browser {
                         this.status = "Đã khôi phục version, bản cũ vẫn còn trong lịch sử".into();
                         this.load_inspection(reload, cx);
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2149,7 +2235,7 @@ impl Browser {
                         this.status = "Đã xoá version".into();
                         this.load_inspection(reload, cx);
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2182,7 +2268,7 @@ impl Browser {
                         this.status = "Đã yêu cầu khôi phục, có thể mất vài giờ".into();
                         this.load_inspection(reload, cx);
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2213,7 +2299,7 @@ impl Browser {
                         this.status = "Đã đổi quyền truy cập".into();
                         this.load_inspection(reload, cx);
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2248,7 +2334,7 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => this.load_inspection(reload, cx),
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2285,7 +2371,7 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => this.load_inspection(reload, cx),
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2347,7 +2433,7 @@ impl Browser {
                             share.url = Some(url.into());
                         }
                     }
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 cx.notify();
@@ -2646,7 +2732,7 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => this.status = format!("Đã sao chép thành {new_name}").into(),
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
@@ -2722,7 +2808,7 @@ impl Browser {
                         errors.len(),
                         errors.first().cloned().unwrap_or_default()
                     )),
-                    Ok(Err(error)) => this.report(format!("{error}")),
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
                 }
                 this.selection.clear();
@@ -3090,6 +3176,184 @@ impl Browser {
             )
     }
 
+    /// The failure log.
+    ///
+    /// Everything that has gone wrong this session, newest first, each with the
+    /// provider's own words underneath and a button where there is one thing to
+    /// do. The status bar can only hold a summary; this is where the rest of it
+    /// lives, and it is reachable by clicking that summary.
+    fn render_failures(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.failures_open {
+            return None;
+        }
+        let theme = self.theme;
+
+        Some(
+            div()
+                .id("failures-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.failures_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("failures-dialog")
+                        .w(px(DIALOG_WIDTH))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .child(div().flex_1().text_color(theme.text).child("Lỗi"))
+                                .child(
+                                    action_button("failures-clear", "Xoá hết", theme).on_click(
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.failures.clear();
+                                            this.failures_open = false;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("failures-list")
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .max_h(px(360.))
+                                .overflow_y_scroll()
+                                // Newest first: the one being asked about is
+                                // almost always the one that just happened.
+                                .children(self.failures.iter().rev().enumerate().map(
+                                    |(index, failure)| {
+                                        div()
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(theme.panel)
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .text_xs()
+                                                            .text_color(theme.danger)
+                                                            .child(failure.summary.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(theme.text_faint)
+                                                            .child(SharedString::from(
+                                                                format_timestamp(failure.at),
+                                                            )),
+                                                    ),
+                                            )
+                                            // The provider's own words, clipped
+                                            // rather than allowed to run: one
+                                            // SDK chain is a dozen lines, and
+                                            // letting it push the buttons below
+                                            // the fold makes the log unusable
+                                            // for the failure that needs it
+                                            // most. The whole thing is one
+                                            // click away on the clipboard.
+                                            .child(
+                                                div()
+                                                    .max_h(px(DETAIL_HEIGHT))
+                                                    .overflow_hidden()
+                                                    // 52, not 64: a 64-character
+                                                    // line does not fit the
+                                                    // panel, so the layout wraps
+                                                    // it again and every line
+                                                    // gets a two-word stub
+                                                    // under it.
+                                                    .child(wrapped_text(
+                                                        &flatten(failure.detail.as_ref()),
+                                                        52,
+                                                        theme.text_muted,
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .when_some(failure.fix, |this, fix| {
+                                                        this.child(
+                                                            action_button_dyn(
+                                                                SharedString::from(format!(
+                                                                    "failure-fix-{index}"
+                                                                )),
+                                                                SharedString::from(fix.label()),
+                                                                theme,
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                move |this, _event, window, cx| {
+                                                                    this.apply_fix(fix, window, cx)
+                                                                },
+                                                            )),
+                                                        )
+                                                    })
+                                                    // The text cannot be
+                                                    // selected with a mouse in
+                                                    // this UI, so without this
+                                                    // the "paste it into a
+                                                    // ticket" story is a story.
+                                                    .child({
+                                                        let detail =
+                                                            failure.detail.to_string();
+                                                        action_button_dyn(
+                                                            SharedString::from(format!(
+                                                                "failure-copy-{index}"
+                                                            )),
+                                                            "Chép chi tiết".into(),
+                                                            theme,
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _event, _window, cx| {
+                                                                this.copy_to_clipboard(
+                                                                    detail.clone(),
+                                                                    "chi tiết lỗi",
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        ))
+                                                    }),
+                                            )
+                                    },
+                                ))
+                                .when(self.failures.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.text_faint)
+                                            .child("Chưa có lỗi nào"),
+                                    )
+                                }),
+                        ),
+                ),
+        )
+    }
+
     fn render_profiles_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.profiles_open {
             return None;
@@ -3332,7 +3596,17 @@ impl Browser {
             return None;
         }
         let theme = self.theme;
-        let cannot_list = self.buckets.is_empty();
+        // Whatever went wrong is why there are no buckets, so the empty area
+        // says that rather than guessing. It used to assert "token có thể chỉ
+        // có quyền trên một bucket" for every failure, which is a confident
+        // lie when the real cause is a wrong key or a dead endpoint.
+        let failure = self
+            .buckets
+            .is_empty()
+            .then(|| self.failures.last())
+            .flatten()
+            .cloned();
+        let has_failure = failure.is_some();
 
         Some(
             div()
@@ -3342,37 +3616,68 @@ impl Browser {
                 .items_center()
                 .justify_center()
                 .gap_3()
+                .child(div().text_color(theme.text).child(match &failure {
+                    Some(failure) => failure.summary.clone(),
+                    None => SharedString::from("Chọn một bucket"),
+                }))
+                // Not the raw error here. The provider's chain runs for eight
+                // lines and buries its one useful sentence in the middle, which
+                // is a wall to be scrolled past rather than something to read.
+                // The summary above says what happened; the panel keeps the
+                // rest for whoever needs to paste it somewhere.
+                .child(div().max_w(px(440.)).text_xs().child(wrapped_text(
+                    match &failure {
+                        Some(_) => "Bấm Xem lỗi để đọc nguyên văn từ provider.",
+                        None => "Chọn ở cột bên trái.",
+                    },
+                    56,
+                    theme.text_muted,
+                )))
                 .child(
                     div()
-                        .text_color(theme.text)
-                        .child(if cannot_list {
-                            "Không liệt kê được bucket"
-                        } else {
-                            "Chọn một bucket"
-                        }),
-                )
-                .child(
-                    div()
-                        .max_w(px(440.))
-                        .text_xs()
-                        .child(wrapped_text(
-                            if cannot_list {
-                                // Naming the likely cause separates this from
-                                // wrong credentials, which look identical.
-                                "Token có thể chỉ có quyền trên một bucket."
-                            } else {
-                                "Chọn ở cột bên trái."
+                        .flex()
+                        .gap_2()
+                        // Skipping `OpenBucketByName`: the button below already
+                        // is that, and two identical buttons side by side reads
+                        // as a rendering fault.
+                        .when_some(
+                            failure
+                                .and_then(|failure| failure.fix)
+                                .filter(|fix| *fix != Fix::OpenBucketByName),
+                            |this, fix| {
+                            this.child(
+                                action_button_dyn(
+                                    "empty-fix".into(),
+                                    SharedString::from(fix.label()),
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _event, window, cx| {
+                                        this.apply_fix(fix, window, cx)
+                                    },
+                                )),
+                            )
                             },
-                            48,
-                            theme.text_muted,
-                        )),
-                )
-                .child(
-                    action_button("empty-open-bucket", "Mở bucket theo tên", theme).on_click(
-                        cx.listener(|this, _event, window, cx| {
-                            this.open_form(FormKind::OpenBucket, window, cx)
+                        )
+                        // Always reachable, whatever the failure was: a bucket
+                        // opened by name works for a scoped token, and does no
+                        // harm when the cause was something else.
+                        .child(
+                            action_button("empty-open-bucket", "Mở bucket theo tên", theme)
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.open_form(FormKind::OpenBucket, window, cx)
+                                })),
+                        )
+                        .when(has_failure, |this| {
+                            this.child(
+                                action_button("empty-errors", "Xem lỗi", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.failures_open = true;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
                         }),
-                    ),
                 ),
         )
     }
@@ -3678,9 +3983,31 @@ impl Browser {
             .bg(theme.panel)
             .border_t_1()
             .border_color(theme.border)
-            .child(match &self.error {
-                Some(error) => div().text_color(theme.danger).child(error.clone()),
-                None => div().text_color(theme.text_muted).child(self.status.clone()),
+            .child(match self.failures.last() {
+                // Clickable, because the summary is one line and the rest of
+                // what went wrong has to be reachable from where it is shown.
+                Some(failure) => div()
+                    .id("failure-chip")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(theme.danger)
+                    .hover(|this| this.bg(theme.hover))
+                    .child(SharedString::from(if self.failures.len() > 1 {
+                        format!("{} ({} lỗi)", failure.summary, self.failures.len())
+                    } else {
+                        failure.summary.to_string()
+                    }))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.failures_open = true;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                None => div()
+                    .text_color(theme.text_muted)
+                    .child(self.status.clone())
+                    .into_any_element(),
             })
             .child(div().flex_1())
             .child(
@@ -4410,9 +4737,12 @@ impl Browser {
                                     )))
                             }),
                         )
-                        .when_some(self.error.clone(), |this, error| {
-                            this.child(div().text_xs().text_color(theme.danger).child(error))
-                        }),
+                        .when_some(
+                            self.failures.last().map(|failure| failure.summary.clone()),
+                            |this, summary| {
+                                this.child(div().text_xs().text_color(theme.danger).child(summary))
+                            },
+                        ),
                 ),
         )
     }
@@ -5057,6 +5387,7 @@ impl Render for Browser {
             .children(self.render_sso(cx))
             .children(self.render_form(cx))
             .children(self.render_profiles_dialog(cx))
+            .children(self.render_failures(cx))
     }
 }
 
@@ -5811,6 +6142,16 @@ fn wrap_words(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// A block of text wrapped at word boundaries, one element per line.
+/// Collapses a multi-line error into one paragraph, for display only.
+///
+/// `anyhow`'s `Debug` output is already broken into indented `Caused by:`
+/// lines. Re-wrapping that at a column produces a line of prose followed by a
+/// stub of three words, over and over, which looks like a rendering fault. What
+/// gets copied to the clipboard stays exactly as the provider wrote it.
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn wrapped_text(text: &str, max_chars: usize, color: gpui::Hsla) -> impl IntoElement {
     div()
         .flex()
@@ -5883,6 +6224,9 @@ fn validate_profile(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Refresh,
+    /// Opens the failure log. Also reachable by clicking the summary in the
+    /// status bar, but that one is only there while something has gone wrong.
+    Errors,
     GoUp,
     Filter,
     NewFolder,
@@ -5914,6 +6258,7 @@ impl Command {
             Command::Refresh => ("Tải lại", "⌘R"),
             Command::GoUp => ("Lên một cấp", "⌘↑"),
             Command::Filter => ("Lọc", "⌘F"),
+            Command::Errors => ("Xem lỗi", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -5936,7 +6281,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 22] {
+    fn all() -> [Command; 23] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -5960,6 +6305,7 @@ impl Command {
             Command::AssumeRole,
             Command::SsoSignIn,
             Command::NewProfile,
+            Command::Errors,
         ]
     }
 }
@@ -6187,7 +6533,8 @@ mod tests {
             anchor: None,
             scroll: UniformListScrollHandle::new(),
             status: "test".into(),
-            error: None,
+            failures: Vec::new(),
+            failures_open: false,
             transfers: TransferEngine::in_memory().expect("in-memory queue"),
             drawer_open: false,
 
@@ -6643,6 +6990,21 @@ mod tests {
     }
 
     #[test]
+    fn flattening_makes_one_paragraph_of_a_cause_chain() {
+        // What `anyhow` prints: a message, then indented `Caused by:` lines.
+        // Re-wrapping that at a column leaves a stub after every original line
+        // break, which reads as a broken renderer rather than as an error.
+        let raw = "ListBuckets failed\n\nCaused by:\n    0: service error\n    1: bad key";
+        assert_eq!(
+            flatten(raw),
+            "ListBuckets failed Caused by: 0: service error 1: bad key"
+        );
+        // Already one line: nothing to do, and no trailing space either.
+        assert_eq!(flatten("một dòng"), "một dòng");
+        assert_eq!(flatten("  thừa   khoảng trắng  "), "thừa khoảng trắng");
+    }
+
+    #[test]
     fn wrapping_never_splits_a_word() {
         // The bug this exists for: gpui breaks before any non-ASCII character,
         // turning "cấp" into "c" / "ấp". Every line here must be whole words.
@@ -6809,7 +7171,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 22);
+        assert_eq!(all.len(), 23);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

@@ -377,10 +377,32 @@ lại từ bên ngoài khung hình, ở bước đầu của task.
 không khớp, và dòng "Đang tải thêm…" khi sang trang. Riêng placeholder của
 inspector thì chưa thấy chạy.
 
-### 7.4 Thông báo lỗi thao tác được
-Lỗi hiện là chữ đỏ ở đáy màn hình, không thao tác được và tự biến mất khi có
-thông báo sau. Cần giữ lại, cho phép xem chi tiết, và với lỗi có cách sửa rõ
-ràng thì kèm luôn nút — như ca token R2 không liệt kê được bucket.
+### 7.4 Thông báo lỗi thao tác được — xong
+Một lỗi giờ tách làm ba phần: **tóm tắt** nói bằng tiếng người, **nguyên văn**
+giữ đúng lời provider vì đó mới là thứ dán vào ticket, và **nút sửa** chỉ có ở
+những ca thật sự có đúng một việc để làm.
+
+Giữ cả danh sách chứ không một ô: một lượt xoá hàng loạt lỗi theo từng key, ô đơn
+thì chỉ còn đúng một lỗi trên màn hình và không có đường tới những cái còn lại.
+Không tự xoá khi điều hướng — lỗi tự biến mất trong lúc đang đọc là lỗi không ai
+đọc được.
+
+Phân loại nằm ở `crates/app/src/failure.rs`, thuần và có test. Ba nhóm phải tách
+bạch: khoá sai (sửa profile), không đủ quyền (không có nút, vì thiếu quyền gì thì
+tuỳ request mà đoán bừa là chỉ người ta đi sửa cái đang đúng), và mạng hoặc bị
+chặn tốc độ (thử lại). Không nhận ra thì giữ nguyên lời provider chứ không bịa
+một câu thân thiện.
+
+Một lỗi có sẵn lộ ra khi làm: mọi chỗ đều dùng `{error}`, mà `Display` của
+`anyhow` chỉ in lớp context ngoài cùng, nên `.context("ListBuckets failed")` vứt
+mất nguyên văn của provider. Đổi hết sang `{error:?}`. Trước khi đổi, một khoá
+sai bị báo thành "token không có quyền liệt kê bucket".
+
+Khu trống ở giữa cũng thôi đoán: trước nó khẳng định "token có thể chỉ có quyền
+trên một bucket" cho mọi lỗi, giờ nó nói đúng cái vừa hỏng và kèm nút.
+
+Đã xem tận mắt: khoá sai cho ra "Khoá truy cập không đúng" kèm nút Sửa profile,
+bảng nhật ký mở được từ command palette, có nguyên văn cắt gọn và nút chép.
 
 ### 7.5 Tìm kiếm file và bucket
 Bộ lọc hiện chỉ lọc trang đang tải. Tìm kiếm thật phải quét theo prefix trên

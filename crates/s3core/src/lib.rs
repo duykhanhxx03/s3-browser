@@ -1776,7 +1776,9 @@ pub fn detect_local_offset() -> i32 {
         .unwrap_or(0)
 }
 
-fn now_epoch() -> i64 {
+/// Seconds since the Unix epoch. Public because the UI stamps its own events
+/// with it, and two clocks would eventually disagree.
+pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

@@ -9,6 +9,7 @@
 mod assets;
 mod browser;
 mod crash;
+mod failure;
 #[cfg(target_os = "macos")]
 mod glass_check;
 mod platform;
