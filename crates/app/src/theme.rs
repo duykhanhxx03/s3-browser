@@ -57,36 +57,17 @@ pub struct Theme {
 
 /// How light falls on a floating pane of glass, per mode.
 ///
-/// gpui has no per-element backdrop blur and no shader hook, so real
-/// refraction is off the table — and this file's own tests forbid translucent
-/// dialogs, because without a blur behind them the content underneath reads
-/// straight through the text. What *can* be computed is the lighting: a pane
-/// of glass under a key light from above shows a bright top rim, a soft sheen
-/// down its face, a shaded thickness at its bottom edge, and it throws a deep
-/// soft shadow. Each of those is one cheap layer, and every value derives from
-/// one question — which way round are ground and light in this mode.
+/// The pane itself — capture, blur, refraction, edge lighting — lives in the
+/// forked renderer's glass shader, computed on the rounded-rect SDF. What
+/// stays here is only what a shader cannot own: the hairline rim, the drop
+/// shadow, and how frosted the pane is. Every value still derives from one
+/// question — which way round are ground and light in this mode.
 #[derive(Clone, Copy, Debug)]
 pub struct GlassSpec {
     /// The hairline border. Opposite polarity to the ground: light glass on a
     /// dark ground catches light at its edge, dark-rimmed glass on a light
     /// ground reads as a cut edge.
     pub rim: Hsla,
-    /// A 1px specular line inside the top edge — the key light's reflection.
-    ///
-    /// Zero alpha in light mode, deliberately: a white specular line on a
-    /// white dialog is invisible, and painting it anyway is furniture.
-    pub edge: Hsla,
-    /// The face sheen, drawn as a top-down gradient to transparent.
-    ///
-    /// Zero in light mode, same rule as `edge`: white over a white dialog is
-    /// invisible, and the one trace it *did* leave was wrong — gpui's gradient
-    /// shader interpolates straight (non-premultiplied) RGBA, so white fading
-    /// to transparent black passes through grey, and the "sheen" rendered as a
-    /// faint darkening veil. The opposite sign of light.
-    pub sheen: Hsla,
-    /// The shaded thickness along the bottom inside edge, gradient upward.
-    /// Always dark: glass thickness reads as shade in both modes.
-    pub keel: Hsla,
     /// The drop shadow's colour. Stronger in the dark, where the panel needs
     /// separating from a ground nearly its own colour; light mode gets a
     /// fainter, wider throw because shadows on white read louder per unit of
@@ -107,18 +88,12 @@ impl GlassSpec {
         match mode {
             Mode::Dark => Self {
                 rim: rgba(0xffffff2b).into(),
-                edge: rgba(0xffffff4d).into(),
-                sheen: rgba(0xffffff12).into(),
-                keel: rgba(0x00000038).into(),
                 shadow: rgba(0x00000094).into(),
                 shadow_geometry: (12., 36., -6.),
                 frost: 0.45,
             },
             Mode::Light => Self {
                 rim: rgba(0x1c202426).into(),
-                edge: rgba(0xffffff00).into(),
-                sheen: rgba(0xffffff00).into(),
-                keel: rgba(0x0000000d).into(),
                 shadow: rgba(0x0000004a).into(),
                 shadow_geometry: (14., 44., -8.),
                 frost: 0.52,
@@ -290,22 +265,13 @@ mod tests {
     }
 
     #[test]
-    fn glass_light_falls_from_above_and_actually_paints() {
+    fn glass_is_lit_from_above_and_stays_glass() {
         let dark = GlassSpec::new(Mode::Dark);
         let light = GlassSpec::new(Mode::Light);
 
         for (mode, glass) in [("dark", dark), ("light", light)] {
-            // The sheen is painted *under* the content, so this cap is about
-            // the panel's own face: past it the face reads tinted rather than
-            // lit, and the layer stops being light on glass.
-            assert!(glass.sheen.a <= 0.12, "{mode} sheen too strong");
-            // Thickness reads as shade in both modes — a bright keel would
-            // mean the light comes from below, which nothing else agrees with.
-            assert_eq!(glass.keel.l, 0.0, "{mode} keel must be dark");
-            // And it must actually paint: rgba(0,0,0,0) has l == 0 too, and a
-            // spec of zeroes would pass every cap in this test while drawing
-            // no glass at all. The floors are what make the model real.
-            assert!(glass.keel.a > 0.03, "{mode} keel must be visible");
+            // The rim must actually paint: a spec of zeroes would pass every
+            // cap in this test while drawing no glass at all.
             assert!(glass.rim.a > 0.05, "{mode} rim must be visible");
 
             let (y, blur, spread) = glass.shadow_geometry;
@@ -321,26 +287,16 @@ mod tests {
         assert!(dark.rim.l > 0.9, "dark rim catches light");
         assert!(light.rim.l < 0.2, "light rim reads as a cut edge");
 
-        // The specular layers only exist where they can be seen. White on a
-        // white dialog is invisible, and painting it anyway is furniture — and
-        // in the sheen's case it was worse than furniture: gpui interpolates
-        // gradients in straight alpha, so white-to-transparent-black passes
-        // through grey and the layer rendered as a *darkening* veil.
-        assert!(dark.edge.a > 0.2);
-        assert!(dark.sheen.a > 0.04, "dark sheen is the one that must paint");
-        assert_eq!(light.edge.a, 0.0);
-        assert_eq!(light.sheen.a, 0.0);
-
         // Dark needs the stronger shadow — the panel is nearly the ground's
         // own colour; light gets a wider, fainter throw instead.
         assert!(dark.shadow.a > light.shadow.a);
         assert!(light.shadow_geometry.1 > dark.shadow_geometry.1);
 
         // Frost has a floor and a ceiling. Below the floor the backdrop
-        // fights the dialog's own text even through the blur; near 1.0 the
-        // pane is frosted plastic and the whole capture was for nothing —
-        // which is exactly what the first cut at 0.72/0.78 looked like. Light
-        // frosts harder because dark text needs a steadier ground.
+        // fights the dialog's own text even through the blur; past the
+        // ceiling the pane is frosted plastic and the whole capture was for
+        // nothing — which is exactly what the first cut at 0.72/0.78 looked
+        // like. Light frosts harder because dark text needs a steadier ground.
         for (mode, glass) in [("dark", dark), ("light", light)] {
             assert!(glass.frost >= 0.35 && glass.frost <= 0.6, "{mode} frost");
         }

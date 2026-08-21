@@ -71,6 +71,12 @@ const INSPECTOR_WIDTH: f32 = 320.;
 /// Tall enough for every command without scrolling; it scrolls anyway once a
 /// filter is typed and more rows appear than fit.
 const PALETTE_HEIGHT: f32 = 452.;
+/// Wider than the other dialogs: a palette row carries a label *and* a
+/// shortcut chip, and at 460 the two collided on the longest labels.
+const PALETTE_WIDTH: f32 = 540.;
+/// Roomier than a list row. The palette is the app's front door, not a data
+/// grid; cramped rows read as a debug menu.
+const PALETTE_ROW_HEIGHT: f32 = 38.;
 const PROGRESS_HEIGHT: f32 = 4.;
 /// Every button is this tall. Sizing to content let a long label grow taller
 /// than the bar holding it, so buttons in the same row did not match.
@@ -5899,7 +5905,7 @@ impl Browser {
                 .py_1()
                 .flex()
                 .flex_col()
-                .liquid_glass_flush(theme)
+                .liquid_glass(theme)
                 .children(places.into_iter().enumerate().map(|(index, place)| {
                     let target = place.clone();
                     let active = self.path_choice == Some(index);
@@ -6274,7 +6280,7 @@ impl Browser {
                         .max_h(px(PREVIEW_HEIGHT))
                         .flex()
                         .flex_col()
-                        .liquid_glass_flush(theme)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -8913,36 +8919,62 @@ impl Browser {
                     div()
                         .id("palette")
                         .mt(px(90.))
-                        .w(px(DIALOG_WIDTH))
+                        .w(px(PALETTE_WIDTH))
                         .h(px(PALETTE_HEIGHT))
                         .flex()
                         .flex_col()
-                        .liquid_glass_flush(theme)
+                        .liquid_glass(theme)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
+                        // The search line, drawn as a search line: icon, text,
+                        // a caret. It used to be a bare string jammed into the
+                        // pane's top edge, which read as a stray label rather
+                        // than as somewhere typing goes.
                         .child(
                             div()
-                                .h(px(HEADER_HEIGHT))
-                                .px_3()
+                                .h(px(48.))
+                                .flex_shrink_0()
+                                .px_4()
                                 .flex()
                                 .items_center()
+                                .gap_2()
                                 .border_b_1()
                                 .border_color(theme.border)
-                                .text_color(theme.text)
-                                .child(SharedString::from(if query.is_empty() {
-                                    "Gõ để tìm lệnh…".to_string()
-                                } else {
-                                    query.clone()
-                                })),
+                                .child(sized_icon("search", 14., theme.text_faint))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(if query.is_empty() {
+                                            theme.text_faint
+                                        } else {
+                                            theme.text
+                                        })
+                                        .child(SharedString::from(if query.is_empty() {
+                                            "Gõ để tìm lệnh…".to_string()
+                                        } else {
+                                            query.clone()
+                                        })),
+                                )
+                                // A standing caret. The palette really does
+                                // take keystrokes, and nothing else on this
+                                // line says so.
+                                .child(div().w(px(1.5)).h(px(16.)).bg(theme.accent)),
                         )
                         .child(
                             div()
                                 .id("palette-list")
                                 .flex_1()
+                                .min_h(px(0.))
+                                .px_2()
+                                .py_2()
                                 .when(matches.is_empty(), |this| {
                                     this.child(
                                         div()
-                                            .p_3()
-                                            .text_xs()
+                                            .flex_1()
+                                            .h_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_sm()
                                             .text_color(theme.text_faint)
                                             .child("Không có lệnh nào khớp"),
                                     )
@@ -8995,6 +9027,25 @@ impl Browser {
                                         .h_full(),
                                     )
                                 }),
+                        )
+                        // The footer earns its row by teaching the three keys
+                        // the palette lives on — the count rides along because
+                        // "no result" and "38 commands" are the two ends of
+                        // the same fact.
+                        .child(
+                            div()
+                                .h(px(34.))
+                                .flex_shrink_0()
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .text_xs()
+                                .text_color(theme.text_faint)
+                                .child("↑↓ chọn   ↵ chạy   esc đóng")
+                                .child(SharedString::from(format!("{} lệnh", matches.len()))),
                         ),
                 ),
         )
@@ -10083,28 +10134,22 @@ fn queue_badge(stats: &transfer::Stats) -> Option<SharedString> {
 /// them.
 trait LiquidGlass: Styled + ParentElement + Sized {
     fn liquid_glass(self, theme: Theme) -> Self {
-        self.glass_layers(theme, true)
-    }
-
-    /// The same pane without the keel, for containers whose content runs flush
-    /// to the bottom edge — the suggestion popover, the preview body, the
-    /// palette list. The keel was tuned on `p_4` dialogs, where it lives inside
-    /// the bottom padding; under a flush list it showed through the last row's
-    /// transparent background as a dimmer strip nothing above it had.
-    fn liquid_glass_flush(self, theme: Theme) -> Self {
-        self.glass_layers(theme, false)
-    }
-
-    fn glass_layers(self, theme: Theme, keel: bool) -> Self {
         let glass = theme.glass;
         let (shadow_y, shadow_blur, shadow_spread) = glass.shadow_geometry;
-        // The pane itself: real backdrop glass from the forked renderer, not a
-        // painted colour. The canvas is the first child, so it captures and
-        // blurs everything already on screen and every later child — the
-        // dialog's own content — paints on top of the pane.
+        // The pane itself: real backdrop glass from the forked renderer. The
+        // canvas is the first child, so it captures and blurs everything
+        // already on screen and every later child — the dialog's own content —
+        // paints on top of the pane.
+        //
+        // All the edge lighting lives in the glass shader now, on the SDF.
+        // Earlier versions layered horizontal gradient strips over the pane —
+        // a sheen band, a keel band, a 1px specular line — and straight bands
+        // over a curved rim read as a mockup: light that ignores the shape it
+        // sits on. The only things left out here are the ones a shader cannot
+        // own: the hairline border and the drop shadow.
         let mut frost = theme.modal;
         frost.a = glass.frost;
-        self.rounded_lg()
+        self.rounded_2xl()
             .border_1()
             .border_color(glass.rim)
             .child(
@@ -10113,7 +10158,7 @@ trait LiquidGlass: Styled + ParentElement + Sized {
                     move |bounds, _, window, _| {
                         window.paint_backdrop_glass(
                             bounds,
-                            gpui::Corners::all(px(8.)),
+                            gpui::Corners::all(px(16.)),
                             px(22.),
                             frost,
                         );
@@ -10139,56 +10184,6 @@ trait LiquidGlass: Styled + ParentElement + Sized {
                     spread_radius: px(0.),
                 },
             ])
-            // The sheen: the key light down the face. Top third only — glass
-            // lit evenly all the way down is a screenshot filter, not a light.
-            // It fades to *its own colour* at zero alpha, never to transparent
-            // black: gpui interpolates gradients in straight alpha, so a fade
-            // toward transparent black passes through grey on the way and the
-            // highlight renders as a shadow.
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded_lg()
-                    .bg(gpui::linear_gradient(
-                        180.,
-                        gpui::linear_color_stop(glass.sheen, 0.),
-                        gpui::linear_color_stop(glass.sheen.opacity(0.), 0.38),
-                    )),
-            )
-            // The specular line inside the top edge — the light's reflection.
-            // Inset past the corner radius so its square ends stay inside the
-            // curve. Its alpha is zero in light mode, which paints nothing.
-            .child(
-                div()
-                    .absolute()
-                    .top(px(1.))
-                    .left(px(9.))
-                    .right(px(9.))
-                    .h(px(1.))
-                    .bg(glass.edge),
-            )
-            // The keel: the pane's thickness, shaded, along the bottom edge.
-            // Same rule as the sheen: fade to its own colour at zero alpha.
-            // Chosen with `if`, not `when` — that helper is not on this
-            // trait's bounds — and the flush case paints an empty div rather
-            // than an invisible layer, because "no keel" is the point of it.
-            .child(if keel {
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(10.))
-                    .rounded_b_lg()
-                    .bg(gpui::linear_gradient(
-                        0.,
-                        gpui::linear_color_stop(glass.keel, 0.),
-                        gpui::linear_color_stop(glass.keel.opacity(0.), 1.),
-                    ))
-            } else {
-                div()
-            })
     }
 }
 
@@ -10636,18 +10631,44 @@ fn palette_row(
     let (label, shortcut) = command.label();
     div()
         .id(position)
-        .h(px(HEADER_HEIGHT))
+        .h(px(PALETTE_ROW_HEIGHT))
         .w_full()
         .px_3()
         .flex()
         .items_center()
         .gap_2()
-        .text_xs()
+        .text_sm()
+        // Inset and rounded, not an edge-to-edge band: the full-width bar ran
+        // into the pane's corner curve on the first row, and a selection that
+        // pokes out of its own container reads as a rendering bug.
+        .rounded_lg()
         .cursor_pointer()
         .when(selected, |row| row.bg(theme.selected))
         .hover(|row| row.bg(theme.hover))
-        .child(div().flex_1().text_color(theme.text).child(label))
-        .child(div().text_color(theme.text_faint).child(shortcut))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(theme.text)
+                .child(label),
+        )
+        // The shortcut as a keycap, the way every palette draws one. Bare
+        // faint text next to bare faint text is how the old rows managed to
+        // hold two facts and show one.
+        .when(!shortcut.is_empty(), |row| {
+            row.child(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(theme.hover)
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child(shortcut),
+            )
+        })
 }
 
 fn bandwidth_label(limit: u64) -> String {

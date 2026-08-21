@@ -980,3 +980,29 @@ của Apple, giờ đều nằm trong fragment shader:
 Đã nhìn thật cả hai mode, kể cả kính-chồng-kính: palette nổi trên hộp Cài đặt,
 đọc được chữ của dialog ghosting qua tấm, phóng nhẹ, mép mềm. Cũng dọn hai
 warning `float_literal_f32_fallback` ở `taffy.rs` của upstream cho build sạch.
+
+### 10.17 Tinh chỉnh kính + làm lại palette (21/08/2026)
+
+Góp ý "chưa tinh tế": ba nguyên nhân nhìn ra được từ ảnh chụp. (1) Góc bo 8px —
+Liquid Glass dùng góc lớn; lên 16px. (2) Hai hệ chiếu sáng cãi nhau: các dải
+gradient *ngang* từ thời kính giả (sheen/edge/keel) vẫn đè lên ánh sáng *theo
+SDF* của shader — dải thẳng trên vành cong là thứ đọc ra "mockup". Bỏ hẳn ba
+lớp đó; chiếu sáng vành giờ sống trọn trong shader: sáng đúng chỗ cạnh ngửa
+lên nguồn sáng (−normal.y), kể cả cung góc; một chút fresnel cho mọi cạnh; mặt
+dưới trừ đi — độ dày đọc thành bóng râm. `GlassSpec` teo lại còn đúng thứ
+shader không sở hữu được: vành hairline, bóng đổ, độ sương. (3) Vòng thấu kính
+rộng bằng blur nên mép nhão: band co còn 0.6×, falloff bậc ba — vành lens gọn
+ôm sát mép. Blur nâng 24→30.
+
+Palette ⌘K làm lại theo góp ý "ui khá tệ" — chẩn đoán từ ảnh: header là chuỗi
+trần dán sát mép trên (đọc như nhãn đi lạc, không phải chỗ gõ), dòng chọn tô
+kín mép-tới-mép đè lên cung góc 16px (selection thò ra khỏi container của nó
+đọc như lỗi render), shortcut là chữ mờ cạnh chữ mờ. Giờ: dòng tìm đúng dạng
+dòng tìm (icon + chữ + caret đứng màu accent — palette thật sự nhận phím, mà
+không có gì trên dòng đó nói thế), danh sách lùi lề `px_2` với dòng chọn bo
+góc, shortcut thành keycap, footer dạy ba phím kèm đếm lệnh. Rộng 460→540 vì
+nhãn dài nhất đụng keycap.
+
+Đĩa lại xuống 751MB giữa chừng: `deps/` giữ rlib của mọi thế hệ build — ba bản
+`libaws_sdk_s3` 174MB và 117 bản `libgpui`. Xoá hết trừ bản mới nhất, build
+xác nhận vẫn link.

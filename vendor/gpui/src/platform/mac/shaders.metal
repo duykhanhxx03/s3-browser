@@ -1326,26 +1326,36 @@ fragment float4 backdrop_glass_fragment(
 
   // The rim bends *sharp* imagery, not the blur. A refracted blur is mush; a
   // real slab shows a crisp, stretched band of what lies just outside its
-  // edge. Quadratic falloff keeps the middle perfectly flat. The three taps a
-  // hair apart are chromatic dispersion — the faint colour fringing at the
-  // very edge that says "lens" to an eye that never names it.
-  float band = max(glass.blur_radius, 1.);
+  // edge. The band is narrower than the blur and the falloff cubic, so the
+  // lens reads as a defined ring hugging the edge rather than a wide smear —
+  // the wide quadratic version is exactly what looked unrefined. The three
+  // taps a hair apart are chromatic dispersion: the faint colour fringing at
+  // the very edge that says "lens" to an eye that never names it.
+  float band = max(glass.blur_radius * 0.6, 8.);
   float rim = saturate(1. + distance / band);
-  float bend = rim * rim;
-  float2 shift = normal * bend * band * 1.1 / viewport;
+  float bend = rim * rim * rim;
+  float2 shift = normal * bend * band * 1.4 / viewport;
   float3 rim_rgb = float3(sharp.sample(blur_sampler, uv + shift * 1.06).r,
                           sharp.sample(blur_sampler, uv + shift).g,
                           sharp.sample(blur_sampler, uv + shift * 0.94).b);
-  float3 color = mix(base.rgb, rim_rgb, bend * 0.8);
+  float3 color = mix(base.rgb, rim_rgb, bend * 0.85);
 
   // The frost, thin enough to stay glass.
   float4 tint = hsla_to_rgba(glass.tint);
   color = mix(color, tint.rgb, tint.a);
 
-  // Specular on the rim where the edge faces the key light from above: the
-  // outward normal's -y is exactly "how much this edge looks up".
-  float specular = saturate(-normal.y) * bend;
-  color += specular * 0.20;
+  // Edge lighting lives here, on the SDF, not in overlay bands. The app used
+  // to lay horizontal gradient strips over the pane — a top band, a bottom
+  // band, a 1px line — and straight bands over a curved rim is what made the
+  // whole thing read as a mockup: light that ignores the shape it sits on.
+  // On the SDF the arc brightens exactly where the edge curves toward the
+  // key light, corners included, because -normal.y *is* "how much this edge
+  // faces up". A small direction-free term is the fresnel glint every edge
+  // gets; the underside subtracts instead — thickness reads as shade.
+  float top = saturate(-normal.y);
+  float bottom = saturate(normal.y);
+  color += bend * (0.20 * top + 0.05);
+  color -= bend * 0.10 * bottom;
 
   return float4(color * coverage, coverage);
 }
