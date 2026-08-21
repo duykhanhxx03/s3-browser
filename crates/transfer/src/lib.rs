@@ -236,14 +236,24 @@ impl TransferEngine {
     /// Jobs that were mid-flight are marked paused rather than resumed silently:
     /// after a crash the user should decide what starts moving again.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::from_journal(Journal::open(path)?)
+        Self::from_journal(Journal::open(path)?, DEFAULT_JOB_CONCURRENCY)
+    }
+
+    /// How many jobs run at once, chosen at construction.
+    ///
+    /// Not adjustable afterwards: the limit is a semaphore's permit count, and
+    /// shrinking one means taking permits back from work already running.
+    /// Pretending a slider changes it live, when what it really does is take
+    /// effect next launch, would be worse than saying so.
+    pub fn open_with(path: &Path, job_concurrency: usize) -> Result<Self> {
+        Self::from_journal(Journal::open(path)?, job_concurrency.clamp(1, 16))
     }
 
     pub fn in_memory() -> Result<Self> {
-        Self::from_journal(Journal::in_memory()?)
+        Self::from_journal(Journal::in_memory()?, DEFAULT_JOB_CONCURRENCY)
     }
 
-    fn from_journal(journal: Journal) -> Result<Self> {
+    fn from_journal(journal: Journal, job_concurrency: usize) -> Result<Self> {
         let restored = journal.load_all()?;
         let mut jobs = HashMap::new();
         for mut job in restored {
@@ -259,7 +269,7 @@ impl TransferEngine {
                 journal,
                 jobs: Mutex::new(jobs),
                 controls: Mutex::new(HashMap::new()),
-                job_slots: Arc::new(Semaphore::new(DEFAULT_JOB_CONCURRENCY)),
+                job_slots: Arc::new(Semaphore::new(job_concurrency)),
                 part_concurrency: DEFAULT_PART_CONCURRENCY,
                 throttle: Throttle::unlimited(),
                 rate: Mutex::new(Rate::default()),
@@ -824,7 +834,7 @@ mod tests {
             .unwrap();
         journal.set_state(id, JobState::Running).unwrap();
 
-        let engine = TransferEngine::from_journal(journal).unwrap();
+        let engine = TransferEngine::from_journal(journal, DEFAULT_JOB_CONCURRENCY).unwrap();
         let jobs = engine.snapshot();
         assert_eq!(jobs.len(), 1);
         assert_eq!(

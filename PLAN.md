@@ -544,9 +544,8 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
 6. ~~**Chân danh sách nói rõ hơn**~~ — xong (21/08/2026). "8 mục · 5 thư mục,
    3 tệp" ngay dưới danh sách; thanh trạng thái nhường chỗ đó cho tên profile và
    region.
-7. **Màn hình Cài đặt.** App chưa có cái nào: chủ đề, region mặc định, số luồng
-   truyền, giới hạn preview, xoá cache. Hiện mỗi thứ nằm rải rác hoặc không đổi
-   được.
+7. ~~**Màn hình Cài đặt**~~ — xong (21/08/2026). Chủ đề, giới hạn preview, băng
+   thông, số luồng truyền, và đường tới thư mục cấu hình. Lưu ở `settings.json`.
 8. **Bảng theo dõi API**: số request thành công/thất bại và log trực tiếp. Hợp với
    phần nhật ký lỗi ở §7.4.
 

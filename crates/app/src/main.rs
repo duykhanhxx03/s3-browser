@@ -13,6 +13,7 @@ mod failure;
 #[cfg(target_os = "macos")]
 mod glass_check;
 mod platform;
+mod settings;
 mod theme;
 
 use std::time::Duration;

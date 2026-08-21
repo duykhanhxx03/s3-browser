@@ -25,6 +25,7 @@ use transfer::{Job, JobState, TransferEngine};
 use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
 
 use crate::failure::{Failure, Fix};
+use crate::settings::{Settings, SettingsStore, ThemeChoice};
 use crate::platform::{self, Chrome};
 use crate::theme::Theme;
 
@@ -285,7 +286,7 @@ pub struct Previewing {
 }
 
 /// What a preview can show of an object's contents. Only ever holds the first
-/// `PREVIEW_LIMIT` bytes: a preview must never turn into an accidental download
+/// the settings' preview limit: a preview must never become an accidental download
 /// of a multi-gigabyte object.
 pub enum Preview {
     Image(std::sync::Arc<gpui::Image>),
@@ -550,6 +551,10 @@ pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
     chrome: Chrome,
+    /// What the system last said. Kept because choosing "theo hệ thống" again
+    /// has to repaint immediately, and the only other place that answer lives
+    /// is inside a callback that has already run.
+    appearance: gpui::WindowAppearance,
     /// Resolved once at startup: which of the candidate fonts this machine has.
     ui_font: SharedString,
     mono_font: SharedString,
@@ -560,6 +565,10 @@ pub struct Browser {
     /// Pinned and recently visited locations, kept on disk beside the profiles.
     places: Places,
     place_store: Option<PlaceStore>,
+    settings: Settings,
+    settings_store: Option<SettingsStore>,
+    /// Whether the settings panel is open.
+    settings_open: bool,
 
     client: Option<S3Client>,
     buckets: Vec<SharedString>,
@@ -713,7 +722,6 @@ pub struct Browser {
 impl Browser {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let chrome = Chrome::detect();
-        let theme = Theme::from_window(window.appearance(), chrome);
 
         // The UI font ships with the binary, so there is nothing to probe for:
         // `all_font_names` lists what the *system* has installed and does not
@@ -728,12 +736,15 @@ impl Browser {
         ));
         debug_log!("font: {ui_font} / {mono_font}");
 
-        // Follow the system between light and dark without a restart.
+        // Follow the system between light and dark without a restart — unless
+        // the settings say otherwise, in which case a system change is not this
+        // app's business.
         let weak = cx.entity().downgrade();
         let appearance = window.observe_window_appearance(move |window, cx| {
             let appearance = window.appearance();
             _ = weak.update(cx, |this: &mut Self, cx| {
-                this.theme = Theme::from_window(appearance, this.chrome);
+                this.appearance = appearance;
+                this.theme = theme_for(this.settings.theme, appearance, this.chrome);
                 cx.notify();
             });
         });
@@ -801,6 +812,11 @@ impl Browser {
 
         let store = ProfileStore::default_location().ok();
         let place_store = store.as_ref().map(|store| PlaceStore::beside(store.path()));
+        let settings_store = store.as_ref().map(|store| SettingsStore::beside(store.path()));
+        let settings = settings_store
+            .as_ref()
+            .map(|store| store.load())
+            .unwrap_or_default();
         let places = place_store
             .as_ref()
             .map(|store| store.load())
@@ -815,9 +831,10 @@ impl Browser {
         let transfers = store
             .as_ref()
             .and_then(|store| store.path().parent().map(|dir| dir.join("transfers.db")))
-            .and_then(|path| TransferEngine::open(&path).ok())
+            .and_then(|path| TransferEngine::open_with(&path, settings.job_concurrency()).ok())
             .or_else(|| TransferEngine::in_memory().ok())
             .expect("an in-memory queue always opens");
+        transfers.set_bandwidth_limit(settings.bandwidth_limit);
 
         // Explicit, because nothing else does it: with no focused handle the
         // window has nowhere to send a key press, so the shortcuts and the
@@ -829,8 +846,9 @@ impl Browser {
 
         let mut this = Self {
             focus,
-            theme,
+            theme: theme_for(settings.theme, window.appearance(), chrome),
             chrome,
+            appearance: window.appearance(),
             ui_font: ui_font.clone(),
             mono_font,
             profiles,
@@ -838,6 +856,9 @@ impl Browser {
             store,
             places,
             place_store,
+            settings: settings.clone(),
+            settings_store,
+            settings_open: false,
             client: None,
             buckets: Vec::new(),
             bucket_filter: String::new(),
@@ -1960,6 +1981,28 @@ impl Browser {
         })
     }
 
+    /// Applies a change and writes it out.
+    ///
+    /// One path in, so nothing can change a preference without saving it — the
+    /// worst version of a settings panel is one that forgets on restart.
+    fn update_settings(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
+        change(&mut self.settings);
+
+        self.theme = theme_for(self.settings.theme, self.appearance, self.chrome);
+        self.transfers.set_bandwidth_limit(self.settings.bandwidth_limit);
+
+        if let Some(store) = self.settings_store.as_ref() {
+            if let Err(error) = store.save(&self.settings) {
+                self.fail(Failure::known(
+                    "Không lưu được cài đặt",
+                    format!("{error}"),
+                    None,
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     fn save_places(&mut self) {
         let Some(store) = self.place_store.as_ref() else {
             return;
@@ -2991,6 +3034,10 @@ impl Browser {
                 }
             }
             Command::ToggleFavorite => self.toggle_favorite(cx),
+            Command::Settings => {
+                self.settings_open = true;
+                cx.notify();
+            }
             Command::Filter => {
                 if let Some(window) = window {
                     self.focus_filter(window, cx);
@@ -3393,7 +3440,7 @@ impl Browser {
         // rather than fetched and shown broken. Text is fine truncated.
         let refusal = match kind {
             PreviewKind::None => Some(Preview::Unsupported),
-            PreviewKind::Image if size > PREVIEW_LIMIT as i64 => {
+            PreviewKind::Image if size > self.settings.preview_limit_bytes() as i64 => {
                 self.status = "Ảnh quá lớn để xem trước".into();
                 Some(Preview::Unsupported)
             }
@@ -3408,7 +3455,7 @@ impl Browser {
             return;
         }
 
-        let wanted = (size as u64).min(PREVIEW_LIMIT);
+        let wanted = (size as u64).min(self.settings.preview_limit_bytes());
         let fetch_key = key.clone();
         let fetching = Tokio::spawn(cx, async move {
             client.get_range(&bucket, &fetch_key, 0..wanted, None).await
@@ -4739,6 +4786,28 @@ impl Browser {
                 this.child(skeleton_sidebar(theme))
             })
             .child(div().flex_1())
+            // At the foot of the sidebar, where Brows3 has it and where every
+            // app of this shape has it.
+            .child(
+                div()
+                    .id("settings-open")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(theme.text_muted)
+                    .hover(|this| this.bg(theme.hover))
+                    .child(sized_icon("more", 11., theme.text_faint))
+                    .child("Cài đặt")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.settings_open = true;
+                        cx.notify();
+                    })),
+            )
     }
 
     /// The pinned and recent sections above the bucket list.
@@ -5095,6 +5164,155 @@ impl Browser {
                                         .child("Không xem trước được kiểu này")
                                         .into_any_element(),
                                 }),
+                        ),
+                ),
+        )
+    }
+
+    /// The settings panel.
+    fn render_settings(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.settings_open {
+            return None;
+        }
+        let theme = self.theme;
+        let settings = self.settings.clone();
+        let config_dir = self
+            .settings_store
+            .as_ref()
+            .and_then(|store| store.path().parent().map(|dir| dir.to_path_buf()));
+
+        Some(
+            div()
+                .id("settings-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.settings_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("settings")
+                        .w(px(PROFILE_DIALOG_WIDTH))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(div().text_color(theme.text).child("Cài đặt"))
+                        .child(setting_row(
+                            "Giao diện",
+                            None,
+                            div().flex().gap_1().children(
+                                ThemeChoice::ALL.into_iter().map(|choice| {
+                                    choice_chip(
+                                        SharedString::from(format!("theme-{}", choice.label())),
+                                        choice.label().into(),
+                                        settings.theme == choice,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.update_settings(|s| s.theme = choice, cx)
+                                    }))
+                                }),
+                            ),
+                            theme,
+                        ))
+                        .child(setting_row(
+                            "Xem trước",
+                            Some("Tải nhiều nhất bấy nhiêu cho một lần xem trước"),
+                            div().flex().gap_1().children(
+                                crate::settings::PREVIEW_LIMITS_MB.into_iter().map(|mb| {
+                                    choice_chip(
+                                        SharedString::from(format!("preview-{mb}")),
+                                        SharedString::from(format!("{mb} MB")),
+                                        settings.preview_limit_mb == mb,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.update_settings(|s| s.preview_limit_mb = mb, cx)
+                                    }))
+                                }),
+                            ),
+                            theme,
+                        ))
+                        .child(setting_row(
+                            "Băng thông",
+                            None,
+                            div().flex().gap_1().children(
+                                BANDWIDTH_PRESETS.into_iter().map(|limit| {
+                                    choice_chip(
+                                        SharedString::from(format!("bw-{limit}")),
+                                        SharedString::from(bandwidth_label(limit)),
+                                        settings.bandwidth_limit == limit,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.update_settings(|s| s.bandwidth_limit = limit, cx)
+                                    }))
+                                }),
+                            ),
+                            theme,
+                        ))
+                        .child(setting_row(
+                            "Số luồng truyền",
+                            // Said out loud rather than letting someone change
+                            // it and wonder why nothing moved faster: the limit
+                            // is a semaphore's permit count, and shrinking one
+                            // means taking permits back from work in flight.
+                            Some("Áp dụng từ lần mở app sau"),
+                            div().flex().gap_1().children(
+                                crate::settings::JOB_CONCURRENCY_CHOICES.into_iter().map(|n| {
+                                    choice_chip(
+                                        SharedString::from(format!("jobs-{n}")),
+                                        SharedString::from(n.to_string()),
+                                        settings.job_concurrency == n,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.update_settings(|s| s.job_concurrency = n, cx)
+                                    }))
+                                }),
+                            ),
+                            theme,
+                        ))
+                        .when_some(config_dir, |this, dir| {
+                            let shown = dir.display().to_string();
+                            this.child(setting_row(
+                                "Thư mục cấu hình",
+                                Some("Profile, nơi đã ghim, cài đặt và hàng đợi"),
+                                action_button_dyn(
+                                    "open-config".into(),
+                                    SharedString::from(elide_middle(&shown, 44)),
+                                    theme,
+                                )
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    if let Err(error) = opener::open(&dir) {
+                                        this.report(format!("Không mở được thư mục: {error}"));
+                                    }
+                                    cx.notify();
+                                })),
+                                theme,
+                            ))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .child(action_button("settings-close", "Xong", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.settings_open = false;
+                                        cx.notify();
+                                    }),
+                                )),
                         ),
                 ),
         )
@@ -7579,6 +7797,7 @@ impl Render for Browser {
             .children(self.render_profiles_dialog(cx))
             .children(self.render_failures(cx))
             .children(self.render_preview(cx))
+            .children(self.render_settings(cx))
     }
 }
 
@@ -8417,10 +8636,6 @@ fn next_encryption(current: &Encryption) -> Option<Encryption> {
 /// and the bytes are billed.
 const THUMBNAIL_LIMIT: i64 = 512 * 1024;
 
-/// How much of an object a preview is allowed to fetch. Big enough for a photo,
-/// small enough that previewing a huge object is never a surprise download.
-const PREVIEW_LIMIT: u64 = 8 * 1024 * 1024;
-
 /// What a preview should try to render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreviewKind {
@@ -8732,6 +8947,63 @@ fn row_action(
         .child(sized_icon(name, 13., theme.text_faint))
 }
 
+/// The palette to paint: the setting when it names one, the system otherwise.
+fn theme_for(choice: ThemeChoice, appearance: gpui::WindowAppearance, chrome: Chrome) -> Theme {
+    match choice {
+        ThemeChoice::System => Theme::from_window(appearance, chrome),
+        ThemeChoice::Light => Theme::new(crate::theme::Mode::Light, chrome),
+        ThemeChoice::Dark => Theme::new(crate::theme::Mode::Dark, chrome),
+    }
+}
+
+/// One row of the settings panel: what it is, why it matters, and the control.
+fn setting_row(
+    label: &'static str,
+    note: Option<&'static str>,
+    control: impl IntoElement,
+    theme: Theme,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .w(px(150.))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .child(div().text_xs().text_color(theme.text).child(label))
+                .children(note.map(|note| {
+                    div().text_xs().text_color(theme.text_faint).child(note)
+                })),
+        )
+        .child(div().flex_1().min_w(px(0.)).child(control))
+}
+
+/// One option among a few. A row of these rather than a dropdown: with three or
+/// four choices the row is shorter than the menu that would hide it.
+fn choice_chip(
+    id: SharedString,
+    label: SharedString,
+    selected: bool,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(BUTTON_HEIGHT))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(if selected { theme.selected } else { theme.hover })
+        .text_color(if selected { theme.text } else { theme.text_muted })
+        .hover(|this| this.bg(theme.selected))
+        .child(label)
+}
+
 /// A heading with no control beside it, unlike `section_header`.
 fn section_label(text: &'static str, theme: Theme) -> impl IntoElement {
     div()
@@ -8883,6 +9155,7 @@ pub enum Command {
     CloseTab,
     GoToPath,
     ToggleFavorite,
+    Settings,
     GoUp,
     Filter,
     NewFolder,
@@ -8920,6 +9193,7 @@ impl Command {
             Command::CloseTab => ("Đóng tab", "⌘W"),
             Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
             Command::ToggleFavorite => ("Ghim nơi này", ""),
+            Command::Settings => ("Cài đặt", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -8942,7 +9216,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 28] {
+    fn all() -> [Command; 29] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -8972,6 +9246,7 @@ impl Command {
             Command::CloseTab,
             Command::GoToPath,
             Command::ToggleFavorite,
+            Command::Settings,
         ]
     }
 }
@@ -9175,6 +9450,7 @@ mod tests {
             focus: cx.focus_handle(),
             theme: Theme::new(Mode::Dark, Chrome::Solid),
             chrome: Chrome::Solid,
+            appearance: gpui::WindowAppearance::Dark,
             ui_font: "Inter".into(),
             mono_font: "monospace".into(),
             profiles: Vec::new(),
@@ -9182,6 +9458,9 @@ mod tests {
             store: None,
             places: Places::default(),
             place_store: None,
+            settings: Settings::default(),
+            settings_store: None,
+            settings_open: false,
             client: None,
             buckets: Vec::new(),
             bucket_filter: String::new(),
@@ -9919,7 +10198,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 28);
+        assert_eq!(all.len(), 29);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

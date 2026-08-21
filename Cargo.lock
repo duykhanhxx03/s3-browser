@@ -6195,6 +6195,8 @@ dependencies = [
  "objc2-foundation",
  "opener",
  "s3core",
+ "serde",
+ "serde_json",
  "transfer",
  "vault",
 ]

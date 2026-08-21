@@ -62,6 +62,9 @@ hoá luôn cái kho khoá.
 | `S3BROWSER_GLASS=0/1` | Ép chế độ solid / glass, ghi đè mặc định theo platform |
 | `S3BROWSER_DEV_SECRET=…` | Khoá bí mật lấy thẳng từ môi trường, bỏ qua chuỗi khoá. Chỉ bản debug |
 
+Cài đặt (chủ đề, giới hạn xem trước, băng thông, số luồng truyền) nằm ở
+`settings.json` cạnh `profiles.json`; nơi đã ghim và nơi vừa tới ở `places.json`.
+
 ```bash
 cargo test    # 132 test; test MinIO tự bỏ qua nếu chưa chạy Docker
 ```
