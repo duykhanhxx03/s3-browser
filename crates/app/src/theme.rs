@@ -90,6 +90,11 @@ pub struct GlassSpec {
     /// legibility at low frost is the blur underneath, not the tint. At 1.0
     /// the pane is an opaque panel that paid for a capture it hides.
     pub frost: f32,
+    /// Frost for small controls — buttons, chips. Far thinner than a pane's,
+    /// per the reverse-engineered tables (white 0.10 / dark 0.20): a control
+    /// is glass you can nearly see straight through, and its cap gradient
+    /// carries the shape.
+    pub control_frost: f32,
 }
 
 impl GlassSpec {
@@ -104,12 +109,14 @@ impl GlassSpec {
                 // here: dark mode leans on tint for legibility where light
                 // mode can lean on a bright blur.
                 frost: 0.40,
+                control_frost: 0.20,
             },
             Mode::Light => Self {
                 rim: rgba(0x1c202426).into(),
                 shadow: rgba(0x0000004a).into(),
                 shadow_geometry: (14., 44., -8.),
                 frost: 0.25,
+                control_frost: 0.10,
             },
         }
     }
@@ -347,6 +354,14 @@ mod tests {
         // 0.40 and light at 0.25: a dark pane cannot brighten its backdrop
         // into legibility, so it has to tint it away instead.
         assert!(dark.frost > light.frost);
+
+        // Controls are thinner glass than panes in both modes, and keep the
+        // same dark-over-light ordering for the same reason.
+        for (mode, glass) in [("dark", dark), ("light", light)] {
+            assert!(glass.control_frost < glass.frost, "{mode} control frost");
+            assert!(glass.control_frost >= 0.05, "{mode} control must paint");
+        }
+        assert!(dark.control_frost > light.control_frost);
     }
 
     #[test]

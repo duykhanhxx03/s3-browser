@@ -489,6 +489,11 @@ impl MetalRenderer {
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
+        // One backdrop capture can serve many glass batches — see the `fresh`
+        // flag on the primitive. Reset per frame: a stale capture from a
+        // previous frame would show last frame's world.
+        let mut have_backdrop_capture = false;
+
         let mut command_encoder = new_command_encoder(
             command_buffer,
             drawable,
@@ -584,27 +589,30 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::BackdropGlasses(glasses) => {
-                    // The same encoder-swap dance as Paths, with a capture in
-                    // the middle: everything encoded so far has to be resolved
-                    // into a texture before a glass can sample it.
-                    command_encoder.end_encoding();
+                    // A pane wants the backdrop as of its own draw order; a
+                    // control is happy with whatever this frame already
+                    // captured. Only the former pays for the encoder-swap
+                    // dance — the same one the Paths batch does — with a blit
+                    // and two blur passes in the middle.
+                    let needs_fresh = glasses.iter().any(|glass| glass.fresh != 0);
+                    if needs_fresh || !have_backdrop_capture {
+                        command_encoder.end_encoding();
+                        have_backdrop_capture = self.capture_and_blur_backdrop(
+                            command_buffer,
+                            drawable,
+                            viewport_size,
+                        );
+                        command_encoder = new_command_encoder(
+                            command_buffer,
+                            drawable,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                    }
 
-                    let captured = self.capture_and_blur_backdrop(
-                        command_buffer,
-                        drawable,
-                        viewport_size,
-                    );
-
-                    command_encoder = new_command_encoder(
-                        command_buffer,
-                        drawable,
-                        viewport_size,
-                        |color_attachment| {
-                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                        },
-                    );
-
-                    if captured {
+                    if have_backdrop_capture {
                         self.draw_backdrop_glasses(
                             glasses,
                             instance_buffer,

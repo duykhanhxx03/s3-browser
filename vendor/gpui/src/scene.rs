@@ -569,6 +569,17 @@ pub struct BackdropGlass {
     /// Composited over the blurred sample; its alpha is how frosted the pane
     /// is. Full alpha is an opaque panel that paid for a capture it hides.
     pub tint: Hsla,
+    /// Whether this pane needs the backdrop re-captured at its own draw order
+    /// (1) or may reuse whatever capture this frame already made (0).
+    ///
+    /// Apple's own rule makes the shared capture correct: glass never samples
+    /// other glass, so a control's sample does not need the panes drawn before
+    /// it — only the pixels spatially beneath it, which its paint order
+    /// guarantees were captured. Panes ask for a fresh capture because whole
+    /// screenfuls of content are painted between one pane and the next; a
+    /// toolbar of twenty glass buttons re-capturing per button is the cost
+    /// this flag exists to avoid.
+    pub fresh: u32,
 }
 
 impl From<BackdropGlass> for Primitive {

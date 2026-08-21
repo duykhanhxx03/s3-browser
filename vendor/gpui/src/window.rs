@@ -2872,6 +2872,33 @@ impl Window {
         blur_radius: Pixels,
         tint: Hsla,
     ) {
+        self.paint_backdrop_glass_inner(bounds, corner_radii, blur_radius, tint, 1);
+    }
+
+    /// The same pane, reusing this frame's existing backdrop capture instead
+    /// of taking a fresh one. For small controls: a toolbar of glass buttons
+    /// costs one capture between them instead of one each. Correct as long as
+    /// everything spatially beneath the control painted before it — which the
+    /// element tree's paint order guarantees — because glass never samples
+    /// other glass.
+    pub fn paint_backdrop_glass_shared(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        tint: Hsla,
+    ) {
+        self.paint_backdrop_glass_inner(bounds, corner_radii, blur_radius, tint, 0);
+    }
+
+    fn paint_backdrop_glass_inner(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        tint: Hsla,
+        fresh: u32,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -2884,6 +2911,7 @@ impl Window {
             corner_radii: corner_radii.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             tint: tint.opacity(opacity),
+            fresh,
         });
     }
 

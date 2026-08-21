@@ -1068,3 +1068,31 @@ dày làm nền, vì Docker liệt — mc treo — không dựng được listin
 nén nhẹ đúng ở vành, không viền cầu vồng, không răng cưa mép. Chưa soi được
 dark mode trong phiên này (theme là lựa chọn đang mở của người dùng, không đè
 nữa) — token dark đi cùng một shader, khác mỗi frost/tint đã ghim bằng test.
+
+### 10.20 Kính thật xuống tận nút bấm (22/08/2026)
+
+Phần còn thiếu của spec: control cũng là kính, không chỉ pane. Rào là chi phí —
+mỗi batch kính là một lần cắt render pass + blit + hai pass blur, toolbar chục
+nút là chục lần capture mỗi khung hình. Lối ra nằm ngay trong spec, là quy tắc
+của chính Apple (WWDC25-323): **kính không bao giờ lấy mẫu kính khác** — nghĩa
+là control chỉ cần những pixel *nằm dưới nó về mặt không gian*, mà thứ tự vẽ
+của cây element đảm bảo chúng đã được vẽ trước. Vậy primitive thêm cờ `fresh`:
+pane đòi capture tươi tại đúng lượt vẽ của nó (giữa hai pane là cả một màn nội
+dung), control dùng chung capture sẵn có của khung hình — toolbar hai mươi nút
+giá một lần capture, không phải hai mươi.
+
+`control_base` giờ đặt một tấm kính shared dưới nắp: band 8px nên control gần
+như toàn vành — đúng dáng viên thấu kính mà các catalog tham chiếu ship cho
+nút. Frost control mỏng hơn pane (light 0.10, dark 0.20 theo bảng
+reverse-engineer), có test ghim cả sàn lẫn quan hệ control < pane.
+
+Bẫy thứ tự vẽ tốn một vòng: `.bg()` của element vẽ *trước* con, nên nắp
+gradient và tint chọn của chip bị tấm kính (alpha 1 chỗ nó phủ) chôn mất — cả
+hai phải thành lớp phủ vẽ *sau* kính, hover đi qua `group_hover` vì hover trên
+div ngoài chỉ đổi cái nền đã bị chôn.
+
+Nghiệm thu bằng mắt trên nền trang Gần đây: nhìn xuyên qua chip thấy chữ dòng
+mờ phía sau; nắp, vành, ring accent của chip chọn còn nguyên; nhãn không bị
+tint đè (lớp chọn chèn trước nhãn). Chưa đo được chi phí GPU — một capture
+chung cho mọi control cộng một capture mỗi pane là thiết kế, nhưng con số là
+điều còn nợ.

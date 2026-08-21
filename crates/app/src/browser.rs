@@ -9795,8 +9795,16 @@ fn control_fill_hover(theme: Theme) -> gpui::Background {
 /// own colour on top. One place to change the material, thirty places wearing
 /// it.
 fn control_base(id: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    // Real glass under the cap. The shared-capture variant, so a toolbar of
+    // these costs one backdrop capture between them, not one each — correct
+    // because glass never samples other glass, and everything spatially
+    // beneath a control painted before it did. The gradient cap and hairline
+    // ride on top as the control's own lighting.
+    let mut frost = theme.modal;
+    frost.a = theme.glass.control_frost;
     div()
         .id(id)
+        .group("control")
         .h(px(BUTTON_HEIGHT))
         .px_2()
         .flex()
@@ -9804,10 +9812,38 @@ fn control_base(id: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(control_fill(theme))
         .border_1()
         .border_color(theme.control_border)
-        .hover(move |this| this.bg(control_fill_hover(theme)))
+        .child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    window.paint_backdrop_glass_shared(
+                        bounds,
+                        gpui::Corners::all(px(6.)),
+                        // A control this small is nearly all rim: the band is
+                        // most of its height, which is exactly the full-lens
+                        // pill look the reference catalogs ship for buttons.
+                        px(8.),
+                        frost,
+                    );
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        // The cap gradient rides *over* the glass as its own layer. It cannot
+        // be this div's `.bg()`: an element paints its own background before
+        // its children, and the glass — opaque where it covers — would bury
+        // it. Hover goes through the group for the same reason.
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded_md()
+                .bg(control_fill(theme))
+                .group_hover("control", move |this| this.bg(control_fill_hover(theme))),
+        )
 }
 
 fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
@@ -11697,13 +11733,22 @@ fn choice_chip(
     // wear the shared control glass. Selection stays a colour, not a shape —
     // a row of caps where one bulges differently reads as a broken row.
     let base = control_base(id, theme)
-        .text_color(if selected { theme.text } else { theme.text_muted })
-        .child(label);
-    if selected {
-        base.bg(theme.selected).border_color(theme.accent)
+        .text_color(if selected { theme.text } else { theme.text_muted });
+    // The selection tint is an overlay for the same reason the cap gradient
+    // is: this div's own `.bg()` would paint under the glass and be buried.
+    // Inserted before the label so the text stays untinted on top.
+    let base = if selected {
+        base.border_color(theme.accent).child(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded_md()
+                .bg(theme.selected),
+        )
     } else {
         base
-    }
+    };
+    base.child(label)
 }
 
 /// Whether a preview of an object that size holds all of it.
