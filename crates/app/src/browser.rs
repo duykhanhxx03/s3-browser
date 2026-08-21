@@ -712,6 +712,12 @@ pub struct Browser {
 
     transfers: TransferEngine,
     drawer_open: bool,
+    /// Folder rows in the drawer the user has opened, by group key.
+    ///
+    /// Kept on the view rather than on the job, because the queue is rebuilt
+    /// from a snapshot every frame: state stored beside a job would be thrown
+    /// away and the folder would snap shut while it was being read.
+    expanded_folders: HashSet<String>,
 
 
     confirm: Option<Confirm>,
@@ -1003,6 +1009,7 @@ impl Browser {
             failures_open: false,
             transfers,
             drawer_open: false,
+            expanded_folders: HashSet::new(),
 
             confirm: None,
             form: None,
@@ -7951,6 +7958,7 @@ impl Browser {
                             action_button("clear-finished", "Xoá đã xong", theme).on_click(
                                 cx.listener(|this, _event, _window, cx| {
                                     this.transfers.clear_finished();
+                                    this.prune_expanded_folders();
                                     cx.notify();
                                 }),
                             ),
@@ -7967,6 +7975,15 @@ impl Browser {
                         .child("Kéo tệp vào danh sách để tải lên")
                         .into_any_element()
                 } else {
+                    // Laid out once and moved into the closure. Building it
+                    // inside instead cost four passes a frame, not the two it
+                    // looked like: gpui measures an item in `request_layout`,
+                    // measures again in `prepaint`, then asks for the visible
+                    // range — and each of those took its own `snapshot()` and
+                    // regrouped every job. It also closed the window where the
+                    // count and the rows came from two different snapshots.
+                    let rows = queue_rows(&jobs, &self.expanded_folders);
+                    let lines = rows.len();
                     div()
                         .flex_1()
                         .flex()
@@ -7974,12 +7991,11 @@ impl Browser {
                         .child(self.render_job_header())
                         .child(uniform_list(
                         "transfers",
-                        jobs.len(),
+                        lines,
                         cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            let jobs = this.transfers.snapshot();
                             range
-                                .filter_map(|ix| jobs.get(ix).cloned())
-                                .map(|job| this.render_job(job, cx))
+                                .filter_map(|ix| rows.get(ix).cloned())
+                                .map(|row| this.render_queue_row(row, cx))
                                 .collect::<Vec<_>>()
                             }),
                         )
@@ -9014,11 +9030,11 @@ impl Browser {
 
     /// Column widths for the transfer table. Shared by the header and the rows
     /// so they line up — the object list taught that lesson the hard way.
-    const JOB_COLS: (f32, f32, f32, f32) = (18., 150., 130., 78.);
+    const JOB_COLS: (f32, f32, f32, f32, f32) = (18., 150., 130., 78., 112.);
 
     fn render_job_header(&self) -> impl IntoElement {
         let theme = self.theme;
-        let (icon_w, size_w, progress_w, state_w) = Self::JOB_COLS;
+        let (icon_w, size_w, progress_w, state_w, actions_w) = Self::JOB_COLS;
 
         let cell = move |label: &'static str, width: f32| {
             div()
@@ -9050,14 +9066,251 @@ impl Browser {
             .child(cell("Tiến trình", progress_w))
             .child(cell("Trạng thái", state_w))
             // Matches the two action buttons on a row.
-            .child(div().w(px(112.)))
+            .child(div().w(px(actions_w)))
     }
 
-    fn render_job(&self, job: Job, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_queue_row(&self, row: QueueRow, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match row {
+            QueueRow::Heading(section) => self.render_queue_heading(section).into_any_element(),
+            QueueRow::Folder(folder) => self.render_folder(folder, cx).into_any_element(),
+            QueueRow::Job { job, child } => self.render_job(job, child, cx).into_any_element(),
+        }
+    }
+
+    /// A status heading inside the queue.
+    ///
+    /// As tall as a job row, not `HEADER_HEIGHT`, because `uniform_list`
+    /// measures one row and spaces every other row by that height. A heading
+    /// declaring a shorter height would not pull the rows under it up — and
+    /// since the first line is always a heading, it is the row that gets
+    /// measured, so every file row would be squashed into 28px.
+    fn render_queue_heading(&self, section: QueueSection) -> impl IntoElement {
+        let theme = self.theme;
+
+        div()
+            .h(px(JOB_ROW_HEIGHT))
+            .w_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .text_xs()
+            .text_color(theme.text_faint)
+            .child(section.label())
+    }
+
+    /// A folder's files on one line, with the same columns as a job row so the
+    /// two line up under one header.
+    fn render_folder(&self, folder: FolderRow, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let (icon_w, size_w, progress_w, state_w, actions_w) = Self::JOB_COLS;
+        let fraction = folder.fraction();
+        let state_color = match folder.section {
+            QueueSection::Active => theme.accent,
+            QueueSection::Done => theme.text_muted,
+            QueueSection::Failed => theme.danger,
+            QueueSection::Canceled => theme.text_faint,
+        };
+        let key = folder.key.clone();
+        let pause_ids = folder.ids.clone();
+        let resume_ids = folder.ids.clone();
+        let remove_ids = folder.ids.clone();
+
+        div()
+            .id(SharedString::from(format!("folder-{}", folder.key)))
+            .h(px(JOB_ROW_HEIGHT))
+            .w_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .cursor_pointer()
+            .hover(|this| this.bg(theme.hover))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if !this.expanded_folders.remove(&key) {
+                    this.expanded_folders.insert(key.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                // Pointing where the click sends things, which is the
+                // convention the status bar's own queue toggle already set:
+                // ▾ while shut, because the files come *down* out of it, and ▴
+                // once they are out. The first draft had it the other way and
+                // read as "collapse" on a row that was already collapsed.
+                div().w(px(icon_w)).child(sized_icon(
+                    if folder.expanded {
+                        "chevron-up"
+                    } else {
+                        "chevron-down"
+                    },
+                    12.,
+                    theme.text_faint,
+                )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon("folder", theme.accent))
+                    .child(
+                        div()
+                            .text_color(theme.text)
+                            .child(SharedString::from(folder.name.clone())),
+                    )
+                    // The count is what says this row stands for more than one
+                    // thing; without it a folder row reads as a single file.
+                    .child(
+                        div()
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!("{} tệp", folder.count))),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(size_w))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "{} / {}",
+                        format_size(folder.transferred as i64),
+                        format_size(folder.size as i64)
+                    ))),
+            )
+            .child(
+                div()
+                    .w(px(progress_w))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h(px(PROGRESS_HEIGHT))
+                            .rounded_sm()
+                            .bg(theme.hover)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fraction))
+                                    .rounded_sm()
+                                    .bg(if folder.section == QueueSection::Failed {
+                                        theme.danger
+                                    } else {
+                                        theme.accent
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!(
+                                "{}%",
+                                (fraction * 100.0).round() as u32
+                            ))),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(state_w))
+                    .text_color(state_color)
+                    .child(folder.state_label),
+            )
+            // The buttons act on every file under the row. Pausing two hundred
+            // files one at a time is the thing this row exists to avoid.
+            .child(
+                div()
+                    .w(px(actions_w))
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    // Both, when both apply. Unlike a single job the states
+                    // here are not exclusive — one queued file and one failed
+                    // file makes a folder that can be paused *and* resumed —
+                    // and an `else if` meant the failed one could only be
+                    // retried by opening the row.
+                    .when(folder.pausable, |this| {
+                        this.child(
+                            icon_button_dyn(
+                                SharedString::from(format!("folder-pause-{}", folder.key)),
+                                "pause",
+                                theme,
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                // Or the row underneath fires too and pausing
+                                // the folder also opens it.
+                                cx.stop_propagation();
+                                for id in &pause_ids {
+                                    this.transfers.pause(*id);
+                                }
+                                cx.notify();
+                            })),
+                        )
+                    })
+                    .when(folder.resumable, |this| {
+                        this.child(
+                            icon_button_dyn(
+                                SharedString::from(format!("folder-resume-{}", folder.key)),
+                                "play",
+                                theme,
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(client) = this.client.clone() {
+                                    for id in &resume_ids {
+                                        this.transfers.resume(*id, client.clone());
+                                    }
+                                    this.start_ticking(cx);
+                                }
+                                cx.notify();
+                            })),
+                        )
+                    })
+                    .child(
+                        icon_button_dyn(
+                            SharedString::from(format!("folder-remove-{}", folder.key)),
+                            "close",
+                            theme,
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            for id in &remove_ids {
+                                this.transfers.remove_job(*id);
+                            }
+                            this.prune_expanded_folders();
+                            cx.notify();
+                        })),
+                    ),
+            )
+    }
+
+    /// Forgets folders that no longer have jobs behind them.
+    ///
+    /// The open-set is keyed by prefix, so without this a folder uploaded,
+    /// cleared, and uploaded again next week comes back already open — a row
+    /// nobody opened, holding files nobody asked to see. Called wherever jobs
+    /// leave the queue, which is the only way a key goes stale.
+    fn prune_expanded_folders(&mut self) {
+        let live: HashSet<String> = self
+            .transfers
+            .snapshot()
+            .iter()
+            .filter_map(folder_group_key)
+            .collect();
+        self.expanded_folders.retain(|key| live.contains(key));
+    }
+
+    /// One file. `child` indents it under the folder row it belongs to.
+    fn render_job(&self, job: Job, child: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let id = job.id;
         let fraction = job.fraction();
-        let (icon_w, size_w, progress_w, state_w) = Self::JOB_COLS;
+        let (icon_w, size_w, progress_w, state_w, actions_w) = Self::JOB_COLS;
         let direction = match job.direction {
             transfer::Direction::Upload => "upload",
             transfer::Direction::Download => "download",
@@ -9083,6 +9336,9 @@ impl Browser {
             .items_center()
             .gap_2()
             .text_xs()
+            // Indent, so a file under an open folder row is read as belonging
+            // to it rather than as another folder's worth of work.
+            .when(child, |this| this.child(div().w(px(14.))))
             .child(div().w(px(icon_w)).child(icon(direction, theme.text_faint)))
             .child(
                 div()
@@ -9147,7 +9403,7 @@ impl Browser {
             )
             .child(
                 div()
-                    .w(px(112.))
+                    .w(px(actions_w))
                     .flex()
                     .justify_end()
                     .gap_1()
@@ -10186,6 +10442,313 @@ fn next_bandwidth_limit(current: u64) -> u64 {
         Some(ix) => BANDWIDTH_PRESETS[(ix + 1) % BANDWIDTH_PRESETS.len()],
         None => BANDWIDTH_PRESETS[0],
     }
+}
+
+/// Which heading a line of the transfer queue sits under.
+///
+/// Four headings rather than one per `JobState`: queued, running and paused all
+/// mean the transfer has not happened yet, and a heading each would cut the
+/// list into slivers that repeat what the state column beside them already
+/// says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueSection {
+    Active,
+    Done,
+    Failed,
+    Canceled,
+}
+
+impl QueueSection {
+    /// The order the drawer draws headings in.
+    const ORDER: [QueueSection; 4] = [
+        QueueSection::Active,
+        QueueSection::Done,
+        QueueSection::Failed,
+        QueueSection::Canceled,
+    ];
+
+    fn of(state: JobState) -> Self {
+        match state {
+            JobState::Queued | JobState::Running | JobState::Paused => QueueSection::Active,
+            JobState::Done => QueueSection::Done,
+            JobState::Failed => QueueSection::Failed,
+            JobState::Canceled => QueueSection::Canceled,
+        }
+    }
+
+    /// Uppercase, like every other section heading in this file — ĐÃ GHIM,
+    /// BUCKETS, QUYỀN TRUY CẬP, and the drawer's own "HÀNG ĐỢI {n}" three lines
+    /// above. It also stops a heading reading as a state cell: "đang chạy" is
+    /// a value the Trạng thái column already prints.
+    fn label(self) -> &'static str {
+        match self {
+            QueueSection::Active => "ĐANG CHẠY",
+            QueueSection::Done => "XONG",
+            QueueSection::Failed => "HỎNG",
+            QueueSection::Canceled => "ĐÃ HUỶ",
+        }
+    }
+}
+
+/// Where a folder row is filed when its files are not all in the same state.
+///
+/// Anything still moving wins, so a folder does not leave the running section
+/// while part of it is still going. After that, "xong" is reserved for a folder
+/// that arrived whole: the headings are what someone scans to decide whether
+/// anything needs them, and a folder with one broken or cancelled file filed
+/// under "xong" hides exactly the file they were looking for.
+fn folder_section(members: &[Job]) -> QueueSection {
+    for section in [
+        QueueSection::Active,
+        QueueSection::Failed,
+        QueueSection::Canceled,
+    ] {
+        if members
+            .iter()
+            .any(|job| QueueSection::of(job.state) == section)
+        {
+            return section;
+        }
+    }
+    QueueSection::Done
+}
+
+/// The folder row a job belongs to, or `None` for a key at the bucket root.
+///
+/// Grouped on the shared parent prefix, which is not quite what it should be: a
+/// `Job` carries an id, a direction, a bucket, a key, a size and a state, and
+/// nothing that says "these two were queued by the same dropped folder". So two
+/// files uploaded separately into one folder also collapse into a single row.
+/// That is the safe direction to be wrong in — the row opens to show exactly
+/// which files it stands for — and it is the only one available without a batch
+/// id on the job itself.
+///
+/// It also means a folder with subfolders arrives as one row per level rather
+/// than one row for the drop, since each level is its own prefix.
+///
+/// Direction and bucket are part of the key because an upload and a download of
+/// the same prefix are different work; one progress bar over bytes moving in
+/// opposite directions would say nothing.
+fn folder_group_key(job: &Job) -> Option<String> {
+    let prefix = parent_prefix_of(&job.key);
+    if prefix.is_empty() {
+        return None;
+    }
+    let direction = match job.direction {
+        transfer::Direction::Upload => "upload",
+        transfer::Direction::Download => "download",
+    };
+    // `|` separates the three parts unambiguously: a bucket name cannot contain
+    // one, so a key that does cannot be mistaken for another bucket's.
+    Some(format!("{direction}|{}|{prefix}", job.bucket))
+}
+
+/// The prefix out of a group key, which is `direction|bucket|prefix/`.
+///
+/// Trailing slash removed: it is how a prefix is written everywhere in the S3
+/// API, and nowhere in a name a person reads.
+fn folder_name_of_key(group_key: &str) -> String {
+    group_key
+        .splitn(3, '|')
+        .nth(2)
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// What a folder row prints in the name column.
+///
+/// The prefix on its own when that is enough to tell the rows apart, and the
+/// bucket in front of it when it is not. Direction last, for the one case both
+/// leave ambiguous: the same prefix in the same bucket going both ways at once.
+fn folder_display_name(group_key: &str, plain_counts: &HashMap<String, usize>) -> String {
+    let mut parts = group_key.splitn(3, '|');
+    let direction = parts.next().unwrap_or_default();
+    let bucket = parts.next().unwrap_or_default();
+    let prefix = parts.next().unwrap_or_default().trim_end_matches('/');
+
+    if plain_counts.get(prefix).copied().unwrap_or(0) <= 1 {
+        return prefix.to_string();
+    }
+    let direction = match direction {
+        "download" => " ↓",
+        _ => " ↑",
+    };
+    format!("{bucket}/{prefix}{direction}")
+}
+
+/// What a folder row prints in the Trạng thái column.
+///
+/// Not the section heading's word. A folder of files that have not started is
+/// filed under ĐANG CHẠY — nothing has failed, so it belongs with the work
+/// still to do — but printing "đang chạy" beside it while every child row says
+/// "chờ" is one column giving two answers in one frame. The order is the one a
+/// reader scans: what is happening, then what is waiting, then how it ended.
+fn folder_state_label(members: &[Job]) -> &'static str {
+    let any = |wanted: JobState| members.iter().any(|job| job.state == wanted);
+    if any(JobState::Running) {
+        "đang chạy"
+    } else if any(JobState::Queued) {
+        "chờ"
+    } else if any(JobState::Paused) {
+        "tạm dừng"
+    } else if any(JobState::Failed) {
+        "lỗi"
+    } else if any(JobState::Canceled) {
+        "đã huỷ"
+    } else {
+        "xong"
+    }
+}
+
+/// A folder's jobs, collapsed onto one line.
+#[derive(Clone, Debug)]
+struct FolderRow {
+    /// Identity of the group; also what the expanded set holds and what the
+    /// row's element ids are built from.
+    key: String,
+    name: String,
+    section: QueueSection,
+    expanded: bool,
+    count: usize,
+    /// What the Trạng thái column prints. Kept apart from `section`, which only
+    /// decides which heading the row files under.
+    state_label: &'static str,
+    transferred: u64,
+    size: u64,
+    /// Every job on the row, so its buttons act on the whole folder.
+    ids: Vec<i64>,
+    pausable: bool,
+    resumable: bool,
+}
+
+impl FolderRow {
+    fn build(key: String, name: String, members: &[Job], expanded: bool) -> Self {
+        Self {
+            name,
+            key,
+            section: folder_section(members),
+            state_label: folder_state_label(members),
+            expanded,
+            count: members.len(),
+            transferred: members.iter().map(|job| job.transferred).sum(),
+            size: members.iter().map(|job| job.size).sum(),
+            ids: members.iter().map(|job| job.id).collect(),
+            pausable: members
+                .iter()
+                .any(|job| matches!(job.state, JobState::Running | JobState::Queued)),
+            resumable: members
+                .iter()
+                .any(|job| matches!(job.state, JobState::Paused | JobState::Failed)),
+        }
+    }
+
+    /// The same rule one job uses: with nothing to divide by, a finished folder
+    /// is full and anything else is empty, rather than a NaN-wide bar.
+    fn fraction(&self) -> f32 {
+        if self.size == 0 {
+            return if self.section == QueueSection::Done {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        (self.transferred as f32 / self.size as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// One line of the transfer drawer.
+#[derive(Clone, Debug)]
+enum QueueRow {
+    Heading(QueueSection),
+    Folder(FolderRow),
+    /// `child` marks a file drawn under an open folder row.
+    Job { job: Job, child: bool },
+}
+
+/// Lays the queue out the way the drawer draws it: a heading over each
+/// non-empty status section, the files of one folder collapsed onto a single
+/// row, and that folder's files under it when it is open.
+fn queue_rows(jobs: &[Job], expanded: &HashSet<String>) -> Vec<QueueRow> {
+    /// A folder row and its files, or a file standing alone.
+    enum Item {
+        Folder(FolderRow, Vec<Job>),
+        Job(Job),
+    }
+
+    let mut first_seen: HashMap<String, usize> = HashMap::new();
+    let mut members: HashMap<String, Vec<Job>> = HashMap::new();
+    for (ix, job) in jobs.iter().enumerate() {
+        let Some(key) = folder_group_key(job) else {
+            continue;
+        };
+        first_seen.entry(key.clone()).or_insert(ix);
+        members.entry(key).or_default().push(job.clone());
+    }
+    // One file under a prefix is not a folder transfer; hiding it behind a row
+    // that has to be opened to see the single thing inside is worse than the
+    // flat row it replaces.
+    members.retain(|_, files| files.len() > 1);
+
+    // Keyed by where the entry first appears in the queue, so folders and lone
+    // files stay in the order they were queued instead of in whatever order the
+    // grouping happened to visit them.
+    // Two folders can share a prefix and still be different work — the same
+    // `photos/` in two buckets, or one being uploaded while the other comes
+    // down. Left alone they draw as two rows with the same name, the same
+    // count and the same bar, and nothing on the row says which is which.
+    // Qualified only where that actually happens, so the ordinary row stays
+    // short.
+    let mut plain: HashMap<String, usize> = HashMap::new();
+    for key in members.keys() {
+        *plain.entry(folder_name_of_key(key)).or_default() += 1;
+    }
+
+    let mut items: Vec<(usize, Item)> = members
+        .iter()
+        .map(|(key, files)| {
+            let name = folder_display_name(key, &plain);
+            let row = FolderRow::build(key.clone(), name, files, expanded.contains(key));
+            (first_seen[key], Item::Folder(row, files.clone()))
+        })
+        .collect();
+    for (ix, job) in jobs.iter().enumerate() {
+        let grouped = folder_group_key(job).is_some_and(|key| members.contains_key(&key));
+        if !grouped {
+            items.push((ix, Item::Job(job.clone())));
+        }
+    }
+    items.sort_by_key(|(ix, _)| *ix);
+
+    let mut rows = Vec::new();
+    for section in QueueSection::ORDER {
+        let mut body = Vec::new();
+        for (_, item) in &items {
+            match item {
+                Item::Folder(row, files) if row.section == section => {
+                    body.push(QueueRow::Folder(row.clone()));
+                    if row.expanded {
+                        body.extend(files.iter().map(|job| QueueRow::Job {
+                            job: job.clone(),
+                            child: true,
+                        }));
+                    }
+                }
+                Item::Job(job) if QueueSection::of(job.state) == section => {
+                    body.push(QueueRow::Job {
+                        job: job.clone(),
+                        child: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if !body.is_empty() {
+            rows.push(QueueRow::Heading(section));
+            rows.append(&mut body);
+        }
+    }
+    rows
 }
 
 /// Expiry choices for a presigned URL. Capped per-credential-type at sign time,
@@ -11410,6 +11973,7 @@ mod tests {
             failures_open: false,
             transfers: TransferEngine::in_memory().expect("in-memory queue"),
             drawer_open: false,
+            expanded_folders: HashSet::new(),
 
             confirm: None,
             form: None,
@@ -12955,4 +13519,259 @@ mod tests {
         );
     }
 
+    fn job(id: i64, key: &str, state: JobState) -> Job {
+        sized_job(id, key, state, 0, 0)
+    }
+
+    fn sized_job(id: i64, key: &str, state: JobState, transferred: u64, size: u64) -> Job {
+        Job {
+            id,
+            direction: transfer::Direction::Upload,
+            local: PathBuf::from(key),
+            bucket: "demo".into(),
+            key: key.into(),
+            size,
+            transferred,
+            state,
+            error: None,
+            created_at: 0,
+        }
+    }
+
+    /// The drawer, one line per string: `#` a heading, `[n]` a folder row and
+    /// its file count, two spaces a file drawn under an open folder.
+    fn drawn(rows: &[QueueRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                QueueRow::Heading(section) => format!("# {}", section.label()),
+                QueueRow::Folder(folder) => format!("[{}] {}", folder.count, folder.name),
+                QueueRow::Job { job, child } => {
+                    format!("{}{}", if *child { "  " } else { "" }, job.key)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_folder_of_files_is_one_row_until_it_is_opened() {
+        let jobs = [
+            job(1, "photos/a.jpg", JobState::Running),
+            job(2, "photos/b.jpg", JobState::Running),
+            job(3, "photos/c.jpg", JobState::Running),
+        ];
+
+        // Closed: three files, one line. Dropping a folder of two hundred is
+        // what this is for — the flat list buried everything else in the queue.
+        let closed = HashSet::new();
+        assert_eq!(
+            drawn(&queue_rows(&jobs, &closed)),
+            ["# ĐANG CHẠY", "[3] photos"]
+        );
+
+        let open = HashSet::from([folder_group_key(&jobs[0]).unwrap()]);
+        assert_eq!(
+            drawn(&queue_rows(&jobs, &open)),
+            [
+                "# ĐANG CHẠY",
+                "[3] photos",
+                "  photos/a.jpg",
+                "  photos/b.jpg",
+                "  photos/c.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_file_is_never_hidden_behind_a_folder_row() {
+        let jobs = [
+            job(1, "photos/only.jpg", JobState::Running),
+            // At the bucket root there is no folder to collapse into, however
+            // many of them there are.
+            job(2, "top.txt", JobState::Running),
+            job(3, "other.txt", JobState::Running),
+        ];
+
+        assert_eq!(
+            drawn(&queue_rows(&jobs, &HashSet::new())),
+            ["# ĐANG CHẠY", "photos/only.jpg", "top.txt", "other.txt"]
+        );
+    }
+
+    #[test]
+    fn a_folder_row_reports_the_bytes_of_every_file_under_it() {
+        let jobs = [
+            sized_job(1, "photos/a.jpg", JobState::Done, 100, 100),
+            sized_job(2, "photos/b.jpg", JobState::Running, 50, 300),
+        ];
+
+        let rows = queue_rows(&jobs, &HashSet::new());
+        let QueueRow::Folder(folder) = &rows[1] else {
+            panic!("expected a folder row");
+        };
+        assert_eq!((folder.transferred, folder.size), (150, 400));
+        assert!((folder.fraction() - 0.375).abs() < f32::EPSILON);
+        // Both files, not only the ones still moving: the row's buttons act on
+        // everything it stands for.
+        assert_eq!(folder.ids, [1, 2]);
+    }
+
+    #[test]
+    fn a_folder_leaves_the_running_section_only_once_every_file_has_landed() {
+        let mut jobs = [
+            job(1, "photos/a.jpg", JobState::Done),
+            job(2, "photos/b.jpg", JobState::Queued),
+        ];
+        assert_eq!(folder_section(&jobs), QueueSection::Active);
+
+        // A single broken file keeps the whole folder out of "xong", because a
+        // folder filed under "xong" is one nobody goes back to look at.
+        jobs[1].state = JobState::Failed;
+        assert_eq!(folder_section(&jobs), QueueSection::Failed);
+
+        jobs[1].state = JobState::Canceled;
+        assert_eq!(folder_section(&jobs), QueueSection::Canceled);
+
+        jobs[1].state = JobState::Done;
+        assert_eq!(folder_section(&jobs), QueueSection::Done);
+    }
+
+    #[test]
+    fn headings_keep_their_order_and_an_empty_section_draws_nothing() {
+        // Root-level keys, so nothing here collapses into a folder and the
+        // sectioning is the only thing under test.
+        let jobs = [
+            job(1, "canceled.txt", JobState::Canceled),
+            job(2, "done.txt", JobState::Done),
+            job(3, "failed.txt", JobState::Failed),
+            job(4, "running.txt", JobState::Running),
+            job(5, "paused.txt", JobState::Paused),
+        ];
+
+        // Headings come in their fixed order however the queue was filled, and
+        // running and paused share one.
+        assert_eq!(
+            drawn(&queue_rows(&jobs, &HashSet::new())),
+            [
+                "# ĐANG CHẠY",
+                "running.txt",
+                "paused.txt",
+                "# XONG",
+                "done.txt",
+                "# HỎNG",
+                "failed.txt",
+                "# ĐÃ HUỶ",
+                "canceled.txt",
+            ]
+        );
+
+        // A section with nothing in it draws no heading at all.
+        let only_done = [job(1, "done.txt", JobState::Done)];
+        assert_eq!(
+            drawn(&queue_rows(&only_done, &HashSet::new())),
+            ["# XONG", "done.txt"]
+        );
+        assert!(queue_rows(&[], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn the_same_prefix_in_two_places_is_two_folder_rows() {
+        let mut jobs = vec![
+            job(1, "photos/a.jpg", JobState::Running),
+            job(2, "photos/b.jpg", JobState::Running),
+            job(3, "photos/c.jpg", JobState::Running),
+            job(4, "photos/d.jpg", JobState::Running),
+        ];
+        jobs[2].bucket = "backup".into();
+        jobs[3].bucket = "backup".into();
+        // Two buckets, so two rows: one bar over bytes going to two different
+        // places would describe neither. And the rows have to be *told apart* —
+        // two lines with the same name, count and bar, differing only in a
+        // bucket the drawer never shows, leaves the reader guessing which one
+        // to pause.
+        let mut names = drawn(&queue_rows(&jobs, &HashSet::new()));
+        names.sort();
+        assert_eq!(
+            names,
+            ["# ĐANG CHẠY", "[2] backup/photos ↑", "[2] demo/photos ↑"]
+        );
+
+        // Same bucket, opposite directions: the bucket cannot separate them, so
+        // the arrow does.
+        jobs[2].bucket = "demo".into();
+        jobs[3].bucket = "demo".into();
+        jobs[2].direction = transfer::Direction::Download;
+        jobs[3].direction = transfer::Direction::Download;
+        let mut names = drawn(&queue_rows(&jobs, &HashSet::new()));
+        names.sort();
+        assert_eq!(
+            names,
+            ["# ĐANG CHẠY", "[2] demo/photos ↑", "[2] demo/photos ↓"]
+        );
+
+        // And with nothing to collide with, the row stays short.
+        let alone = [
+            job(1, "photos/a.jpg", JobState::Running),
+            job(2, "photos/b.jpg", JobState::Running),
+        ];
+        assert_eq!(
+            drawn(&queue_rows(&alone, &HashSet::new())),
+            ["# ĐANG CHẠY", "[2] photos"]
+        );
+    }
+
+    #[test]
+    fn a_folder_row_says_the_same_thing_as_the_files_under_it() {
+        // The heading and the state cell answer different questions. A folder
+        // of files that have not started files under ĐANG CHẠY — it is work
+        // still to do — but the cell has to say "chờ", because that is what
+        // every row underneath says. Borrowing the heading's word put two
+        // answers in one column in one frame.
+        let queued = [
+            job(1, "photos/a.jpg", JobState::Queued),
+            job(2, "photos/b.jpg", JobState::Queued),
+        ];
+        assert_eq!(folder_section(&queued), QueueSection::Active);
+        assert_eq!(folder_state_label(&queued), "chờ");
+
+        // One file moving is enough to call the folder moving.
+        let mixed = [
+            job(1, "photos/a.jpg", JobState::Queued),
+            job(2, "photos/b.jpg", JobState::Running),
+        ];
+        assert_eq!(folder_state_label(&mixed), "đang chạy");
+
+        // Nothing moving and something broken: the cell says "lỗi", the word a
+        // failed job's own row uses — not "hỏng", which is the heading's.
+        let broken = [
+            job(1, "photos/a.jpg", JobState::Done),
+            job(2, "photos/b.jpg", JobState::Failed),
+        ];
+        assert_eq!(folder_section(&broken), QueueSection::Failed);
+        assert_eq!(folder_state_label(&broken), "lỗi");
+
+        // "xong" only when the whole folder arrived.
+        let done = [
+            job(1, "photos/a.jpg", JobState::Done),
+            job(2, "photos/b.jpg", JobState::Done),
+        ];
+        assert_eq!(folder_state_label(&done), "xong");
+    }
+
+    #[test]
+    fn a_deeper_folder_is_its_own_row() {
+        // Prefix grouping cannot see that these arrived from one dropped
+        // folder, so each level gets a row. Documented rather than hidden: the
+        // job carries nothing that would tell one drop from two.
+        let jobs = [
+            job(1, "trip/a.jpg", JobState::Running),
+            job(2, "trip/b.jpg", JobState::Running),
+            job(3, "trip/raw/c.dng", JobState::Running),
+            job(4, "trip/raw/d.dng", JobState::Running),
+        ];
+
+        assert_eq!(
+            drawn(&queue_rows(&jobs, &HashSet::new())),
+            ["# ĐANG CHẠY", "[2] trip", "[2] trip/raw"]
+        );
+    }
 }

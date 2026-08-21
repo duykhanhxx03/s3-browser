@@ -767,8 +767,11 @@ Ngày tạo thì `ListBuckets` trả sẵn và app đang vứt đi. Một cài �
 dạng (`list_buckets` gọi `list_buckets_detailed` rồi bỏ bớt) — hỏi hai lần cho
 thứ một câu trả lời đã mang theo là loại lãng phí hiện lên hoá đơn.
 
-**d. Hàng đợi gom theo thư mục.** Tải lên một thư mục 200 tệp là **một dòng mở
-được**, không phải 200 dòng. Ngăn kéo của mình đang phẳng.
+**d. ~~Hàng đợi gom theo thư mục~~** — xong (21/08/2026). Gom theo
+`(chiều, bucket, prefix cha)`, vì `Job` **không mang** thứ gì nói "hai tệp này
+cùng một lần kéo thả". Nên hai tệp tải lên riêng lẻ vào cùng một thư mục cũng gom
+chung — hướng sai an toàn, vì dòng mở ra là thấy đúng những tệp nào — và một thư
+mục có thư mục con thì thành một dòng mỗi cấp.
 
 **e. ~~Mục điều hướng mờ đi kèm tooltip~~** — xong (21/08/2026), nhưng **hẹp hơn
 Brows3**. Trạng thái "chưa có profile nào" của họ ở app này không tới được
@@ -811,6 +814,7 @@ Giờ tự dựng nút, đi qua `clear_filter` để focus quay về danh sách,
 ô lọc bucket ở sidebar. Nhân tiện gom ba bản sao của cùng một hình vuông-icon-nhỏ
 (× trên tab, nút làm mới cạnh tiêu đề BUCKETS, và × mới) vào `small_icon_button`.
 
-**i. Uploads và Downloads tách hai trang**, mỗi trang gom theo trạng thái
-(đang chạy / xong / hỏng / đã huỷ). Tách theo chiều thì chưa chắc hơn ngăn kéo một
-chỗ, nhưng **gom theo trạng thái** thì hơn.
+**i. ~~Gom theo trạng thái~~** — xong (21/08/2026): ĐANG CHẠY / XONG / HỎNG /
+ĐÃ HUỶ, mục rỗng không vẽ gì. **Không** tách Uploads và Downloads thành hai trang
+— một ngăn kéo có tiêu đề nhóm nói được cùng chừng ấy mà không bắt ai đổi trang
+để biết một lần truyền đã xong chưa.
