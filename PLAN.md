@@ -770,7 +770,14 @@ thứ một câu trả lời đã mang theo là loại lãng phí hiện lên ho
 **d. Hàng đợi gom theo thư mục.** Tải lên một thư mục 200 tệp là **một dòng mở
 được**, không phải 200 dòng. Ngăn kéo của mình đang phẳng.
 
-**e. Mục điều hướng mờ đi kèm tooltip, thay vì biến mất.** Chưa có profile thì
+**e. ~~Mục điều hướng mờ đi kèm tooltip~~** — xong (21/08/2026), nhưng **hẹp hơn
+Brows3**. Trạng thái "chưa có profile nào" của họ ở app này không tới được
+sidebar: chưa có profile thì cả sidebar không được vẽ, màn onboarding chiếm chỗ.
+Trạng thái thật sự tới được là `client` rỗng — đọc keychain hỏng thì `connect`
+thoát sớm trước khi đặt `active_profile`. Còn "khoá sai" thì `client` **vẫn có**
+(dựng client không xác thực gì), và ở đó panel lỗi kèm nút "Sửa profile" nói được
+nhiều hơn một tooltip. Nên cổng chặn khoá theo `client`, không theo
+`active_profile` như bản agent làm — hai thứ đó lệch nhau đúng ở chỗ này. Chưa có profile thì
 Home/Favorites/Recent/Downloads/Uploads vẫn nằm đó, xám, tooltip "Create a profile
 first". Cách này dạy hình dáng ứng dụng trước khi dùng được nó.
 

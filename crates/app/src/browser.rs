@@ -15,6 +15,7 @@ use gpui::Focusable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::ContextMenuExt;
 use gpui_component::select::{Select, SelectEvent, SelectState};
+use gpui_component::tooltip::Tooltip;
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
@@ -2328,12 +2329,28 @@ impl Browser {
         self.open(place.bucket.clone().into(), place.prefix.clone(), cx);
     }
 
+    /// Why the sidebar's rows and the pages behind them cannot be used.
+    ///
+    /// One predicate for both ways in. The rows went grey and the palette kept
+    /// running the very same two commands, in the same words — greying a row
+    /// while ⌘K still fires it is not a block, it is a rumour.
+    fn sidebar_blocked(&self) -> Option<&'static str> {
+        sidebar_blocked_reason(self.client.is_some() || self.connecting)
+    }
+
     /// Shows a page, or goes back to the listing if it is already showing.
     ///
     /// A toggle, so the same row that opened it closes it. The alternative is a
     /// page with no way back except opening something, which forces a
     /// navigation on someone who only wanted a look.
     fn show_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        // Closing is always allowed: being stuck on a page because the thing
+        // that opened it went away is worse than the page itself.
+        if let (Some(reason), true) = (self.sidebar_blocked(), self.screen != screen) {
+            self.status = reason.into();
+            cx.notify();
+            return;
+        }
         self.screen = if self.screen == screen {
             Screen::Objects
         } else {
@@ -5380,6 +5397,11 @@ impl Browser {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let current_bucket = self.bucket.clone();
+        // Everything above Cài đặt needs credentials behind it. Cài đặt does
+        // not, and must not be blocked: it is where a profile is made, so
+        // greying it out would leave the only way out of this state greyed out
+        // too.
+        let blocked = self.sidebar_blocked();
 
         div()
             .w(px(SIDEBAR_WIDTH))
@@ -5400,11 +5422,16 @@ impl Browser {
                     "bucket",
                     "Tất cả bucket".into(),
                     self.screen == Screen::Buckets,
+                    blocked,
                     theme,
                 )
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.show_screen(Screen::Buckets, cx);
-                })),
+                // Never attached rather than attached and made to return early,
+                // so the row being dead is decided in one place instead of two.
+                .when(blocked.is_none(), |row| {
+                    row.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_screen(Screen::Buckets, cx);
+                    }))
+                }),
             )
             .child(
                 sidebar_item(
@@ -5412,11 +5439,14 @@ impl Browser {
                     "clock",
                     "Gần đây".into(),
                     self.screen == Screen::Recent,
+                    blocked,
                     theme,
                 )
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.show_screen(Screen::Recent, cx);
-                })),
+                .when(blocked.is_none(), |row| {
+                    row.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_screen(Screen::Recent, cx);
+                    }))
+                }),
             )
             .children(self.render_places(cx))
             .child(
@@ -5521,11 +5551,14 @@ impl Browser {
                             "bucket",
                             bucket,
                             selected,
+                            blocked,
                             theme,
                         )
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.open(target.clone(), String::new(), cx);
-                        }))
+                        .when(blocked.is_none(), |row| {
+                            row.on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.open(target.clone(), String::new(), cx);
+                            }))
+                        })
                     })
                     .collect::<Vec<_>>(),
             )
@@ -5538,8 +5571,15 @@ impl Browser {
             // At the foot of the sidebar, where Brows3 has it and where every
             // app of this shape has it. Giới thiệu sits under it as a pair.
             .child(
-                sidebar_item("settings-open".into(), "more", "Cài đặt".into(), false, theme)
-                    .on_click(
+                sidebar_item(
+                    "settings-open".into(),
+                    "more",
+                    "Cài đặt".into(),
+                    false,
+                    None,
+                    theme,
+                )
+                .on_click(
                     cx.listener(|this, _event, _window, cx| {
                         this.settings_open = true;
                         cx.notify();
@@ -5550,7 +5590,10 @@ impl Browser {
             // the version number is the one writing a bug report, and asking
             // them to find a command palette first is where that report stops.
             .child(
-                sidebar_item("about-open".into(), "info", "Giới thiệu".into(), false, theme)
+                // Never blocked, for the same reason as Cài đặt: someone with
+                // nothing connected is exactly who needs to read off a version
+                // number and find the crash folder.
+                sidebar_item("about-open".into(), "info", "Giới thiệu".into(), false, None, theme)
                     .on_click(cx.listener(|this, _event, _window, cx| this.open_about(cx))),
             )
     }
@@ -5580,7 +5623,9 @@ impl Browser {
             // twenty-six, because these rows are the same size as every other
             // row now and fewer of the bigger characters fit.
             let label = elide_middle(&place.label(), 22);
-            sidebar_item(id, "star", SharedString::from(label), false, theme).on_click(
+            // Never blocked: this section only exists while a profile is
+            // active, since a pinned place belongs to one set of credentials.
+            sidebar_item(id, "star", SharedString::from(label), false, None, theme).on_click(
                 cx.listener(move |this, _event, _window, cx| this.open_place(&target, cx)),
             )
         };
@@ -9598,6 +9643,29 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
         .child(label)
 }
 
+/// Why the sidebar's rows cannot be used, or `None` when they can.
+///
+/// Keyed on the client, which is what every one of those rows would need: the
+/// `+` beside BUCKETS checks it, `open` returns early without it, and so does
+/// `refresh_buckets`. An earlier draft keyed on `active_profile` instead and
+/// disagreed with all three — a connect that fails after the profile is chosen
+/// leaves a profile selected and no client, and every row stayed lit.
+///
+/// A connect in flight counts as live. It is about to be, and blinking the
+/// whole sidebar grey for the second a startup takes is worse than a row that
+/// does nothing for that second.
+///
+/// One sentence, not two: telling the difference between "no profile chosen"
+/// and "the chosen one did not connect" is the failure panel's job, and it is
+/// already saying it in more words than a tooltip has room for.
+fn sidebar_blocked_reason(connected: bool) -> Option<&'static str> {
+    if connected {
+        None
+    } else {
+        Some("Chưa kết nối tới profile nào")
+    }
+}
+
 /// One row of the sidebar: an icon, a label, and a highlight when you are on it.
 ///
 /// **Every** row in there is this shape — the two nav entries at the top, the
@@ -9606,11 +9674,19 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
 /// began where everyone else's *icon* did, and the column had a ragged left
 /// edge — and the pinned list was a size smaller again on a theory about
 /// sub-lists that only ever read as an accident.
+///
+/// `blocked` is the sentence saying why the row cannot be used, and dims it
+/// instead of removing it. A nav entry that comes and goes is one nobody learns
+/// the position of, and a window that changes shape the moment the last profile
+/// is deleted hides the app's own layout from the person least likely to know
+/// it. The selected background stays even when blocked — it reports which page
+/// is on screen, which is still true — but nothing else about the row does.
 fn sidebar_item(
     id: SharedString,
     icon: &'static str,
     label: SharedString,
     active: bool,
+    blocked: Option<&'static str>,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -9622,14 +9698,30 @@ fn sidebar_item(
         .items_center()
         .gap_1p5()
         .text_sm()
-        .cursor_pointer()
         .when(active, |this| this.bg(theme.selected))
-        .text_color(if active { theme.text } else { theme.text_muted })
-        .hover(|this| this.bg(theme.hover))
+        .text_color(match (blocked.is_some(), active) {
+            (true, _) => theme.text_faint,
+            (false, true) => theme.text,
+            (false, false) => theme.text_muted,
+        })
+        // A hover highlight and a hand cursor on a row whose click is dropped
+        // are both promises the row cannot keep.
+        .when_else(
+            blocked.is_some(),
+            |this| this.cursor_default(),
+            |this| this.cursor_pointer().hover(|this| this.bg(theme.hover)),
+        )
+        .when_some(blocked, |this, reason| {
+            this.tooltip(move |window, cx| Tooltip::new(reason).build(window, cx))
+        })
         .child(sized_icon(
             icon,
             13.,
-            if active { theme.accent } else { theme.text_faint },
+            if active && blocked.is_none() {
+                theme.accent
+            } else {
+                theme.text_faint
+            },
         ))
         .child(
             div()
@@ -12003,6 +12095,21 @@ mod tests {
         assert_eq!(
             split_endpoint("s3.example.com/mybucket"),
             ("https://s3.example.com".into(), Some("mybucket".into()))
+        );
+    }
+
+    #[test]
+    fn the_sidebar_goes_dead_with_the_client_not_with_the_profile() {
+        // Connected: nothing greyed out, no row carrying a tooltip.
+        assert_eq!(sidebar_blocked_reason(true), None);
+
+        // Not connected. Keyed on the client rather than on `active_profile`
+        // because a connect that fails after the profile is chosen leaves a
+        // profile selected and no client — and every row lit, promising work
+        // that `open` and `refresh_buckets` both refuse to do.
+        assert_eq!(
+            sidebar_blocked_reason(false),
+            Some("Chưa kết nối tới profile nào")
         );
     }
 
