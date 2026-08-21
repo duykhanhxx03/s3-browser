@@ -5558,21 +5558,22 @@ impl Browser {
         let theme = self.theme;
         let limit_mb = self.settings.preview_limit_bytes() / (1024 * 1024);
         let kind: SharedString = type_badge_of(&previewing.name).unwrap_or_else(|| "TỆP".into());
-        // Text is fetched only as far as the limit. Saying so in the header is
-        // the difference between reading a file and reading the start of one —
-        // and it is also why the "Sửa" button is missing, which otherwise looks
-        // like the button is broken.
+        // Text is fetched only as far as the limit, and that fact belongs in
+        // its own strip rather than tacked onto the end of the title: it is the
+        // difference between reading a file and reading the start of one, and
+        // it is also why the "Sửa" button is missing — which on its own looks
+        // like a broken button.
         let truncated = matches!(
             previewing.content,
             Some(Preview::Text(_)) | Some(Preview::Table(_))
         ) && !self.preview_is_whole();
-        let subtitle: SharedString = {
-            let mut line = format!("{kind} · {}", format_size(previewing.size));
-            if truncated {
-                line.push_str(&format!(" · chỉ hiện {limit_mb} MB đầu"));
-            }
-            line.into()
-        };
+        // The total is already at the end of the title row, so this says the
+        // part the title cannot: how much of it is here, and what that costs.
+        let cut_note: SharedString =
+            format!("Chỉ hiện {limit_mb} MB đầu — không sửa trực tiếp được").into();
+        // No type here. The extension is already in the name directly above it,
+        // and repeating it as `TXT · 31 B` reads like a debug line.
+        let size_text: SharedString = format_size(previewing.size).into();
         let editable = previewing.editing.is_none()
             && matches!(previewing.content, Some(Preview::Text(_)))
             && self.preview_is_whole();
@@ -5601,43 +5602,33 @@ impl Browser {
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
+                                .h(px(HEADER_HEIGHT))
                                 .flex_shrink_0()
                                 .px_3()
-                                .py_2()
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap_3()
                                 .border_b_1()
                                 .border_color(theme.border)
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w(px(0.))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_0p5()
-                                        .child(
-                                            div()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .text_color(theme.text)
-                                                .child(previewing.name.clone()),
-                                        )
-                                        // Type and size belong here: the
-                                        // question a preview answers is "is this
-                                        // the file I wanted", and half of that
-                                        // answer is how big it is.
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .whitespace_nowrap()
-                                                .text_color(if truncated {
-                                                    theme.text_muted
-                                                } else {
-                                                    theme.text_faint
-                                                })
-                                                .child(subtitle),
-                                        ),
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.text)
+                                        .child(previewing.name.clone()),
+                                )
+                                // The size sits quietly at the end of the title
+                                // row, ahead of the buttons: half of "is this
+                                // the file I wanted" is how big it is, and it
+                                // does not deserve a line of its own.
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.text_faint)
+                                        .child(size_text),
                                 )
                                 // Only for text, and only when the whole object
                                 // is here. Editing a preview that stopped at the
@@ -5681,6 +5672,22 @@ impl Browser {
                                     ),
                                 ),
                         )
+                        // A strip of its own, between the title and the text
+                        // it is about.
+                        .when(truncated, |this| {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_3()
+                                    .py_1()
+                                    .bg(theme.hover)
+                                    .border_b_1()
+                                    .border_color(theme.border)
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child(cut_note),
+                            )
+                        })
                         .child(
                             div()
                                 .id("preview-body")
