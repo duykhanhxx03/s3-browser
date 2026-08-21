@@ -4914,6 +4914,19 @@ impl Browser {
     }
 
     /// Empties the filter and hands the keyboard back to the list.
+    /// Empties the sidebar's bucket filter.
+    ///
+    /// Its own method rather than an inline `set_value("")`: the field's text
+    /// and `self.bucket_filter` are two copies of one fact, and every place
+    /// that clears one has to clear the other.
+    fn clear_bucket_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bucket_filter.clear();
+        if let Some(input) = self.bucket_filter_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
     fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = self.filter_input.clone() {
             // Setting the value emits `Change`, which is what actually clears
@@ -5326,13 +5339,12 @@ impl Browser {
                     // to fall back to.
                     .when(closable, |this| {
                         this.child(
-                            div()
-                                .id(SharedString::from(format!("tab-close-{index}")))
-                                .flex()
-                                .items_center()
-                                .rounded_sm()
-                                .hover(|this| this.bg(theme.hover))
-                                .child(sized_icon("close", 10., theme.text_faint))
+                            small_icon_button(
+                                SharedString::from(format!("tab-close-{index}")),
+                                "close",
+                                10.,
+                                theme,
+                            )
                                 .on_click(cx.listener(move |this, event, window, cx| {
                                     // Or the click reaches the tab underneath and
                                     // selects the tab it just closed.
@@ -5429,16 +5441,8 @@ impl Browser {
                     // nothing, and the note beside it would be a lie.
                     .when(self.buckets_cached, |this| {
                         this.child(
-                            div()
-                                .id("buckets-refresh")
+                            small_icon_button("buckets-refresh".into(), "refresh", 11., theme)
                                 .size(px(20.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|this| this.bg(theme.hover))
-                                .child(sized_icon("refresh", 11., theme.text_faint))
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.refresh_buckets(cx)
                                 })),
@@ -5466,7 +5470,24 @@ impl Browser {
                                 Input::new(&input)
                                     .h(px(FIELD_HEIGHT))
                                     .prefix(sized_icon("search", 12., theme.text_faint))
-                                    .cleanable(true),
+                                    // Same story as the object filter above:
+                                    // `cleanable(true)` was here and drew an
+                                    // invisible control.
+                                    .when(!self.bucket_filter.is_empty(), |this| {
+                                        this.suffix(
+                                            small_icon_button(
+                                                "bucket-filter-clear".into(),
+                                                "close",
+                                                10.,
+                                                theme,
+                                            )
+                                            .on_click(cx.listener(
+                                                |this, _event, window, cx| {
+                                                    this.clear_bucket_filter(window, cx)
+                                                },
+                                            )),
+                                        )
+                                    }),
                             ),
                         )
                     })
@@ -6749,7 +6770,25 @@ impl Browser {
                             .prefix(sized_icon("search", 13., theme.text_faint))
                             // An × inside the field, so clearing it does not
                             // mean selecting the text and deleting it.
-                            .cleanable(true),
+                            //
+                            // Hand-built rather than the component's
+                            // `cleanable(true)`, which was here and drew
+                            // *nothing*: it asks for `IconName::CircleX`, and
+                            // this app serves its own hand-authored icon set,
+                            // which has no such name. So the control existed,
+                            // took its space, and was invisible.
+                            //
+                            // Routed through `clear_filter` — where every other
+                            // way out of a filter goes — so it also puts focus
+                            // back on the list and the arrow keys work again.
+                            .when(!self.filter.is_empty(), |this| {
+                                this.suffix(
+                                    small_icon_button("filter-clear".into(), "close", 11., theme)
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            this.clear_filter(window, cx)
+                                        })),
+                                )
+                            }),
                     ),
                 )
             })
@@ -9357,6 +9396,28 @@ fn sidebar_item(
                 .whitespace_nowrap()
                 .child(label),
         )
+}
+
+/// A bare glyph you can click, with no button chrome around it.
+///
+/// For the small controls that live *inside* something else — the × on a tab,
+/// the refresh beside a section heading, the × inside a filter field. Distinct
+/// from [`icon_button`], which carries a hit target sized for a toolbar.
+fn small_icon_button(
+    id: SharedString,
+    name: &'static str,
+    size: f32,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.hover))
+        .child(sized_icon(name, size, theme.text_faint))
 }
 
 fn icon_button(id: &'static str, name: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {

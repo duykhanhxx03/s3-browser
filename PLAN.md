@@ -782,8 +782,17 @@ profile · region · phím tắt.
 **g. Hộp thoại About** có số phiên bản và link. Trong UI của mình **không chỗ nào**
 nói đang chạy bản nào.
 
-**h. Ô lọc có nút `×` ngay trong ô.** Mình chỉ có "Xoá bộ lọc" ở trạng thái rỗng,
-tức là chỉ thấy khi lọc đã ăn sạch danh sách.
+**h. ~~Ô lọc có nút `×` ngay trong ô~~** — xong (21/08/2026), và **tiền đề ban đầu
+sai**. Lúc đối chiếu tôi kết luận là mình không có nút nào; thật ra cả hai ô lọc
+đều đã gọi `.cleanable(true)` từ lâu, kèm nguyên một comment giải thích. Nhưng nó
+**vẽ ra không có gì**: nút clear của gpui-component xin `IconName::CircleX`, mà
+app này phục vụ bộ icon tự vẽ của riêng nó, không có tên đó. Nên suốt thời gian
+qua có một control chiếm chỗ và vô hình — tệ hơn là không có, vì không ai đi tìm
+thứ mình tưởng là không tồn tại.
+
+Giờ tự dựng nút, đi qua `clear_filter` để focus quay về danh sách, và làm cho cả
+ô lọc bucket ở sidebar. Nhân tiện gom ba bản sao của cùng một hình vuông-icon-nhỏ
+(× trên tab, nút làm mới cạnh tiêu đề BUCKETS, và × mới) vào `small_icon_button`.
 
 **i. Uploads và Downloads tách hai trang**, mỗi trang gom theo trạng thái
 (đang chạy / xong / hỏng / đã huỷ). Tách theo chiều thì chưa chắc hơn ngăn kéo một
