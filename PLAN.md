@@ -1119,3 +1119,20 @@ trạng thái, trang Gần đây / Tất cả bucket, hàng đợi gom nhóm…)
 
 Đã soi lại: hộp Cài đặt nền đục trắng, chip phẳng như cũ; palette giữ layout
 mới trên nền đục. 174 test pass trên gpui nguyên bản.
+
+### 10.22 Bo góc modal, và một lỗi tự gây ở §10.21 (22/08/2026)
+
+Góp ý "modal hơi vuông" hoá ra bắt đúng một lỗi của chính đợt revert. Script
+revert phân biệt vỏ dialog với vỏ popover bằng mức thụt lề, và **điều kiện bị
+ngược**: mười hộp thoại nhận vỏ popover (`rounded_md`, 6px) còn cái popover duy
+nhất nhận vỏ dialog. Bản trước kính có đúng mười `rounded_lg` + một
+`rounded_md`; đối chiếu với `git show 9fd6290` là thấy ngay.
+
+Sửa lại đúng chiều, và nhân đó bo tròn hơn theo ý: hộp thoại **12px**
+(`rounded_xl`, từ 8px), popover **8px** (`rounded_lg`, từ 6px). 12px là quãng
+sheet của macOS hiện nay, và ở kích thước hộp thoại thì 8px vẫn đọc ra hơi
+vuông.
+
+Bài học ghi lại: khi revert bằng script, thứ phân biệt hai khối phải là *nội
+dung* của chúng, không phải khoảng trắng — thụt lề là thứ dễ đảo nhất và im
+lặng nhất khi đảo.
