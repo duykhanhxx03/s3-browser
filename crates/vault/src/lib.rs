@@ -79,16 +79,20 @@ pub enum Provider {
     Wasabi,
     Spaces,
     MinIO,
+    /// Anything else that speaks S3. Defaults to what self-hosted stores
+    /// overwhelmingly need: path-style addressing and relaxed checksums.
+    Compatible,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 6] = [
+    pub const ALL: [Provider; 7] = [
         Provider::Aws,
         Provider::R2,
         Provider::B2,
         Provider::Wasabi,
         Provider::Spaces,
         Provider::MinIO,
+        Provider::Compatible,
     ];
 
     pub fn label(self) -> &'static str {
@@ -99,7 +103,16 @@ impl Provider {
             Provider::Wasabi => "Wasabi",
             Provider::Spaces => "DO Spaces",
             Provider::MinIO => "MinIO",
+            Provider::Compatible => "S3 Compatible",
         }
+    }
+
+    /// The provider a label names. The dropdown hands back the label it showed,
+    /// and this is the only place that mapping lives.
+    pub fn from_label(label: &str) -> Option<Provider> {
+        Provider::ALL
+            .into_iter()
+            .find(|provider| provider.label() == label)
     }
 
     /// What to put in the endpoint field. Empty for AWS, which addresses its
@@ -116,6 +129,8 @@ impl Provider {
             Provider::Wasabi => "https://s3.wasabisys.com",
             Provider::Spaces => "https://sgp1.digitaloceanspaces.com",
             Provider::MinIO => "http://127.0.0.1:9000",
+            // Deliberately not a real host, for the same reason as R2's.
+            Provider::Compatible => "https://s3.example.com",
         }
     }
 
@@ -129,17 +144,6 @@ impl Provider {
         }
     }
 
-    /// The one thing about this provider worth saying in the dialog.
-    pub fn hint(self) -> &'static str {
-        match self {
-            Provider::Aws => "Để trống endpoint; chọn region của bucket.",
-            Provider::R2 => "Thay ACCOUNT_ID bằng account id ở dashboard R2.",
-            Provider::B2 => "Endpoint có số region, xem ở trang Buckets của B2.",
-            Provider::Wasabi => "Region khác us-east-1 thì endpoint đổi theo.",
-            Provider::Spaces => "sgp1 là datacenter; đổi theo Space của bạn.",
-            Provider::MinIO => "Mặc định là MinIO chạy ở máy.",
-        }
-    }
 }
 
 /// Reads and writes the profile list plus its secrets.
@@ -388,9 +392,10 @@ mod tests {
                     assert!(!stored.path_style, "{provider:?} is not path-style");
                     assert!(stored.relaxed_checksums);
                 }
-                // Self-hosted: path-style, because there is no wildcard DNS.
-                Provider::MinIO => {
-                    assert!(stored.path_style, "MinIO needs path-style");
+                // Self-hosted and unknown: path-style, because there is no
+                // wildcard DNS in front of either.
+                Provider::MinIO | Provider::Compatible => {
+                    assert!(stored.path_style, "{provider:?} needs path-style");
                     assert!(stored.relaxed_checksums);
                 }
             }
@@ -404,6 +409,18 @@ mod tests {
         // permissions error, which sends people to check the wrong thing.
         assert!(Provider::R2.endpoint_template().contains("ACCOUNT_ID"));
         assert!(Provider::Aws.endpoint_template().is_empty());
+        assert!(Provider::Compatible.endpoint_template().contains("example.com"));
+    }
+
+    #[test]
+    fn every_label_maps_back_to_its_provider() {
+        // The dropdown returns the string it displayed, so a label that does
+        // not round-trip silently picks nothing and leaves the fields as they
+        // were — which reads as a dead control rather than as a bug.
+        for provider in Provider::ALL {
+            assert_eq!(Provider::from_label(provider.label()), Some(provider));
+        }
+        assert_eq!(Provider::from_label("Không có thật"), None);
     }
 
     #[test]

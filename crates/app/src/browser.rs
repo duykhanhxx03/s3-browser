@@ -14,6 +14,7 @@ use gpui::{
 use gpui::Focusable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
@@ -271,8 +272,10 @@ pub struct Form {
     kind: FormKind,
     fields: Vec<Field>,
     error: Option<SharedString>,
-    /// Which preset filled the endpoint and region, for the profile dialog.
-    provider: Option<Provider>,
+    /// The provider dropdown, on the profile form only.
+    provider_select: Option<Entity<SelectState<Vec<&'static str>>>>,
+    /// Kept alive so the dropdown keeps reporting what was picked.
+    _provider_events: Option<Subscription>,
     /// What a connection test said. Separate from `error`, which is about the
     /// form being wrong: a test that fails leaves the form perfectly valid and
     /// still worth saving, because the endpoint may just be down.
@@ -316,7 +319,8 @@ impl Form {
             kind,
             fields,
             error: None,
-            provider: None,
+            provider_select: None,
+            _provider_events: None,
             probe: None,
         }
     }
@@ -1694,7 +1698,39 @@ impl Browser {
     }
 
     fn open_form(&mut self, kind: FormKind, window: &mut Window, cx: &mut Context<Self>) {
-        self.form = Some(Form::new(kind, window, cx));
+        let is_profile = kind == FormKind::NewProfile;
+        let mut form = Form::new(kind, window, cx);
+
+        if is_profile {
+            // Built here rather than in `Form::new` because the subscription
+            // has to be owned by the browser's context, and `Form::new` only
+            // has an `App`.
+            let labels: Vec<&'static str> =
+                Provider::ALL.into_iter().map(Provider::label).collect();
+            let select = cx.new(|cx| SelectState::new(labels, None, window, cx));
+
+            // `subscribe_in`, not `subscribe`: filling the endpoint and region
+            // fields writes into text inputs, and that needs the window.
+            form._provider_events = Some(cx.subscribe_in(
+                &select,
+                window,
+                |this: &mut Self,
+                 _state,
+                 event: &SelectEvent<Vec<&'static str>>,
+                 window,
+                 cx| {
+                    let SelectEvent::Confirm(Some(label)) = event else {
+                        return;
+                    };
+                    if let Some(provider) = Provider::from_label(label) {
+                        this.pick_provider(provider, window, cx);
+                    }
+                },
+            ));
+            form.provider_select = Some(select);
+        }
+
+        self.form = Some(form);
         cx.notify();
     }
 
@@ -1836,7 +1872,6 @@ impl Browser {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        form.provider = Some(provider);
         // A new preset invalidates whatever the last test concluded, because it
         // just changed the endpoint the test was about.
         form.probe = None;
@@ -5310,55 +5345,34 @@ impl Browser {
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child(form.kind.title()))
-                        // Presets first, because they decide what two of the
-                        // fields below should say. Nobody remembers that R2
-                        // wants region `auto` and a hostname built from an
+                        // The preset comes first, because it decides what two
+                        // of the fields below should say. Nobody remembers that
+                        // R2 wants region `auto` and a hostname built from an
                         // account id, and getting it wrong looks exactly like a
                         // wrong secret key.
-                        .when(is_profile, |this| {
-                            this.child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_1()
-                                    .children(Provider::ALL.into_iter().map(|provider| {
-                                        let selected = form.provider == Some(provider);
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "provider-{}",
-                                                provider.label()
-                                            )))
-                                            .h(px(BUTTON_HEIGHT))
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .rounded_md()
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .bg(if selected { theme.selected } else { theme.hover })
-                                            .text_color(if selected {
-                                                theme.text
-                                            } else {
-                                                theme.text_muted
-                                            })
-                                            .hover(|this| this.bg(theme.selected))
-                                            .child(provider.label())
-                                            .on_click(cx.listener(
-                                                move |this, _event, window, cx| {
-                                                    this.pick_provider(provider, window, cx)
-                                                },
-                                            ))
-                                    })),
-                            )
-                            .when_some(form.provider, |this, provider| {
+                        .when_some(
+                            form.provider_select.clone().filter(|_| is_profile),
+                            |this, select| {
                                 this.child(
                                     div()
-                                        .text_xs()
-                                        .text_color(theme.text_faint)
-                                        .child(provider.hint()),
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(84.))
+                                                .text_xs()
+                                                .text_color(theme.text_faint)
+                                                .child("Dịch vụ"),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w(px(0.)).child(
+                                                Select::new(&select).placeholder("Chọn dịch vụ"),
+                                            ),
+                                        ),
                                 )
-                            })
-                        })
+                            },
+                        )
                         .children(form.fields.iter().map(|field| {
                             div()
                                 .flex()
@@ -5391,31 +5405,43 @@ impl Browser {
                         .when_some(form.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         })
-                        .when_some(form.probe.clone(), |this, probe| {
-                            let (colour, text) = match probe {
-                                Probe::Running => (theme.text_muted, "Đang thử kết nối…".into()),
-                                Probe::Ok(message) => (theme.accent, message),
-                                Probe::Failed(message) => (theme.danger, message),
-                            };
-                            this.child(div().text_xs().text_color(colour).child(text))
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .justify_end()
-                                // Testing before saving, because a saved profile
-                                // that cannot connect is three separate things
-                                // to check and no way to tell them apart.
-                                .when(is_profile, |this| {
-                                    this.child(
+                        // Its own row, under the credentials it tests and well
+                        // away from Huỷ/Lưu. Sitting in that group it read as a
+                        // third way to close the dialog, which is the one thing
+                        // it is not: it changes nothing and saves nothing.
+                        .when(is_profile, |this| {
+                            this.child(
+                                div()
+                                    .pt_2()
+                                    .border_t_1()
+                                    .border_color(theme.border)
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
                                         action_button("form-test", "Thử kết nối", theme).on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.test_profile_connection(cx)
                                             }),
                                         ),
                                     )
-                                })
+                                    .when_some(form.probe.clone(), |this, probe| {
+                                        let (colour, text) = match probe {
+                                            Probe::Running => {
+                                                (theme.text_muted, "Đang thử…".into())
+                                            }
+                                            Probe::Ok(message) => (theme.accent, message),
+                                            Probe::Failed(message) => (theme.danger, message),
+                                        };
+                                        this.child(div().text_xs().text_color(colour).child(text))
+                                    }),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .justify_end()
                                 .child(action_button("form-cancel", "Huỷ", theme).on_click(
                                     cx.listener(|this, _event, _window, cx| {
                                         this.form = None;
