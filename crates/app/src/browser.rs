@@ -74,6 +74,12 @@ const PROGRESS_HEIGHT: f32 = 4.;
 const BUTTON_HEIGHT: f32 = 22.;
 const SIDEBAR_WIDTH: f32 = 214.;
 const TAB_HEIGHT: f32 = 30.;
+/// Wide enough for four digits, which is where a listing stops being something
+/// anyone counts through anyway.
+const ROW_NUMBER_WIDTH: f32 = 34.;
+/// The type column. Six characters is the longest thing `type_badge` will
+/// return, so nothing in it ever needs eliding.
+const TYPE_WIDTH: f32 = 52.;
 /// Fixed, so tabs do not resize under the pointer as their titles change.
 const TAB_WIDTH: f32 = 132.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
@@ -574,11 +580,15 @@ pub struct Browser {
     /// What the filter field holds, mirrored here so the list can be narrowed
     /// without reading the widget on every frame.
     filter: String,
-    /// The breadcrumb, turned into a text field. `Some` only while it is being
-    /// edited: a permanent second input in the toolbar would crowd out the
-    /// breadcrumb it duplicates.
+    /// The `s3://` box in the title bar. Always on screen, after Brows3: it is
+    /// the only way in when the token cannot list buckets, and a box that is
+    /// always there also always says where you are.
     path_input: Option<Entity<InputState>>,
-    path_editing: bool,
+    /// The box needs rewriting to match where we now are. A flag rather than a
+    /// direct write, because writing into a text field needs a `Window` and
+    /// most of what navigates — a task finishing, a click deep in a listener —
+    /// does not have one. `render` does, and runs right after.
+    path_dirty: bool,
     /// The filter field itself. A real input rather than a key-capture bar: it
     /// is on screen all the time now, and a permanent field that cannot take a
     /// paste or a cursor key is a worse lie than no field at all.
@@ -730,15 +740,9 @@ impl Browser {
                     InputEvent::PressEnter { .. } => {
                         let text = state.read(cx).value().to_string();
                         this.go_to_path(&text, cx);
-                        this.path_editing = false;
+                        // Back to the list, so the arrow keys work again
+                        // without a trip to the mouse.
                         this.focus.focus(window);
-                        cx.notify();
-                    }
-                    // Clicking away is the same as changing your mind, and
-                    // leaving the field open over a breadcrumb that no longer
-                    // matches it is worse than closing it.
-                    InputEvent::Blur => {
-                        this.path_editing = false;
                         cx.notify();
                     }
                     _ => {}
@@ -837,7 +841,7 @@ impl Browser {
             sort: Sort::default(),
             filter: String::new(),
             path_input: Some(path_input),
-            path_editing: false,
+            path_dirty: false,
             filter_input: Some(filter_input),
             selection: HashSet::new(),
             cursor: None,
@@ -1122,6 +1126,7 @@ impl Browser {
         }
         self.bucket = Some(bucket.clone());
         self.prefix = prefix.clone();
+        self.path_dirty = true;
         self.entries.clear();
         self.visible.clear();
         self.selection.clear();
@@ -1231,22 +1236,16 @@ impl Browser {
             .into();
         }
 
-        let total = self.entries.len();
-        let shown = self.visible.len();
-        let more = if self.continuation.is_some() { "+" } else { "" };
-        let counted = if shown == total {
-            format!("{total}{more} mục")
-        } else {
-            format!("{shown}/{total}{more} mục")
-        };
-
         // The whole point of the completing machinery: when the prefix is not
         // all here, a sort by size or date is an answer about the part that is,
         // and staying quiet about that is the bug.
         if needs_complete_listing(self.sort) && self.continuation.is_some() {
-            return format!("{counted}, sắp xếp trên phần đã tải").into();
+            return format!("{} mục, sắp xếp trên phần đã tải", self.visible.len()).into();
         }
-        counted.into()
+        // Otherwise nothing: the count moved to the footer under the list, and
+        // the status bar saying it a second time is a line of chrome spent
+        // repeating the line above it.
+        SharedString::default()
     }
 
     fn enter(&mut self, entry_index: usize, cx: &mut Context<Self>) {
@@ -1316,6 +1315,7 @@ impl Browser {
 
     fn restore_tab(&mut self, state: TabState, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_tab_state(state);
+        self.path_dirty = true;
 
         // The filter field is one widget shared by every tab, so its text has to
         // be put back by hand or the box would still show the last tab's filter
@@ -1886,7 +1886,6 @@ impl Browser {
             Some(bucket) => format!("s3://{bucket}/{}", self.prefix),
             None => String::new(),
         };
-        self.path_editing = true;
         input.update(cx, |input, cx| {
             input.set_value(current, window, cx);
             input.focus(window, cx);
@@ -4149,6 +4148,12 @@ impl Browser {
 
     // ------------------------------------------------------------------ input
 
+    fn path_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path_input
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     /// Whether what is typed goes to the filter field rather than to the list.
     fn filter_focused(&self, window: &Window, cx: &App) -> bool {
         self.filter_input
@@ -4335,14 +4340,13 @@ impl Browser {
             return self.close_preview(cx);
         }
 
-        if self.path_editing {
+        // Typing in the path box: Escape hands the keyboard back to the list,
+        // everything else is the field's.
+        if self.path_focused(window, cx) {
             if keystroke.key == "escape" {
-                self.path_editing = false;
                 self.focus.focus(window);
                 cx.notify();
             }
-            // Enter is the field's, through `PressEnter`; everything else is
-            // typing.
             return;
         }
 
@@ -4405,6 +4409,70 @@ impl Browser {
     }
 
     // ----------------------------------------------------------------- render
+
+    /// The title bar: the path, and which account it is being read with.
+    ///
+    /// Laid out after Brows3, which puts the `s3://` box across the top rather
+    /// than hiding it behind a click. Two reasons it belongs there: it is the
+    /// only way in when the token cannot list buckets, and a box that is always
+    /// on screen also always says where you are.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let profile = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "Chưa chọn profile".to_string());
+
+        div()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex()
+            .items_center()
+            .gap_2()
+            .pl(px(platform::toolbar_leading_inset()))
+            .pr_2()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .when_some(self.path_input.clone(), |this, input| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            Input::new(&input)
+                                .h(px(FIELD_HEIGHT))
+                                .prefix(sized_icon("path", 12., theme.text_faint)),
+                        ),
+                )
+            })
+            // The account, where Brows3 puts it: the same path under two
+            // profiles is two different places, so it belongs beside the path.
+            .child(
+                div()
+                    .id("profile-switcher")
+                    .h(px(FIELD_HEIGHT))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(theme.hover)
+                    .hover(|this| this.bg(theme.selected))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.profiles_open = true;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text)
+                            .child(SharedString::from(profile)),
+                    )
+                    .child(sized_icon("chevron-down", 10., theme.text_faint)),
+            )
+    }
 
     /// The tab bar.
     ///
@@ -4561,15 +4629,9 @@ impl Browser {
             .when(self.connecting && self.buckets.is_empty(), |this| {
                 this.child(skeleton_sidebar(theme))
             })
-            // Buckets are browsed constantly and profiles are switched rarely,
-            // so the list gets the height and the profile gets a footer.
             .child(div().flex_1())
-            .child(self.render_profile_footer(cx))
     }
 
-    /// The active profile, pinned to the bottom. It opens the manager rather
-    /// than expanding in place: managing profiles is a task of its own, and
-    /// growing the sidebar downward pushed the bucket list around.
     /// The bucket names the sidebar shows, after the filter.
     fn visible_buckets(&self) -> Vec<SharedString> {
         let needle = fold(&self.bucket_filter);
@@ -4578,46 +4640,6 @@ impl Browser {
             .filter(|bucket| needle.is_empty() || fold(bucket).contains(&needle))
             .cloned()
             .collect()
-    }
-
-    fn render_profile_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self
-            .active_profile
-            .and_then(|ix| self.profiles.get(ix))
-            .map(|profile| profile.name.clone())
-            .unwrap_or_else(|| "Chưa chọn profile".to_string());
-
-        div()
-            .pt_2()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .id("profile-switcher")
-                    .h(px(CONTROL_BAR_HEIGHT))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|this| this.bg(theme.hover))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.profiles_open = true;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .text_xs()
-                            .text_color(theme.text)
-                            .child(SharedString::from(active)),
-                    )
-                    .child(icon("plus", theme.text_faint)),
-            )
     }
 
     /// The failure log.
@@ -5011,8 +5033,7 @@ impl Browser {
             .flex()
             .items_center()
             .gap_1()
-            .pl(px(platform::toolbar_leading_inset()))
-            .pr_2()
+            .px_2()
             .border_b_1()
             .border_color(theme.border)
             .child(
@@ -5028,22 +5049,10 @@ impl Browser {
                     },
                 )),
             )
-            // While the path is being edited the field takes the breadcrumb's
-            // place rather than sitting beside it: they say the same thing, and
-            // two of them disagreeing mid-edit is worse than one.
-            .when_some(
-                self.path_input.clone().filter(|_| self.path_editing),
-                |this, input| {
-                    this.child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(Input::new(&input).h(px(FIELD_HEIGHT))),
-                    )
-                },
-            )
-            // Breadcrumb: bucket name, then one segment per prefix level.
-            .when(!self.path_editing, |this| this.child(
+            // Breadcrumb: bucket name, then one segment per prefix level. Kept
+            // alongside the path box rather than replaced by it — the box is for
+            // typing a place, the crumbs are for stepping back through one.
+            .child(
                 div()
                     .flex_1()
                     .flex()
@@ -5079,28 +5088,8 @@ impl Browser {
                                 })),
                             )
                     }))
-                    // The rest of the bar. Clicking the empty space beside a
-                    // path to edit it is what file managers do, but empty space
-                    // announces nothing, which is what the button beside it is
-                    // for.
-                    .child(
-                        div()
-                            .id("path-space")
-                            .flex_1()
-                            .h_full()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.edit_path(window, cx)
-                            })),
-                    ),
-            ))
-            .when(!self.path_editing && self.bucket.is_some(), |this| {
-                this.child(
-                    icon_button("edit-path", "path", theme).on_click(cx.listener(
-                        |this, _event, window, cx| this.edit_path(window, cx),
-                    )),
-                )
-            })
+                    .child(div().flex_1()),
+            )
             // On screen always, not behind ⌘F. A filter you cannot see is a
             // filter you forget is on, and then the list is missing rows for no
             // reason you can point at. ⌘F now moves the caret here rather than
@@ -5314,11 +5303,25 @@ impl Browser {
             .px_3()
             .border_b_1()
             .border_color(theme.border_strong)
+            .child(
+                div()
+                    .w(px(ROW_NUMBER_WIDTH))
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("#"),
+            )
             .child(div().w(px(22.)))
             .child(
                 div().flex_1().child(header(SortKey::Name, "Tên").on_click(
                     cx.listener(|this, _event, _window, cx| this.toggle_sort(SortKey::Name, cx)),
                 )),
+            )
+            .child(
+                div()
+                    .w(px(TYPE_WIDTH))
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("Loại"),
             )
             .child(
                 div().w(px(84.)).child(header(SortKey::Size, "Kích thước").on_click(
@@ -5362,6 +5365,38 @@ impl Browser {
                 this.child(loading_strip("Đang tải thêm…", theme))
             })
             .into_any_element()
+    }
+
+    /// What is in the list, counted, under the list.
+    ///
+    /// After Brows3, which puts it here rather than in the status bar. The
+    /// split between folders and files is the part the bare total never said:
+    /// "1200 mục" is a different situation depending on whether it is twelve
+    /// hundred files or twelve hundred folders.
+    fn render_list_footer(&self) -> impl IntoElement {
+        let theme = self.theme;
+        let folders = self
+            .visible
+            .iter()
+            .filter(|&&index| self.entries[index].is_folder)
+            .count();
+        let files = self.visible.len() - folders;
+
+        div()
+            .h(px(HEADER_HEIGHT))
+            .flex_shrink_0()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.text_faint)
+            .child(SharedString::from(format!("{} mục", self.visible.len())))
+            .child(SharedString::from(format!(
+                "{folders} thư mục, {files} tệp"
+            )))
     }
 
     /// Why the list is empty. An empty prefix and a filter that matched nothing
@@ -5673,6 +5708,26 @@ impl Browser {
             .bg(theme.panel)
             .border_t_1()
             .border_color(theme.border)
+            // With nothing to report, which account this is. The same path
+            // under two profiles is two different places, and that is worth a
+            // permanent line rather than a thing to go and check.
+            .when(self.status.is_empty() && self.failures.is_empty(), |this| {
+                let profile = self
+                    .active_profile
+                    .and_then(|ix| self.profiles.get(ix));
+                this.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_color(theme.text_faint)
+                        .children(profile.map(|profile| {
+                            SharedString::from(profile.name.clone())
+                        }))
+                        .children(profile.map(|profile| {
+                            SharedString::from(profile.region.clone())
+                        })),
+                )
+            })
             .child(match self.failures.last() {
                 // Clickable, because the summary is one line and the rest of
                 // what went wrong has to be reachable from where it is shown.
@@ -7080,8 +7135,22 @@ impl Browser {
 }
 
 impl Render for Browser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+
+        // The one place that has both a window and the current location. Not
+        // while it has focus: overwriting what someone is halfway through
+        // typing is worse than a box that lags a navigation they did not make.
+        if self.path_dirty && !self.path_focused(window, cx) {
+            self.path_dirty = false;
+            if let Some(input) = self.path_input.clone() {
+                let text = match self.bucket.as_ref() {
+                    Some(bucket) => format!("s3://{bucket}/{}", self.prefix),
+                    None => String::new(),
+                };
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        }
 
         div()
             .id("root")
@@ -7141,7 +7210,7 @@ impl Render for Browser {
                 this.child(onboarding)
             })
             .when(!self.profiles.is_empty(), |this| {
-                this.child(self.render_toolbar(cx))
+                this.child(self.render_title_bar(cx))
                     .child(self.render_tabs(cx))
             .child(
                 div()
@@ -7172,9 +7241,16 @@ impl Render for Browser {
                             // a bucket exists reads as a broken window rather
                             // than as a wait.
                             .children(self.render_search_bar(cx))
+                            .child(self.render_toolbar(cx))
                             .when(self.bucket.is_some() || self.connecting, |this| {
                                 this.child(self.render_columns(cx))
                                     .child(self.render_listing(cx))
+                            })
+                            // Outside `render_listing` on purpose: the count
+                            // belongs to the pane, not to whichever of the
+                            // three states the list happens to be in.
+                            .when(self.bucket.is_some() && !self.loading, |this| {
+                                this.child(self.render_list_footer())
                             }),
                     )
                     .children(self.render_inspector(cx)),
@@ -7476,6 +7552,17 @@ fn object_row(
         })
         .when(selected, |this| this.bg(theme.selected))
         .hover(|this| this.bg(theme.hover))
+        // The row number, as Brows3 has it. On a list of twelve hundred files
+        // called `file-0001.txt` it is the only thing that says how far down
+        // you are.
+        .child(
+            div()
+                .w(px(ROW_NUMBER_WIDTH))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child(SharedString::from((position + 1).to_string())),
+        )
         .child(
             div()
                 .w(px(22.))
@@ -7498,13 +7585,34 @@ fn object_row(
             div()
                 .flex_1()
                 .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap_1p5()
                 .overflow_hidden()
-                .text_color(theme.text)
-                .child(SharedString::from(entry.name.clone())),
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(theme.text)
+                        .child(SharedString::from(entry.name.clone())),
+                )
+        )
+        // Its own column rather than a chip beside the name: a chip sits at
+        // whatever x the name happens to end at, so scanning a list for "the
+        // CSVs" means reading every row. A column is one glance down.
+        .child(
+            div()
+                .w(px(TYPE_WIDTH))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .children(type_badge(entry)),
         )
         .child(
             div()
                 .w(px(84.))
+                .flex_shrink_0()
                 .text_color(theme.text_muted)
                 .child(size_label),
         )
@@ -8265,6 +8373,24 @@ fn needs_complete_listing(sort: Sort) -> bool {
 const COMPLETE_MAX_REQUESTS: usize = 100;
 const COMPLETE_MAX_KEYS: usize = 100_000;
 
+/// The extension, as a chip beside the name.
+///
+/// `None` for folders and for names with nothing to show: an empty chip is a
+/// smudge, and a chip that says `TXT` on `README` would be inventing.
+fn type_badge(entry: &Entry) -> Option<SharedString> {
+    if entry.is_folder {
+        return None;
+    }
+    let (_, extension) = entry.name.rsplit_once('.')?;
+    // Long enough to be a suffix rather than an extension — `archive.backup2026`
+    // is not a file type, and neither is the half of a name after a stray dot.
+    if extension.is_empty() || extension.len() > 6 || !extension.chars().all(char::is_alphanumeric)
+    {
+        return None;
+    }
+    Some(extension.to_uppercase().into())
+}
+
 /// Which tab a number key selects.
 ///
 /// `9` means the last one rather than the ninth: with three tabs open, ⌘9 has to
@@ -8682,7 +8808,7 @@ mod tests {
             sort: Sort::default(),
             filter: String::new(),
             path_input: None,
-            path_editing: false,
+            path_dirty: false,
             filter_input: None,
             selection: HashSet::new(),
             cursor: None,
@@ -9586,6 +9712,28 @@ mod tests {
     }
 
     #[test]
+    fn the_type_chip_shows_an_extension_and_nothing_else() {
+        assert_eq!(type_badge(&entry("anh.png", false, 1)).map(|b| b.to_string()),
+            Some("PNG".to_string()));
+        assert_eq!(
+            type_badge(&entry("bang.csv", false, 1)).map(|b| b.to_string()),
+            Some("CSV".to_string())
+        );
+
+        // A folder has no type, and an empty chip beside its name is a smudge.
+        assert_eq!(type_badge(&entry("reports", true, 0)), None);
+        // Nothing after a dot to show.
+        assert_eq!(type_badge(&entry("README", false, 1)), None);
+        // The half of a name after a stray dot is not a file type. Showing
+        // `BACKUP2026` here would be inventing a type nobody has.
+        assert_eq!(type_badge(&entry("archive.backup2026", false, 1)), None);
+        // Nor is punctuation.
+        assert_eq!(type_badge(&entry("a.tar.gz", false, 1)).map(|b| b.to_string()),
+            Some("GZ".to_string()));
+        assert_eq!(type_badge(&entry("weird.a-b", false, 1)), None);
+    }
+
+    #[test]
     fn only_the_order_s3_already_returns_is_free() {
         // `ListObjectsV2` gives lexicographic order and nothing else, so this is
         // the one sort that a half-loaded prefix answers correctly.
@@ -9618,9 +9766,10 @@ mod tests {
         });
 
         entity.update(cx, |browser, _| {
-            // Everything here: any sort is exact and the line stays quiet.
+            // Everything here: any sort is exact, so the line has nothing to
+            // add over the count in the footer under the list.
             browser.sort = Sort { key: SortKey::Size, ascending: true };
-            assert_eq!(browser.listing_summary(), "2 mục");
+            assert_eq!(browser.listing_summary(), "");
 
             // More pages outstanding. Sorting by size now answers "the largest
             // of the ones that happen to have arrived", and the old code said
@@ -9635,7 +9784,7 @@ mod tests {
             // Back to the order S3 returns, and there is nothing to warn about:
             // the pages arrive already in this order.
             browser.sort = Sort { key: SortKey::Name, ascending: true };
-            assert_eq!(browser.listing_summary(), "2+ mục");
+            assert_eq!(browser.listing_summary(), "");
         });
     }
 

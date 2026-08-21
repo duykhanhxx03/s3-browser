@@ -536,9 +536,13 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
    request đi lạc endpoint.
 3. **Favorites và Recent** ở sidebar. Prefix hay dùng nằm sâu ba bốn cấp là chuyện
    thường, mà đường duy nhất tới đó hiện giờ là bấm từng cấp.
-4. **Nhãn loại tệp** cạnh tên (PNG, JSON, PDF). Rẻ, và đọc nhanh hơn phần đuôi.
+4. ~~**Nhãn loại tệp**~~ — xong (21/08/2026), nhưng ở **cột riêng** chứ không phải
+   cạnh tên: một nhãn nằm sau tên thì mỗi dòng một vị trí, quét cả danh sách tìm
+   "mấy cái CSV" là phải đọc từng dòng.
 5. **Nút thao tác trên từng dòng** khi rê chuột, thay vì phải chọn rồi lên toolbar.
-6. **Chân danh sách nói rõ hơn**: "3 thư mục, 5 tệp" thay vì "8 mục".
+6. ~~**Chân danh sách nói rõ hơn**~~ — xong (21/08/2026). "8 mục · 5 thư mục,
+   3 tệp" ngay dưới danh sách; thanh trạng thái nhường chỗ đó cho tên profile và
+   region.
 7. **Màn hình Cài đặt.** App chưa có cái nào: chủ đề, region mặc định, số luồng
    truyền, giới hạn preview, xoá cache. Hiện mỗi thứ nằm rải rác hoặc không đổi
    được.
