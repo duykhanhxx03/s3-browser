@@ -428,3 +428,68 @@ chính chuỗi đã tìm ra nó không thể giấu mất cái nào.
 
 Đã xem tận mắt trên prefix 1200 key: quét qua ranh giới trang, ra đúng
 `many/file-0999.txt` kèm đường dẫn, và ca không khớp nói rõ đã quét hết bucket.
+
+---
+
+## 8. Đối chiếu với CS Browser / s3browser.com (21/08/2026)
+
+Đối chiếu bảng tính năng công bố ở s3browser.com với những gì app này đã có.
+Nhiều mục trùng với §6 nên không nhắc lại; dưới đây là phần §6 chưa nói tới.
+
+### Một lỗi lộ ra khi đối chiếu
+
+**Upload không đặt Content-Type.** `put_object` và `create_multipart_upload` đều
+không gọi `.content_type(..)`, nên mọi object tải lên bằng app này được lưu với
+kiểu mặc định của provider, thường là `application/octet-stream`. Hậu quả không
+thấy ngay trong app — inspector vẫn đọc được kiểu từ `HeadObject` — mà thấy ở
+chỗ khác: một cái ảnh chia sẻ bằng presigned URL sẽ bị trình duyệt tải về thay vì
+mở ra, và một trang tĩnh phục vụ từ bucket sẽ hỏng hoàn toàn.
+
+CS Browser có hẳn một "HTTP Headers Editor" và bộ header mặc định cho việc này,
+tức là họ coi đây là chuyện thường ngày chứ không phải ca hiếm. Đây là lỗi trước,
+tính năng sau.
+
+### Rẻ mà đáng làm ngay
+
+1. **Content-Type khi upload**, đoán từ đuôi file. Sửa lỗi ở trên.
+2. **Sửa header của object đã có**: Content-Type, Cache-Control,
+   Content-Disposition. S3 sửa metadata bằng cách copy đè lên chính nó với
+   `MetadataDirective=REPLACE` — `copy_object` đã có sẵn, chỉ thiếu đường trong
+   giao diện.
+3. **Xem CSV dạng bảng.** Preview hiện chỉ có ảnh và text; CSV hiện ra dạng thô
+   thì đọc được nhưng không dùng được. Parquet thì cần thêm thư viện, tính sau.
+4. **Áp hàng loạt**: ACL và header cho nhiều object một lúc. Cả hai đã có đường
+   đơn lẻ; cái thiếu là vòng lặp có tiến trình và báo lỗi theo từng key — đúng
+   mô hình `delete_prefix` đang dùng.
+
+### Vừa sức, nhưng chưa gấp
+
+- **Requester Pays**: một header trên mỗi request, và một ô tick trong profile.
+- **Transfer Acceleration**: đổi endpoint sang `s3-accelerate`, chỉ AWS.
+- **Bucket logging** và **static website hosting**: cùng nhóm với M8 (lifecycle,
+  CORS, bucket policy), nên gộp vào đó chứ không tách ra.
+- **Proxy**: đã nằm ở M10.
+
+### Lớn
+
+- **Sync hai chiều** — đã là M9, và CS Browser cũng coi đây là mũi nhọn.
+- **Nén và mã hoá phía client (AES-256) trước khi upload.** Khác với SSE: khoá
+  không bao giờ rời máy. Nhưng nó tạo ra một định dạng riêng mà chỉ app này đọc
+  được, nên phải cân nhắc kỹ trước khi hứa — dữ liệu mã hoá bằng một khoá người
+  dùng làm mất là dữ liệu đã mất hẳn.
+
+### Đề nghị không làm
+
+- **Quản lý CloudFront.** Là một sản phẩm khác, không phải một tính năng.
+- **TinyURL.** Gửi key của người dùng sang một dịch vụ thứ ba để đổi lấy một
+  đường link ngắn hơn.
+- **Command-line tools.** Đáng làm, nhưng là một binary khác và một bề mặt khác
+  để bảo trì; chỉ nên bắt đầu khi phần GUI đã ổn định.
+
+### Một lo ngại về quy mô
+
+CS Browser quảng cáo "xử lý hàng triệu file". App này phân trang khi liệt kê,
+nhưng sắp xếp và lọc thì chạy trên toàn bộ `entries` đang giữ trong bộ nhớ. Một
+prefix triệu key sẽ là một triệu `Entry` trong RAM và một lần sort trên mỗi trang
+mới về. Chưa đo, nên chưa biết ngưỡng thật ở đâu — nhưng đây là thứ phải đo trước
+khi in con số đó lên trang bán hàng.
