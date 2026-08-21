@@ -9763,7 +9763,38 @@ fn sidebar_row(
         .child(label)
 }
 
-fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
+/// The one control material, shared by every button and chip.
+///
+/// A vertical gradient — brighter where a convex cap faces the key light,
+/// darker where it turns away — plus a hairline. This is what makes controls
+/// read as pieces of the same glass the panes are cut from; the flat grey
+/// wash each button used to carry read as a sticker on the pane.
+fn control_fill(theme: Theme) -> gpui::Background {
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(theme.control_top, 0.),
+        gpui::linear_color_stop(theme.control_bottom, 1.),
+    )
+}
+
+/// Hover is the cap catching a touch more light, not a different colour: the
+/// same gradient with both ends lifted.
+fn control_fill_hover(theme: Theme) -> gpui::Background {
+    let mut top = theme.control_top;
+    let mut bottom = theme.control_bottom;
+    top.a = (top.a * 1.5).min(1.);
+    bottom.a = (bottom.a * 1.5).min(1.);
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(top, 0.),
+        gpui::linear_color_stop(bottom, 1.),
+    )
+}
+
+/// Every plain control goes through here; the variants below only add their
+/// own colour on top. One place to change the material, thirty places wearing
+/// it.
+fn control_base(id: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(BUTTON_HEIGHT))
@@ -9773,9 +9804,15 @@ fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::S
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(theme.hover)
+        .bg(control_fill(theme))
+        .border_1()
+        .border_color(theme.control_border)
+        .hover(move |this| this.bg(control_fill_hover(theme)))
+}
+
+fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    control_base(id.into(), theme)
         .text_color(theme.text)
-        .hover(|this| this.bg(theme.selected))
         .child(label)
 }
 
@@ -9787,18 +9824,8 @@ fn setting_chip(
     value: String,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(BUTTON_HEIGHT))
-        .px_2()
-        .flex()
-        .items_center()
+    control_base(id.into(), theme)
         .gap_1p5()
-        .rounded_md()
-        .text_xs()
-        .cursor_pointer()
-        .bg(theme.hover)
-        .hover(|this| this.bg(theme.selected))
         .child(div().text_color(theme.text_faint).child(label))
         .child(div().text_color(theme.text).child(SharedString::from(value)))
 }
@@ -9961,32 +9988,36 @@ fn action_button_dyn(
     label: SharedString,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(BUTTON_HEIGHT))
-        .px_2()
-        .flex()
-        .items_center()
-        .rounded_md()
-        .text_xs()
+    control_base(id, theme)
         .text_color(theme.text)
-        .bg(theme.hover)
-        .hover(|style| style.bg(theme.selected))
         .child(label)
 }
 
 fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    // The same convex cap as every other control, cut from red glass: the
+    // gradient runs between the danger colour lightened and darkened rather
+    // than the neutral fill. A flat red slab next to glass buttons read as a
+    // different toolkit.
+    let mut top = theme.danger;
+    top.l = (top.l + 0.06).min(1.);
+    let mut bottom = theme.danger;
+    bottom.l = (bottom.l - 0.05).max(0.);
     div()
         .id(id)
         .h(px(BUTTON_HEIGHT))
         .px_2()
         .flex()
         .items_center()
-        .py_1()
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(theme.danger)
+        .bg(gpui::linear_gradient(
+            180.,
+            gpui::linear_color_stop(top, 0.),
+            gpui::linear_color_stop(bottom, 1.),
+        ))
+        .border_1()
+        .border_color(bottom)
         .text_color(theme.text_on_accent)
         .child(label)
 }
@@ -11658,19 +11689,17 @@ fn choice_chip(
     selected: bool,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(BUTTON_HEIGHT))
-        .px_2()
-        .flex()
-        .items_center()
-        .rounded_md()
-        .text_xs()
-        .cursor_pointer()
-        .bg(if selected { theme.selected } else { theme.hover })
+    // The chosen chip is the same cap filled with the selection tint; the rest
+    // wear the shared control glass. Selection stays a colour, not a shape —
+    // a row of caps where one bulges differently reads as a broken row.
+    let base = control_base(id, theme)
         .text_color(if selected { theme.text } else { theme.text_muted })
-        .hover(|this| this.bg(theme.selected))
-        .child(label)
+        .child(label);
+    if selected {
+        base.bg(theme.selected).border_color(theme.accent)
+    } else {
+        base
+    }
 }
 
 /// Whether a preview of an object that size holds all of it.

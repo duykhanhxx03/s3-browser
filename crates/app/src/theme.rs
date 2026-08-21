@@ -53,6 +53,15 @@ pub struct Theme {
 
     /// The liquid-glass light model for floating surfaces.
     pub glass: GlassSpec,
+
+    /// A control's face: the top and bottom of a vertical gradient, plus its
+    /// hairline. One material for every button and chip in the app — a flat
+    /// grey wash was what buttons had before, and flat fills on glass panes
+    /// read as stickers. The gradient is the curvature: lighter where a convex
+    /// cap faces the key light, darker where it turns away.
+    pub control_top: Hsla,
+    pub control_bottom: Hsla,
+    pub control_border: Hsla,
 }
 
 /// How light falls on a floating pane of glass, per mode.
@@ -90,13 +99,13 @@ impl GlassSpec {
                 rim: rgba(0xffffff2b).into(),
                 shadow: rgba(0x00000094).into(),
                 shadow_geometry: (12., 36., -6.),
-                frost: 0.45,
+                frost: 0.32,
             },
             Mode::Light => Self {
                 rim: rgba(0x1c202426).into(),
                 shadow: rgba(0x0000004a).into(),
                 shadow_geometry: (14., 44., -8.),
-                frost: 0.52,
+                frost: 0.38,
             },
         }
     }
@@ -137,6 +146,10 @@ impl Theme {
                 danger: rgb(0xe5484d).into(),
 
                 glass: GlassSpec::new(Mode::Dark),
+
+                control_top: rgba(0xffffff1f).into(),
+                control_bottom: rgba(0xffffff0d).into(),
+                control_border: rgba(0xffffff21).into(),
             },
             Mode::Light => Self {
                 // Off-white, not pure white: a full-white ground under a full
@@ -173,6 +186,12 @@ impl Theme {
                 danger: rgb(0xc03a2b).into(),
 
                 glass: GlassSpec::new(Mode::Light),
+
+                // Light mode caps are white glass over a light ground: mostly
+                // white, with enough alpha drop at the bottom to read convex.
+                control_top: rgba(0xffffffe0).into(),
+                control_bottom: rgba(0xffffff8c).into(),
+                control_border: rgba(0x1c202421).into(),
             },
         }
     }
@@ -265,6 +284,25 @@ mod tests {
     }
 
     #[test]
+    fn controls_are_convex_caps_under_the_same_light() {
+        // The gradient is the curvature: the top of a raised cap faces the key
+        // light, so it must be the brighter end in both modes — a gradient the
+        // other way up reads as a well, not a button.
+        for mode in [Mode::Dark, Mode::Light] {
+            let theme = Theme::new(mode, Chrome::Glass);
+            let top = (theme.control_top.l, theme.control_top.a);
+            let bottom = (theme.control_bottom.l, theme.control_bottom.a);
+            // Brighter means more light reaches the eye: same lightness at
+            // higher alpha, or higher lightness outright.
+            assert!(
+                top.0 > bottom.0 || (top.0 == bottom.0 && top.1 > bottom.1),
+                "{mode:?} control cap is lit from below"
+            );
+            assert!(theme.control_border.a > 0.05, "{mode:?} rim must paint");
+        }
+    }
+
+    #[test]
     fn glass_is_lit_from_above_and_stays_glass() {
         let dark = GlassSpec::new(Mode::Dark);
         let light = GlassSpec::new(Mode::Light);
@@ -298,7 +336,7 @@ mod tests {
         // nothing — which is exactly what the first cut at 0.72/0.78 looked
         // like. Light frosts harder because dark text needs a steadier ground.
         for (mode, glass) in [("dark", dark), ("light", light)] {
-            assert!(glass.frost >= 0.35 && glass.frost <= 0.6, "{mode} frost");
+            assert!(glass.frost >= 0.2 && glass.frost <= 0.45, "{mode} frost");
         }
         assert!(light.frost > dark.frost);
     }

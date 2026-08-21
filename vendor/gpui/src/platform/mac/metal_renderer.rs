@@ -42,7 +42,7 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// than per-primitive: every pane of glass in one app should be made of the
 /// same material, and per-glass sigmas would mean re-blurring per primitive
 /// instead of once per batch.
-const GLASS_SIGMA: f32 = 30.;
+const GLASS_SIGMA: f32 = 36.;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;

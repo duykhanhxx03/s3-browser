@@ -1006,3 +1006,29 @@ nhãn dài nhất đụng keycap.
 Đĩa lại xuống 751MB giữa chừng: `deps/` giữ rlib của mọi thế hệ build — ba bản
 `libaws_sdk_s3` 174MB và 117 bản `libgpui`. Xoá hết trừ bản mới nhất, build
 xác nhận vẫn link.
+
+### 10.18 Kit control kính; frost mỏng nữa (21/08/2026)
+
+Góp ý "trắng đục đục, chưa glass; chưa implement cho các nút". Hai việc:
+
+**Frost 0.32/0.38** (từ 0.45/0.52). Liquid Glass thật tint chỉ quãng này; độ đọc
+của chữ đến từ blur sâu (sigma 30→36) cộng vibrancy, không phải từ tấm màn
+trắng. Trần trong test hạ theo về 0.45 — mỗi lần user chê đục là trần cũ thành
+định nghĩa của cái sai cũ.
+
+**Kit control chung** — mọi nút và chip cắt từ cùng một tấm kính: `control_base`
+duy nhất (nang lồi: gradient dọc sáng trên tối dưới — độ cong chính là gradient
+— vành hairline, hover là nắp bắt thêm sáng chứ không đổi màu), token
+`control_top/bottom/border` trong Theme có test ghim chiều gradient ("gradient
+lộn ngược đọc thành cái giếng, không phải cái nút"). `action_button`,
+`action_button_dyn`, `setting_chip`, `choice_chip` (chip chọn: cùng nang, tô
+màu selection + viền accent — selection là màu, không phải hình khối) và
+`danger_button` (cắt từ kính đỏ, gradient quanh danger) đều đi qua kit. Nút
+backdrop-glass thật cho từng control thì không làm: mỗi capture là một lần cắt
+render pass, toolbar mười nút là mười lần blit+blur mỗi khung hình.
+
+Trong lúc làm rơi `.child(label)` của choice_chip — cả hàng chip thành nang
+rỗng, ảnh chụp bắt được ngay. Và ngừng đụng vào settings.json: file lật về
+light lúc 23:10 khi app đang mở mà nguồn ghi duy nhất là click chuột vào chip —
+tức là chính người dùng đang chọn theme trong lúc xem, còn tôi thì cứ "khôi
+phục" đè lên lựa chọn đó.
