@@ -31,7 +31,8 @@ macro_rules! icons {
 }
 
 icons![
-    "arrow-up", "check", "chevron-down", "chevron-up", "clock", "close", "copy", "cut", "download",
+    "arrow-up", "bucket", "check", "chevron-down", "chevron-up", "clock", "close", "copy", "cut",
+    "download",
     "duplicate", "external", "eye", "file", "folder", "info", "link", "pause", "play",
     "more", "paste", "path", "plus", "refresh", "rename", "search", "star", "trash", "upload",
 ];

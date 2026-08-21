@@ -5379,10 +5379,10 @@ impl Browser {
             // comes and goes is one nobody learns the position of. The page it
             // opens says so itself when there is nothing in it.
             .child(
-                sidebar_nav(
-                    "nav-buckets",
-                    "folder",
-                    "Tất cả bucket",
+                sidebar_item(
+                    "nav-buckets".into(),
+                    "bucket",
+                    "Tất cả bucket".into(),
                     self.screen == Screen::Buckets,
                     theme,
                 )
@@ -5391,10 +5391,16 @@ impl Browser {
                 })),
             )
             .child(
-                sidebar_nav("nav-recent", "clock", "Gần đây", self.screen == Screen::Recent, theme)
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.show_screen(Screen::Recent, cx);
-                    })),
+                sidebar_item(
+                    "nav-recent".into(),
+                    "clock",
+                    "Gần đây".into(),
+                    self.screen == Screen::Recent,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.show_screen(Screen::Recent, cx);
+                })),
             )
             .children(self.render_places(cx))
             .child(
@@ -5472,8 +5478,9 @@ impl Browser {
                     .map(|bucket| {
                         let selected = current_bucket.as_ref() == Some(&bucket);
                         let target = bucket.clone();
-                        sidebar_row(
+                        sidebar_item(
                             SharedString::from(format!("bucket-{bucket}")),
+                            "bucket",
                             bucket,
                             selected,
                             theme,
@@ -5493,7 +5500,8 @@ impl Browser {
             // At the foot of the sidebar, where Brows3 has it and where every
             // app of this shape has it.
             .child(
-                sidebar_nav("settings-open", "more", "Cài đặt", false, theme).on_click(
+                sidebar_item("settings-open".into(), "more", "Cài đặt".into(), false, theme)
+                    .on_click(
                     cx.listener(|this, _event, _window, cx| {
                         this.settings_open = true;
                         cx.notify();
@@ -5519,40 +5527,17 @@ impl Browser {
             return None;
         }
 
-        let row = |place: &Place, id: SharedString, pinned: bool| {
+        let row = |place: &Place, id: SharedString| {
             let target = place.clone();
-            let label = place.label();
-            div()
-                .id(id)
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .text_xs()
-                .cursor_pointer()
-                .text_color(theme.text_muted)
-                .hover(|this| this.bg(theme.hover))
-                .child(sized_icon(
-                    if pinned { "star" } else { "clock" },
-                    11.,
-                    theme.text_faint,
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        // Elided in the middle: the bucket at the front and the
-                        // last segment at the end are the two halves that tell
-                        // two places apart, and the middle is what they share.
-                        .child(SharedString::from(elide_middle(&label, 26))),
-                )
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.open_place(&target, cx)
-                }))
+            // Elided in the middle: the bucket at the front and the last
+            // segment at the end are the two halves that tell two places apart,
+            // and the middle is what they share. Twenty-two rather than the old
+            // twenty-six, because these rows are the same size as every other
+            // row now and fewer of the bigger characters fit.
+            let label = elide_middle(&place.label(), 22);
+            sidebar_item(id, "star", SharedString::from(label), false, theme).on_click(
+                cx.listener(move |this, _event, _window, cx| this.open_place(&target, cx)),
+            )
         };
 
         Some(
@@ -5562,7 +5547,7 @@ impl Browser {
                 .gap_1()
                 .child(section_label("ĐÃ GHIM", theme))
                 .children(favorites.iter().enumerate().map(|(ix, place)| {
-                    row(place, SharedString::from(format!("fav-{ix}")), true)
+                    row(place, SharedString::from(format!("fav-{ix}")))
                 })),
         )
     }
@@ -5908,7 +5893,7 @@ impl Browser {
                         .items_center()
                         .justify_center()
                         .gap_2()
-                        .child(sized_icon("folder", 24., theme.text_faint))
+                        .child(sized_icon("bucket", 24., theme.text_faint))
                         .child(
                             div()
                                 .text_sm()
@@ -5943,7 +5928,11 @@ impl Browser {
                             .cursor_pointer()
                             .when(selected, |this| this.bg(theme.selected))
                             .hover(|this| this.bg(theme.hover))
-                            .child(sized_icon("folder", 14., theme.text_faint))
+                            .child(sized_icon(
+                                "bucket",
+                                14.,
+                                if selected { theme.accent } else { theme.text_faint },
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -9126,7 +9115,8 @@ fn section_header(
     div()
         .id(id)
         .px_2()
-        .py_1()
+        .pt_2()
+        .pb_0p5()
         .flex()
         .items_center()
         .rounded_md()
@@ -9326,15 +9316,18 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
         .child(label)
 }
 
-/// A row in the sidebar that goes somewhere rather than opening a place.
+/// One row of the sidebar: an icon, a label, and a highlight when you are on it.
 ///
-/// `active` paints the one you are on: without it the sidebar keeps pointing at
-/// the buckets while the pane shows something else entirely, and there is
-/// nothing on screen saying which of the two you are looking at.
-fn sidebar_nav(
-    id: &'static str,
+/// **Every** row in there is this shape — the two nav entries at the top, the
+/// pinned places, the bucket list, and Cài đặt at the foot. It used to be
+/// three: nav rows carried an icon, bucket rows carried none — so their text
+/// began where everyone else's *icon* did, and the column had a ragged left
+/// edge — and the pinned list was a size smaller again on a theory about
+/// sub-lists that only ever read as an accident.
+fn sidebar_item(
+    id: SharedString,
     icon: &'static str,
-    label: &'static str,
+    label: SharedString,
     active: bool,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
@@ -9346,9 +9339,6 @@ fn sidebar_nav(
         .flex()
         .items_center()
         .gap_1p5()
-        // The same size and padding as a bucket row, because it is the same
-        // kind of thing: somewhere the sidebar takes you. The pinned list below
-        // is a step smaller on purpose — that one is a sub-list, not nav.
         .text_sm()
         .cursor_pointer()
         .when(active, |this| this.bg(theme.selected))
@@ -9359,7 +9349,14 @@ fn sidebar_nav(
             13.,
             if active { theme.accent } else { theme.text_faint },
         ))
-        .child(label)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label),
+        )
 }
 
 fn icon_button(id: &'static str, name: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
@@ -10484,10 +10481,16 @@ fn location_text(bucket: &str, keys: &[String], as_path: bool) -> String {
 }
 
 /// A heading with no control beside it, unlike `section_header`.
+/// A heading over a group of sidebar rows.
+///
+/// Shares its padding with [`section_header`], which is the same thing with a
+/// button on the end: two headings a few pixels apart vertically is the kind of
+/// difference nobody can name and everybody can see.
 fn section_label(text: &'static str, theme: Theme) -> impl IntoElement {
     div()
         .px_2()
         .pt_2()
+        .pb_0p5()
         .text_xs()
         .text_color(theme.text_faint)
         .child(text)
