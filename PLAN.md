@@ -669,13 +669,28 @@ vướng: `panic = "abort"` không giết panic hook (`crash.rs` vẫn chạy) n
 `catch_unwind`, mà test của `crash.rs` đang dùng — test chạy ở profile test nên
 không sao, chỉ là phải biết trước.
 
-### 10.6 Endpoint gõ thiếu `https://`
+### 10.6 ~~Endpoint gõ thiếu `https://`~~ — xong (21/08/2026)
 
 `normalize_endpoint_url` của họ thêm `https://` khi người dùng gõ trơ
 `s3.example.com`. Mình không, và AWS SDK trả về "dispatch failure" — mà
 `failure.rs` lại dịch thành "Không kết nối được tới endpoint" kèm nút **Thử lại**,
 tức là mời người ta bấm mãi một nút không bao giờ chạy được, cho một lỗi gõ thiếu
-tám ký tự. Nhỏ, thật, và rẻ.
+tám ký tự.
+
+Đã làm, và **khác họ một chỗ**: loopback thì thêm `http://`, còn lại `https://`.
+Một object store ở `127.0.0.1:9000` mười lần thì chín là MinIO dev, mà MinIO dev
+nói HTTP trần; đoán ngược lại chỉ là đổi một lỗi khó hiểu này lấy một lỗi khó
+hiểu khác — bắt tay TLS với một server chưa từng có chứng chỉ. Cả dải 127/8,
+`::1` trong ngoặc vuông, và `*.localhost` theo RFC 6761.
+
+Chuẩn hoá ở **hai chỗ**: trong `split_endpoint` khi đọc form — thiếu scheme thì
+không có gì để tách, nên `s3.example.com/mybucket` vừa dính bucket vào host vừa
+tới SDK thiếu scheme, một lỗi gõ sinh hai lỗi — và trong `S3Client` khi dựng
+client, cho `profiles.json` sửa tay hoặc do bản cũ ghi ra.
+
+Địa chỉ LAN vẫn nhận `https` và vẫn hỏng nếu server đó là HTTP trần. Cố ý để vậy:
+nhận diện dải riêng là 10/8, 172.16/12, 192.168/16 với cả `.local`, mà lỗi nó
+tránh được ít ra cũng là một lỗi TLS **có tên**, không phải `dispatch failure`.
 
 ### 10.7 Đọc credential từ biến môi trường
 

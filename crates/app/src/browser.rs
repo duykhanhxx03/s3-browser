@@ -10125,7 +10125,11 @@ fn wrapped_text(text: &str, max_chars: usize, color: gpui::Hsla) -> impl IntoEle
 ///
 /// Returns the endpoint without the path, plus the bucket if there was one.
 fn split_endpoint(endpoint: &str) -> (String, Option<String>) {
-    let trimmed = endpoint.trim().trim_end_matches('/');
+    // The scheme goes on first. Without it there is nothing to split on, so a
+    // bare `s3.example.com/mybucket` used to keep the bucket glued to the host
+    // *and* reach the SDK with no scheme — two failures from one typo.
+    let normalized = s3core::normalize_endpoint(endpoint);
+    let trimmed = normalized.trim_end_matches('/');
     let Some((scheme, rest)) = trimmed.split_once("://") else {
         return (trimmed.to_string(), None);
     };
@@ -11185,9 +11189,17 @@ mod tests {
             split_endpoint("https://h/bucket/prefix"),
             ("https://h".into(), Some("bucket".into()))
         );
-        // Something with no scheme is passed through untouched rather than
-        // mangled into a wrong host.
-        assert_eq!(split_endpoint("localhost:9000"), ("localhost:9000".into(), None));
+        // A scheme is put on before splitting. Without that step there is
+        // nothing to split on, so the bucket stayed glued to the host and the
+        // SDK got a URL it answers with `dispatch failure`.
+        assert_eq!(
+            split_endpoint("localhost:9000"),
+            ("http://localhost:9000".into(), None)
+        );
+        assert_eq!(
+            split_endpoint("s3.example.com/mybucket"),
+            ("https://s3.example.com".into(), Some("mybucket".into()))
+        );
     }
 
     #[test]

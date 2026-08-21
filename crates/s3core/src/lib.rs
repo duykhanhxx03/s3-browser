@@ -373,7 +373,10 @@ impl S3Client {
             aws_sdk_s3::config::Builder::from(&sdk_config).force_path_style(profile.path_style);
 
         if let Some(endpoint) = &profile.endpoint {
-            builder = builder.endpoint_url(endpoint);
+            // Also normalised here, not only where the form is read: a
+            // `profiles.json` written by hand or by an older build can hold a
+            // bare host, and the failure it causes names nothing.
+            builder = builder.endpoint_url(normalize_endpoint(endpoint));
         }
 
         if profile.relaxed_checksums {
@@ -1990,6 +1993,62 @@ pub struct ObjectHeaders {
 ///
 /// `None` for a name with no extension or one nobody has registered — claiming
 /// a type there would be worse than the provider's own default.
+/// Puts a scheme on an endpoint that was typed without one.
+///
+/// `s3.example.com` is what people type, and what the AWS SDK answers with is
+/// `dispatch failure` — a message that names nothing, reads like the network is
+/// down, and which this app then classifies as "không kết nối được tới
+/// endpoint" and offers a **Thử lại** button for. So eight missing characters
+/// buy a button that can never work, for a mistake nothing on screen points at.
+///
+/// Loopback gets `http`, everything else `https`. Not a coin flip: an object
+/// store on `127.0.0.1:9000` is a development MinIO nine times in ten and those
+/// speak plain HTTP, while anything with a real hostname is out on the internet
+/// where plain HTTP would be the surprising choice. Guessing this the other way
+/// round just trades one unhelpful error for another — a TLS handshake against
+/// a server that never had a certificate.
+///
+/// A LAN address gets `https` and will fail if that server is plain HTTP. That
+/// is left alone deliberately: recognising private ranges means 10/8, 172.16/12,
+/// 192.168/16 and `.local`, and the failure it would save is at least a *named*
+/// TLS error rather than `dispatch failure`.
+pub fn normalize_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Empty stays empty: `https://` on its own is not a better answer than
+    // nothing, and the caller treats "no endpoint" as "use AWS".
+    if trimmed.is_empty() || has_scheme(trimmed) {
+        return trimmed.to_string();
+    }
+    if is_loopback(host_of(trimmed)) {
+        format!("http://{trimmed}")
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+/// Whether a scheme is already there. The `://` has to come before any path
+/// separator, or a bucket named `a://b` would count as one.
+fn has_scheme(url: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| !scheme.contains('/'))
+}
+
+/// The host out of an authority, port and path removed. Bracketed IPv6 first,
+/// since that form contains the colons a port test would trip over.
+fn host_of(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.split(['/', ':']).next().unwrap_or(authority)
+}
+
+fn is_loopback(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    // The whole of 127.0.0.0/8, not just `127.0.0.1`, and `*.localhost` because
+    // RFC 6761 reserves it to resolve to loopback.
+    host == "localhost" || host.ends_with(".localhost") || host == "::1" || host.starts_with("127.")
+}
+
 pub fn content_type_for(key: &str) -> Option<String> {
     mime_guess::from_path(key)
         .first()
@@ -2085,6 +2144,50 @@ mod tests {
             session_token: None,
             relaxed_checksums: false,
         }
+    }
+
+    #[test]
+    fn an_endpoint_typed_without_a_scheme_gets_one() {
+        // The whole point: the SDK answers a scheme-less URL with `dispatch
+        // failure`, which this app then shows as "không kết nối được tới
+        // endpoint" with a Thử lại button that can never work.
+        assert_eq!(
+            normalize_endpoint("s3.example.com"),
+            "https://s3.example.com"
+        );
+        assert_eq!(
+            normalize_endpoint("abc.r2.cloudflarestorage.com/bucket"),
+            "https://abc.r2.cloudflarestorage.com/bucket"
+        );
+
+        // Loopback is a development object store, and those speak plain HTTP.
+        // Guessing https here would trade `dispatch failure` for a TLS
+        // handshake against a server that never had a certificate.
+        assert_eq!(normalize_endpoint("127.0.0.1:9000"), "http://127.0.0.1:9000");
+        assert_eq!(normalize_endpoint("localhost:9000"), "http://localhost:9000");
+        // The whole loopback block, not just .0.1.
+        assert_eq!(normalize_endpoint("127.1.2.3"), "http://127.1.2.3");
+        // RFC 6761 reserves *.localhost to resolve to loopback.
+        assert_eq!(normalize_endpoint("minio.localhost"), "http://minio.localhost");
+        // Bracketed IPv6: the colons inside must not read as a port.
+        assert_eq!(normalize_endpoint("[::1]:9000"), "http://[::1]:9000");
+        // And a host that merely starts with the digits is not loopback.
+        assert_eq!(normalize_endpoint("127x.example.com"), "https://127x.example.com");
+
+        // Anything that already has a scheme is left exactly as it was, even a
+        // scheme this app cannot use — failing loudly on `ftp://` beats
+        // silently rewriting what someone typed.
+        assert_eq!(normalize_endpoint("http://s3.example.com"), "http://s3.example.com");
+        assert_eq!(normalize_endpoint("https://s3.example.com"), "https://s3.example.com");
+        assert_eq!(normalize_endpoint("ftp://s3.example.com"), "ftp://s3.example.com");
+
+        // Whitespace from a paste.
+        assert_eq!(normalize_endpoint("  s3.example.com \n"), "https://s3.example.com");
+
+        // Empty stays empty: `https://` alone is not a better answer than
+        // nothing, and no endpoint is how a profile says "plain AWS".
+        assert_eq!(normalize_endpoint(""), "");
+        assert_eq!(normalize_endpoint("   "), "");
     }
 
     #[test]
