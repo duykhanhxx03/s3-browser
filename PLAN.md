@@ -844,3 +844,36 @@ số phiên bản chạy liền thành một dải chữ mờ cùng cỡ. Tên p
 một bậc: một cái là tài khoản nào, cái kia là chi tiết của nó. Và thứ duy nhất
 được phép cắt ở giữa là **câu trạng thái** — nó là một câu, nửa câu vẫn nói được
 điều gì đó; mọi thứ bên phải là control hoặc dữ kiện, nửa cái đó thì vô giá trị.
+
+### 10.13 Cài đặt và hàng đợi (21/08/2026)
+
+**Cài đặt chia nhóm.** Năm hàng phẳng — chủ đề, xem trước, băng thông, số luồng,
+một đường dẫn — không có gì nói ba cái giữa là về việc chuyển byte còn cái cuối
+là về máy này. Năm hàng là chỗ một danh sách phẳng thôi là danh sách và bắt đầu
+là một đống. Giờ bốn nhóm: GIAO DIỆN / TRUYỀN TẢI / XEM TRƯỚC / DỮ LIỆU.
+
+Cột nhãn rộng ra 210: ở 150 mọi ghi chú đều xuống hai ba dòng, mỗi hàng cao bằng
+lời giải thích của nó, và sáu mục lấp đầy một nghìn pixel. Control canh trái
+thành một cột chạy dọc được — như System Settings của macOS — chứ không kéo giãn
+hết bề ngang, vì `flex_1` biến "Xoá và tải lại" thành thứ trông như ô nhập.
+
+Thêm **Xoá bộ nhớ tạm** lấy từ Brows3: danh sách bucket nhớ 30 phút, nên một
+bucket vừa tạo ở console không hiện ra cho tới khi hết hạn, mà đường duy nhất
+vượt qua là nút làm mới cạnh tiêu đề sidebar — không phải chỗ ai đi tìm.
+
+**Bỏ chip "Mã hoá" ở thanh hàng đợi.** Nó xoay vòng SSE cho mọi lần tải lên
+(mặc định bucket → SSE-S3 → SSE-KMS). Bỏ theo yêu cầu; giờ tải lên dùng mã hoá
+mặc định của bucket, tức là để **chính sách bucket quyết định** — vốn là chỗ nó
+nên được quyết định. Mất khả năng chọn SSE-KMS với key riêng từ trong app. Vì đó
+là đường vào duy nhất nên `FormKind::KmsKey`, `next_encryption` và
+`encryption_label` cùng đi theo: code không đường nào tới còn tệ hơn code không
+tồn tại. Phía `s3core` vẫn giữ `set_encryption` — nó là API của thư viện, có test
+riêng, và không phải rác của app.
+
+**Nút hàng đợi lên sidebar**, ngay trên Cài đặt. Trước nó là một pill trong thanh
+trạng thái, kẹp giữa một dãy gợi ý phím tắt và số phiên bản — một control sống
+trong dải duy nhất của cửa sổ vốn toàn chữ chỉ đọc. Nhãn kèm một con số khi có
+việc đang chạy, hoặc "n lỗi" khi có việc hỏng; "xong" không phải một trạng thái
+đáng đánh dấu, vì nó đúng mãi mãi. Tốc độ và thời gian còn lại vẫn ở thanh trạng
+thái nhưng **chỉ khi đang chạy** — một hàng 214px không chứa nổi "2 đang chạy,
+3 chờ, 5 MB/s, còn 2 phút".

@@ -34,7 +34,8 @@ icons![
     "arrow-up", "bucket", "check", "chevron-down", "chevron-up", "clock", "close", "copy", "cut",
     "download",
     "duplicate", "external", "eye", "file", "folder", "info", "link", "pause", "play",
-    "more", "paste", "path", "plus", "refresh", "rename", "search", "star", "trash", "upload",
+    "more", "paste", "path", "plus", "refresh", "rename", "search", "star", "transfer", "trash",
+    "upload",
 ];
 
 /// The UI typeface, embedded so every machine renders the same.

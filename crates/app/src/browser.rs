@@ -20,7 +20,7 @@ use gpui_tokio::Tokio;
 use s3core::{
     format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
     capability::{Capabilities, CapabilityCache, Support},
-    Encryption, ObjectAcl, ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
+    ObjectAcl, ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
@@ -116,6 +116,9 @@ const FILTER_WIDTH: f32 = 196.;
 /// The narrowest the name column may get. Below this a row stops saying which
 /// object it is about, which is the one thing every other column depends on.
 const NAME_MIN_WIDTH: f32 = 140.;
+/// The label column in the settings panel. Wide enough that a one-line note
+/// stays on one line.
+const SETTING_LABEL_WIDTH: f32 = 210.;
 const FIELD_HEIGHT: f32 = 26.;
 /// How many buckets before the sidebar gets a search box. Under this the list
 /// fits on screen and the box is pure chrome.
@@ -178,7 +181,6 @@ pub enum FormKind {
     /// dialog is open.
     EditHeaders(Vec<String>),
     AddTag,
-    KmsKey,
     AssumeRole,
     SsoStart,
 }
@@ -199,7 +201,6 @@ impl FormKind {
             }
             FormKind::EditHeaders(_) => "Sửa header",
             FormKind::AddTag => "Thẻ mới",
-            FormKind::KmsKey => "Mã hoá KMS",
             FormKind::AssumeRole => "Nhận role",
             FormKind::SsoStart => "Đăng nhập SSO",
         }
@@ -228,7 +229,6 @@ impl FormKind {
                 ("Content-Disposition", "inline", false),
             ],
             FormKind::AddTag => vec![("Khoá", "", false), ("Giá trị", "", false)],
-            FormKind::KmsKey => vec![("Key id", "", false)],
             FormKind::AssumeRole => vec![
                 ("Role ARN", "arn:aws:iam::…:role/…", false),
                 ("MFA serial", "không bắt buộc", false),
@@ -3044,13 +3044,6 @@ impl Browser {
                 self.form = None;
                 self.add_tag(format!("{first}={value}"), cx);
             }
-            FormKind::KmsKey => {
-                self.form = None;
-                if let Some(client) = self.client.as_ref() {
-                    client.set_encryption(Encryption::Kms(first));
-                    self.status = "Mã hoá: SSE-KMS".into();
-                }
-            }
             FormKind::AssumeRole => {
                 let serial = form.value("MFA serial", cx);
                 let code = form.value("Mã MFA", cx);
@@ -5581,6 +5574,25 @@ impl Browser {
                 this.child(skeleton_sidebar(theme))
             })
             .child(div().flex_1())
+            // Above Cài đặt, where a thing you open belongs. It used to be a
+            // pill in the status bar, wedged between a row of keyboard hints
+            // and the version number — a control living in the one strip of the
+            // window that is otherwise all read-only text.
+            .child(
+                sidebar_item_with_badge(
+                    "queue-toggle".into(),
+                    "transfer",
+                    "Hàng đợi".into(),
+                    queue_badge(&self.transfers.stats()),
+                    self.drawer_open,
+                    None,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.drawer_open = !this.drawer_open;
+                    cx.notify();
+                })),
+            )
             // At the foot of the sidebar, where Brows3 has it and where every
             // app of this shape has it. Giới thiệu sits under it as a pair.
             .child(
@@ -6522,8 +6534,11 @@ impl Browser {
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Cài đặt"))
+                        .child(settings_group("GIAO DIỆN", theme))
                         .child(setting_row(
-                            "Giao diện",
+                            "Chủ đề",
+                            // No note: the chip says "Theo hệ thống", which is
+                            // the only part that needed explaining.
                             None,
                             div().flex().gap_1().children(
                                 ThemeChoice::ALL.into_iter().map(|choice| {
@@ -6540,27 +6555,10 @@ impl Browser {
                             ),
                             theme,
                         ))
-                        .child(setting_row(
-                            "Xem trước",
-                            Some("Tải nhiều nhất bấy nhiêu cho một lần xem trước"),
-                            div().flex().gap_1().children(
-                                crate::settings::PREVIEW_LIMITS_MB.into_iter().map(|mb| {
-                                    choice_chip(
-                                        SharedString::from(format!("preview-{mb}")),
-                                        SharedString::from(format!("{mb} MB")),
-                                        settings.preview_limit_mb == mb,
-                                        theme,
-                                    )
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.update_settings(|s| s.preview_limit_mb = mb, cx)
-                                    }))
-                                }),
-                            ),
-                            theme,
-                        ))
+                        .child(settings_group("TRUYỀN TẢI", theme))
                         .child(setting_row(
                             "Băng thông",
-                            None,
+                            Some("Trần cho cả hàng đợi"),
                             div().flex().gap_1().children(
                                 BANDWIDTH_PRESETS.into_iter().map(|limit| {
                                     choice_chip(
@@ -6577,7 +6575,7 @@ impl Browser {
                             theme,
                         ))
                         .child(setting_row(
-                            "Số luồng truyền",
+                            "Số luồng",
                             // Said out loud rather than letting someone change
                             // it and wonder why nothing moved faster: the limit
                             // is a semaphore's permit count, and shrinking one
@@ -6598,11 +6596,54 @@ impl Browser {
                             ),
                             theme,
                         ))
+                        .child(settings_group("XEM TRƯỚC", theme))
+                        .child(setting_row(
+                            "Giới hạn",
+                            // Naming what it does not cover, because the number
+                            // reads like a cap on everything: audio, video and
+                            // PDF never load here at all — they are handed to
+                            // the machine — and an image over the limit is
+                            // refused rather than truncated.
+                            Some("Chỉ cho văn bản và ảnh"),
+                            div().flex().gap_1().children(
+                                crate::settings::PREVIEW_LIMITS_MB.into_iter().map(|mb| {
+                                    choice_chip(
+                                        SharedString::from(format!("preview-{mb}")),
+                                        SharedString::from(format!("{mb} MB")),
+                                        settings.preview_limit_mb == mb,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.update_settings(|s| s.preview_limit_mb = mb, cx)
+                                    }))
+                                }),
+                            ),
+                            theme,
+                        ))
+                        .child(settings_group("DỮ LIỆU", theme))
+                        // Brows3 has this and it earns its place: the bucket
+                        // list is cached for half an hour, so a bucket made in
+                        // the console does not appear here until it expires,
+                        // and until now the only way past that was the refresh
+                        // beside the sidebar heading — which is not where
+                        // anyone looks for it.
+                        .child(setting_row(
+                            "Bộ nhớ tạm",
+                            Some("Danh sách bucket, nhớ 30 phút"),
+                            action_button("settings-forget-cache", "Xoá và tải lại", theme)
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.forget_bucket_cache();
+                                    this.refresh_buckets(cx);
+                                    this.status = "Đã xoá bộ nhớ tạm".into();
+                                    cx.notify();
+                                })),
+                            theme,
+                        ))
                         .when_some(config_dir, |this, dir| {
                             let shown = dir.display().to_string();
                             this.child(setting_row(
                                 "Thư mục cấu hình",
-                                Some("Profile, nơi đã ghim, cài đặt và hàng đợi"),
+                                Some("Profile, nơi ghim, cài đặt, hàng đợi"),
                                 action_button_dyn(
                                     "open-config".into(),
                                     SharedString::from(elide_middle(&shown, 44)),
@@ -7743,11 +7784,10 @@ impl Browser {
                 "{} đang chạy, {} chờ{speed}",
                 stats.active, stats.queued
             )
-        } else if stats.failed > 0 {
-            format!("{} lỗi", stats.failed)
-        } else if stats.done > 0 {
-            format!("{} xong", stats.done)
         } else {
+            // Nothing while idle. "24 xong" sat in the bar for the rest of the
+            // session after one download, and the sidebar's queue row carries
+            // the failure count, which is the only idle state worth a mark.
             String::new()
         };
 
@@ -7873,39 +7913,19 @@ impl Browser {
                     })),
             )
             .child(status_divider(theme))
-            // Always, not only while something is transferring. Hiding it when
-            // the queue is idle meant the finished and failed jobs — the ones
-            // worth going back to look at — were behind ⌘J and nothing else.
-            .child({
-                let open = self.drawer_open;
-                let label = if queue_label.is_empty() {
-                    "hàng đợi".to_string()
-                } else {
-                    queue_label
-                };
-                div()
-                    .id("queue-toggle")
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(if open { theme.selected } else { theme.hover })
-                    .text_color(theme.text)
-                    .hover(|this| this.bg(theme.selected))
-                    .child(SharedString::from(format!(
-                        "{} {label}",
-                        if open { "▾" } else { "▴" }
-                    )))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.drawer_open = !this.drawer_open;
-                        cx.notify();
-                    }))
+            // What the sidebar's queue row cannot hold. That row answers "is
+            // there anything in there"; this answers "how fast, and how much
+            // longer", which is worth a strip of its own while it is true and
+            // worth nothing at all once the queue is idle.
+            .when(!queue_label.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(queue_label)),
+                )
+                .child(status_divider(theme))
             })
-            // Last, and the quietest thing on the bar. A bug report that does
-            // not say which build it is about costs a round trip, and this is
-            // the one place a user can read the answer off without hunting for
-            // an About box the app does not have.
             .child(status_divider(theme))
             .child(
                 div()
@@ -7974,30 +7994,6 @@ impl Browser {
                                     cx.notify();
                                 })),
                         )
-                        .when_some(self.client.clone(), |this, client| {
-                            let current = client.encryption();
-                            this.child(
-                                setting_chip(
-                                    "encryption",
-                                    "Mã hoá",
-                                    encryption_label(&current),
-                                    theme,
-                                )
-                                    .on_click(cx.listener(move |this, _event, window, cx| {
-                                        match next_encryption(&current) {
-                                            // KMS needs a key id, so it asks
-                                            // rather than silently picking one.
-                                            None => this.open_form(FormKind::KmsKey, window, cx),
-                                            Some(next) => {
-                                                if let Some(client) = this.client.as_ref() {
-                                                    client.set_encryption(next);
-                                                }
-                                                cx.notify();
-                                            }
-                                        }
-                                    })),
-                            )
-                        })
                         .child(
                             action_button("clear-finished", "Xoá đã xong", theme).on_click(
                                 cx.listener(|this, _event, _window, cx| {
@@ -10002,6 +9998,23 @@ fn sidebar_item(
     blocked: Option<&'static str>,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
+    sidebar_item_with_badge(id, icon, label, None, active, blocked, theme)
+}
+
+/// The same row with a count at its trailing edge.
+///
+/// Split out rather than adding an argument to every call site: five of the six
+/// sidebar rows have nothing to count, and `None` repeated five times is noise
+/// at the places that read the clearest without it.
+fn sidebar_item_with_badge(
+    id: SharedString,
+    icon: &'static str,
+    label: SharedString,
+    badge: Option<SharedString>,
+    active: bool,
+    blocked: Option<&'static str>,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_2()
@@ -10044,6 +10057,32 @@ fn sidebar_item(
                 .whitespace_nowrap()
                 .child(label),
         )
+        .children(badge.map(|badge| {
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(if active { theme.text } else { theme.text_faint })
+                .child(badge)
+        }))
+}
+
+/// The number beside "Hàng đợi" in the sidebar, or nothing when idle.
+///
+/// One number, not a sentence. The status bar could afford "2 đang chạy, 3 chờ
+/// 5 MB/s còn 2 phút"; a 214px row cannot, and the drawer one click away has
+/// every one of those facts per job. What the row has to answer is whether
+/// there is anything in there at all.
+fn queue_badge(stats: &transfer::Stats) -> Option<SharedString> {
+    let moving = stats.active + stats.queued;
+    if moving > 0 {
+        return Some(SharedString::from(moving.to_string()));
+    }
+    // Failures outlive the transfer that produced them, and they are the one
+    // idle state worth a mark: nothing is moving, and something needs looking at.
+    if stats.failed > 0 {
+        return Some(SharedString::from(format!("{} lỗi", stats.failed)));
+    }
+    None
 }
 
 /// A hairline between two groups on the status bar.
@@ -11040,25 +11079,6 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
     }
 }
 
-fn encryption_label(encryption: &Encryption) -> String {
-    match encryption {
-        Encryption::BucketDefault => "bucket".into(),
-        Encryption::Aes256 => "SSE-S3".into(),
-        // The key id can be a full ARN, which would push everything else off the
-        // row; the tail is the part that identifies it to a human.
-        Encryption::Kms(key) => format!("KMS {}", key.rsplit('/').next().unwrap_or(key)),
-    }
-}
-
-/// The next setting when the button is clicked. `None` means the next one needs
-/// input first, so the caller has to ask instead of applying it.
-fn next_encryption(current: &Encryption) -> Option<Encryption> {
-    match current {
-        Encryption::BucketDefault => Some(Encryption::Aes256),
-        Encryption::Aes256 => None,
-        Encryption::Kms(_) => Some(Encryption::BucketDefault),
-    }
-}
 
 /// Objects above this are listed with an icon instead of a thumbnail. A row is
 /// 22 pixels tall; fetching megabytes to fill it is not a trade worth making,
@@ -11440,6 +11460,27 @@ fn sync_component_theme(mode: crate::theme::Mode, window: &mut Window, cx: &mut 
 }
 
 /// One row of the settings panel: what it is, why it matters, and the control.
+/// A heading over a group of settings.
+///
+/// The panel was five rows in a flat stack — theme, preview, bandwidth, threads,
+/// a folder path — with nothing saying that the middle three are about moving
+/// bytes and the last is about this machine. Five rows is where a flat list
+/// stops being a list and starts being a pile.
+fn settings_group(title: &'static str, theme: Theme) -> impl IntoElement {
+    div()
+        .pt_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child(title),
+        )
+        .child(div().flex_1().h(px(1.)).bg(theme.border))
+}
+
 fn setting_row(
     label: &'static str,
     note: Option<&'static str>,
@@ -11451,8 +11492,11 @@ fn setting_row(
         .items_start()
         .gap_3()
         .child(
+            // Wider than it was. At 150 every note wrapped onto two or three
+            // lines and each row grew to the height of its explanation, so six
+            // settings filled a thousand pixels.
             div()
-                .w(px(150.))
+                .w(px(SETTING_LABEL_WIDTH))
                 .flex_shrink_0()
                 .flex()
                 .flex_col()
@@ -11461,7 +11505,19 @@ fn setting_row(
                     div().text_xs().text_color(theme.text_faint).child(note)
                 })),
         )
-        .child(div().flex_1().min_w(px(0.)).child(control))
+        // Content-sized, and starting at one x for every row. A `flex_1` child
+        // stretched every button to the full width of the column, which made
+        // "Xoá và tải lại" and a folder path read as text fields rather than as
+        // things to press. Left-aligned rather than right, so the controls form
+        // a column the eye can run down — the same way macOS lays out its own
+        // settings, and the reason the label column has a fixed width at all.
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .child(control),
+        )
 }
 
 /// One option among a few. A row of these rather than a dropdown: with three or
@@ -12899,39 +12955,6 @@ mod tests {
         assert_eq!(revealable(&crashes), crashes.as_path());
 
         _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn encryption_cycle_asks_before_it_needs_a_key() {
-        assert_eq!(encryption_label(&Encryption::BucketDefault), "bucket");
-        assert_eq!(encryption_label(&Encryption::Aes256), "SSE-S3");
-
-        // A full ARN would push the rest of the row off screen; the tail is what
-        // identifies the key to a person.
-        assert_eq!(
-            encryption_label(&Encryption::Kms(
-                "arn:aws:kms:ap-southeast-1:1234:key/abcd-1234".into()
-            )),
-            "KMS abcd-1234"
-        );
-        // A bare id has no slash to split on and must survive intact.
-        assert_eq!(
-            encryption_label(&Encryption::Kms("abcd-1234".into())),
-            "KMS abcd-1234"
-        );
-
-        // Default → SSE-S3 applies directly.
-        assert_eq!(
-            next_encryption(&Encryption::BucketDefault),
-            Some(Encryption::Aes256)
-        );
-        // SSE-S3 → KMS cannot be applied without asking for a key id first.
-        assert_eq!(next_encryption(&Encryption::Aes256), None);
-        // KMS → back to the default, so the cycle always has a way out.
-        assert_eq!(
-            next_encryption(&Encryption::Kms("k".into())),
-            Some(Encryption::BucketDefault)
-        );
     }
 
     #[gpui::test]
