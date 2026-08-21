@@ -525,7 +525,7 @@ một cách ồn ào, nó trả lời một câu hỏi khác với câu được
 
 ### UI
 
-1. **Tab** — làm ngay, theo yêu cầu. Xem §9.1.
+1. ~~**Tab**~~ — xong (21/08/2026). Xem §9.1.
 2. **Ô đường dẫn `s3://bucket/prefix/`** ở thanh trên, gõ vào là tới thẳng. App
    đang có "Mở bucket theo tên" nhưng không dán được một đường dẫn đầy đủ. Với
    token không có `ListBuckets` thì đây là lối vào chính chứ không phải lối phụ.

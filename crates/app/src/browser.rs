@@ -69,6 +69,9 @@ const PROGRESS_HEIGHT: f32 = 4.;
 /// than the bar holding it, so buttons in the same row did not match.
 const BUTTON_HEIGHT: f32 = 22.;
 const SIDEBAR_WIDTH: f32 = 214.;
+const TAB_HEIGHT: f32 = 30.;
+/// Fixed, so tabs do not resize under the pointer as their titles change.
+const TAB_WIDTH: f32 = 132.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
 /// the log without bound otherwise, and nobody reads the fiftieth copy.
 const FAILURE_LIMIT: usize = 50;
@@ -110,6 +113,7 @@ gpui::actions!(
         ActionPreview,
         ActionOpenExternally,
         ActionEditHeaders,
+        ActionOpenInTab,
     ]
 );
 
@@ -381,6 +385,53 @@ impl Form {
     }
 }
 
+/// One browsing location, and everything that makes returning to it feel like
+/// returning rather than starting again.
+///
+/// **Only the active tab's state is live.** The fields it mirrors sit directly
+/// on [`Browser`]; switching tabs swaps a snapshot in and the outgoing one out.
+/// The alternative — every one of the hundred and fifty reads of
+/// `self.entries`, `self.prefix`, `self.selection` becoming `self.tab().…` — is
+/// a refactor across the whole file, and it buys exactly one thing: inactive
+/// tabs loading in the background. Which is LIST requests spent on a list
+/// nobody is looking at.
+pub struct Tab {
+    id: u64,
+    /// The snapshot. Empty for the tab that is currently live.
+    state: TabState,
+}
+
+/// What a tab holds while it is not the one on screen.
+#[derive(Default)]
+pub struct TabState {
+    bucket: Option<SharedString>,
+    prefix: String,
+    entries: Vec<Entry>,
+    visible: Vec<usize>,
+    continuation: Option<String>,
+    sort: Sort,
+    filter: String,
+    selection: HashSet<String>,
+    cursor: Option<String>,
+    anchor: Option<String>,
+    scroll: UniformListScrollHandle,
+    search: Option<Search>,
+}
+
+impl Tab {
+    /// What the tab bar shows: the deepest name in the path, because that is
+    /// what tells two tabs apart when they are in the same bucket.
+    fn title(bucket: Option<&SharedString>, prefix: &str) -> SharedString {
+        match bucket {
+            None => "Trống".into(),
+            Some(bucket) => match prefix.trim_end_matches('/').rsplit('/').next() {
+                Some(segment) if !segment.is_empty() => segment.to_string().into(),
+                _ => bucket.clone(),
+            },
+        }
+    }
+}
+
 /// One operation applied to every object in a selection.
 ///
 /// Driven a key at a time from the UI rather than looped inside one task: five
@@ -524,6 +575,12 @@ pub struct Browser {
     thumbnails: HashMap<String, Option<std::sync::Arc<gpui::Image>>>,
     /// Whether the profile manager dialog is open.
     profiles_open: bool,
+    /// Every open tab, in the order the bar shows them. Never empty: closing the
+    /// last one would leave the window with nowhere to be.
+    tabs: Vec<Tab>,
+    /// Which tab's state is the live one.
+    active_tab: usize,
+    next_tab_id: u64,
     /// An operation running over a selection.
     bulk: Option<Bulk>,
     /// A whole-bucket scan, when one is running or its results are on screen.
@@ -713,6 +770,12 @@ impl Browser {
             thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
+            tabs: vec![Tab {
+                id: 0,
+                state: TabState::default(),
+            }],
+            active_tab: 0,
+            next_tab_id: 1,
             bulk: None,
             search: None,
             palette: None,
@@ -1099,6 +1162,201 @@ impl Browser {
             return;
         }
         self.open(bucket, parent, cx);
+    }
+
+    // ------------------------------------------------------------------- tabs
+
+    /// Lifts the live state out into a snapshot.
+    ///
+    /// Moves rather than clones: a thousand `Entry` values copied on every tab
+    /// switch is a cost for nothing, and the live fields are about to be
+    /// overwritten anyway.
+    fn capture_tab(&mut self) -> TabState {
+        TabState {
+            bucket: self.bucket.take(),
+            prefix: std::mem::take(&mut self.prefix),
+            entries: std::mem::take(&mut self.entries),
+            visible: std::mem::take(&mut self.visible),
+            continuation: self.continuation.take(),
+            sort: self.sort,
+            filter: std::mem::take(&mut self.filter),
+            selection: std::mem::take(&mut self.selection),
+            cursor: self.cursor.take(),
+            anchor: self.anchor.take(),
+            scroll: self.scroll.clone(),
+            search: self.search.take(),
+        }
+    }
+
+    /// The half of restoring that is only moving fields, split out so it can be
+    /// tested without a window.
+    fn apply_tab_state(&mut self, state: TabState) {
+        self.bucket = state.bucket;
+        self.prefix = state.prefix;
+        self.entries = state.entries;
+        self.visible = state.visible;
+        self.continuation = state.continuation;
+        self.sort = state.sort;
+        self.filter = state.filter;
+        self.selection = state.selection;
+        self.cursor = state.cursor;
+        self.anchor = state.anchor;
+        self.scroll = state.scroll;
+        self.search = state.search;
+    }
+
+    fn restore_tab(&mut self, state: TabState, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_tab_state(state);
+
+        // The filter field is one widget shared by every tab, so its text has to
+        // be put back by hand or the box would still show the last tab's filter
+        // while this tab's list is narrowed by a different one.
+        if let Some(input) = self.filter_input.clone() {
+            let filter = self.filter.clone();
+            input.update(cx, |input, cx| input.set_value(filter, window, cx));
+        }
+
+        // Whatever was in flight belongs to the tab being left.
+        self.loading = false;
+        self.loading_more = false;
+        self.listing_task = None;
+        self.paging_task = None;
+
+        // A tab that has a place but nothing in it has never been loaded, or was
+        // switched away from mid-load. Either way it needs the request now; a
+        // tab that already has rows must not spend one.
+        if self.entries.is_empty() {
+            if let Some(bucket) = self.bucket.clone() {
+                let prefix = self.prefix.clone();
+                self.open(bucket, prefix, cx);
+            }
+        } else {
+            self.status = self.listing_summary();
+        }
+        cx.notify();
+    }
+
+    fn switch_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index == self.active_tab || index >= self.tabs.len() {
+            return;
+        }
+        // Abandons any request still running for the tab being left, so its
+        // answer cannot land in the new tab's list.
+        self.generation += 1;
+
+        let state = self.capture_tab();
+        self.tabs[self.active_tab].state = state;
+        self.active_tab = index;
+        let state = std::mem::take(&mut self.tabs[index].state);
+        self.restore_tab(state, window, cx);
+    }
+
+    /// Opens a location in a new tab, or jumps to the tab already showing it.
+    fn open_in_tab(
+        &mut self,
+        bucket: Option<SharedString>,
+        prefix: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Same place twice is two tabs that can never be told apart in the bar.
+        let existing = self.tabs.iter().position(|tab| {
+            if tab.id == self.tabs[self.active_tab].id {
+                self.bucket == bucket && self.prefix == prefix
+            } else {
+                tab.state.bucket == bucket && tab.state.prefix == prefix
+            }
+        });
+        if let Some(index) = existing {
+            return self.switch_tab(index, window, cx);
+        }
+
+        self.generation += 1;
+        let state = self.capture_tab();
+        self.tabs[self.active_tab].state = state;
+
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.insert(
+            self.active_tab + 1,
+            Tab {
+                id,
+                state: TabState {
+                    bucket,
+                    prefix,
+                    sort: self.sort,
+                    ..Default::default()
+                },
+            },
+        );
+        self.active_tab += 1;
+        let state = std::mem::take(&mut self.tabs[self.active_tab].state);
+        self.restore_tab(state, window, cx);
+    }
+
+    /// A new tab at the root of whatever bucket is open, or empty if none is.
+    fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Not a duplicate of the current place: `open_in_tab` would jump back to
+        // this tab if the prefix happened to be the root already.
+        let bucket = self.bucket.clone();
+        if bucket.is_some() && self.prefix.is_empty() {
+            return self.open_in_tab(None, String::new(), window, cx);
+        }
+        self.open_in_tab(bucket, String::new(), window, cx)
+    }
+
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // The last tab stays. A window with no tab has nowhere to be, and an
+        // empty one is what "close everything" should leave behind anyway.
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        if index != self.active_tab {
+            self.tabs.remove(index);
+            if index < self.active_tab {
+                self.active_tab -= 1;
+            }
+            return cx.notify();
+        }
+
+        self.generation += 1;
+        self.tabs.remove(index);
+        // The one to the right, or the last one if this was the rightmost —
+        // what every browser does, and what the hand expects.
+        self.active_tab = index.min(self.tabs.len() - 1);
+        let state = std::mem::take(&mut self.tabs[self.active_tab].state);
+        self.restore_tab(state, window, cx);
+    }
+
+    /// Opens whatever the cursor is on in a new tab.
+    ///
+    /// Only folders: a tab is a place, and an object is not one.
+    fn open_cursor_in_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .cursor_position()
+            .and_then(|position| self.visible.get(position).copied())
+            .and_then(|index| self.entries.get(index))
+            .filter(|entry| entry.is_folder)
+            .map(|entry| entry.key.clone());
+
+        if let (Some(bucket), Some(prefix)) = (self.bucket.clone(), target) {
+            self.open_in_tab(Some(bucket), prefix, window, cx);
+        }
+    }
+
+    /// The label for each tab, taken from live state for the active one.
+    fn tab_titles(&self) -> Vec<SharedString> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                if index == self.active_tab {
+                    Tab::title(self.bucket.as_ref(), &self.prefix)
+                } else {
+                    Tab::title(tab.state.bucket.as_ref(), &tab.state.prefix)
+                }
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------ bulk edits
@@ -2340,6 +2598,17 @@ impl Browser {
             Command::EditHeaders => {
                 if let Some(window) = window {
                     self.edit_headers_for_selection(window, cx);
+                }
+            }
+            Command::NewTab => {
+                if let Some(window) = window {
+                    self.new_tab(window, cx);
+                }
+            }
+            Command::CloseTab => {
+                if let Some(window) = window {
+                    let index = self.active_tab;
+                    self.close_tab(index, window, cx);
                 }
             }
             Command::Filter => {
@@ -3677,6 +3946,20 @@ impl Browser {
                 "enter" => return self.start_rename(window, cx),
                 "i" => return self.toggle_inspector(cx),
                 "k" => return self.open_palette(cx),
+                "t" => return self.new_tab(window, cx),
+                // ⌘1 to ⌘9, like every browser. ⌘9 is the last tab rather than
+                // the ninth, which is also what every browser does and what the
+                // hand means by it.
+                digit if digit.len() == 1 && digit.chars().all(|c| c.is_ascii_digit()) => {
+                    let Some(index) = tab_shortcut(digit, self.tabs.len()) else {
+                        return;
+                    };
+                    return self.switch_tab(index, window, cx);
+                }
+                "w" => {
+                    let index = self.active_tab;
+                    return self.close_tab(index, window, cx);
+                }
                 "j" => {
                     self.drawer_open = !self.drawer_open;
                     cx.notify();
@@ -3763,6 +4046,94 @@ impl Browser {
     }
 
     // ----------------------------------------------------------------- render
+
+    /// The tab bar.
+    ///
+    /// Always on screen, even with one tab. A tab strip that appears only once
+    /// you already have two tabs cannot tell you that tabs exist.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let titles = self.tab_titles();
+        let active = self.active_tab;
+        let closable = self.tabs.len() > 1;
+
+        div()
+            .h(px(TAB_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .px_1()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .children(titles.into_iter().enumerate().map(|(index, title)| {
+                let selected = index == active;
+                div()
+                    .id(SharedString::from(format!("tab-{index}")))
+                    .h(px(TAB_HEIGHT - 6.))
+                    .w(px(TAB_WIDTH))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(if selected { theme.selected } else { theme.hover })
+                    .text_color(if selected { theme.text } else { theme.text_muted })
+                    .hover(|this| this.bg(theme.selected))
+                    .child(sized_icon(
+                        "folder",
+                        12.,
+                        if selected { theme.accent } else { theme.text_faint },
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(title),
+                    )
+                    // The close control only exists while there is another tab
+                    // to fall back to.
+                    .when(closable, |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("tab-close-{index}")))
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .hover(|this| this.bg(theme.hover))
+                                .child(sized_icon("close", 10., theme.text_faint))
+                                .on_click(cx.listener(move |this, event, window, cx| {
+                                    // Or the click reaches the tab underneath and
+                                    // selects the tab it just closed.
+                                    cx.stop_propagation();
+                                    _ = event;
+                                    this.close_tab(index, window, cx);
+                                })),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.switch_tab(index, window, cx)
+                    }))
+            }))
+            .child(
+                div()
+                    .id("tab-new")
+                    .size(px(TAB_HEIGHT - 6.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.hover))
+                    .child(sized_icon("plus", 12., theme.text_muted))
+                    .on_click(cx.listener(|this, _event, window, cx| this.new_tab(window, cx))),
+            )
+    }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -4719,7 +5090,11 @@ impl Browser {
                             // A folder has no metadata of its own and cannot be
                             // shared as a link, so those never appear on one.
                             let menu = if is_folder {
-                                menu
+                                menu.menu_with_icon(
+                                    "Mở trong tab mới",
+                                    menu_icon("external"),
+                                    Box::new(ActionOpenInTab),
+                                )
                             } else {
                                 menu.menu_with_icon(
                                     "Xem trước",
@@ -6351,6 +6726,9 @@ impl Render for Browser {
             .on_action(cx.listener(|this, _: &ActionEditHeaders, window, cx| {
                 this.edit_headers_for_selection(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActionOpenInTab, window, cx| {
+                this.open_cursor_in_tab(window, cx)
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -6364,6 +6742,7 @@ impl Render for Browser {
             })
             .when(!self.profiles.is_empty(), |this| {
                 this.child(self.render_toolbar(cx))
+                    .child(self.render_tabs(cx))
             .child(
                 div()
                     .flex_1()
@@ -7361,6 +7740,21 @@ fn form_label_width(kind: &FormKind) -> f32 {
     (longest as f32 * CHAR_WIDTH + 8.0).max(84.)
 }
 
+/// Which tab a number key selects.
+///
+/// `9` means the last one rather than the ninth: with three tabs open, ⌘9 has to
+/// go somewhere, and every browser sends it to the end.
+fn tab_shortcut(digit: &str, open: usize) -> Option<usize> {
+    let n: usize = digit.parse().ok()?;
+    if n == 0 || open == 0 {
+        return None;
+    }
+    if n == 9 {
+        return Some(open - 1);
+    }
+    (n - 1 < open).then_some(n - 1)
+}
+
 /// An empty field means "send no header", which is how a header gets removed.
 fn some_if_filled(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
@@ -7449,6 +7843,8 @@ pub enum Command {
     /// that one needs a row under the pointer; this reaches a selection made
     /// any other way.
     EditHeaders,
+    NewTab,
+    CloseTab,
     GoUp,
     Filter,
     NewFolder,
@@ -7482,6 +7878,8 @@ impl Command {
             Command::Filter => ("Lọc", "⌘F"),
             Command::Errors => ("Xem lỗi", ""),
             Command::EditHeaders => ("Sửa header", ""),
+            Command::NewTab => ("Tab mới", "⌘T"),
+            Command::CloseTab => ("Đóng tab", "⌘W"),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -7504,7 +7902,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 24] {
+    fn all() -> [Command; 26] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -7530,6 +7928,8 @@ impl Command {
             Command::NewProfile,
             Command::Errors,
             Command::EditHeaders,
+            Command::NewTab,
+            Command::CloseTab,
         ]
     }
 }
@@ -7770,6 +8170,12 @@ mod tests {
             thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
+            tabs: vec![Tab {
+                id: 0,
+                state: TabState::default(),
+            }],
+            active_tab: 0,
+            next_tab_id: 1,
             bulk: None,
             search: None,
             palette: None,
@@ -8462,7 +8868,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 24);
+        assert_eq!(all.len(), 26);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -8547,6 +8953,74 @@ mod tests {
         // to nothing.
         assert_eq!(short, 84.);
         assert!(long > 120., "{long}");
+    }
+
+    #[gpui::test]
+    fn switching_tabs_puts_everything_back_where_it_was(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![entry("a.txt", false, 1), entry("b.txt", false, 2)],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, _| {
+            browser.prefix = "photos/2026/".into();
+            browser.selection.insert("b.txt".into());
+            browser.cursor = Some("b.txt".into());
+            browser.filter = "b".into();
+            browser.sort = Sort {
+                key: SortKey::Size,
+                ..browser.sort
+            };
+
+            // Leaving the tab lifts all of that out, and leaves the live state
+            // empty rather than half of the old tab showing through.
+            let saved = browser.capture_tab();
+            assert!(browser.entries.is_empty());
+            assert!(browser.selection.is_empty());
+            assert!(browser.prefix.is_empty());
+            assert_eq!(saved.entries.len(), 2);
+
+            // Coming back is not "load the folder again": the rows, the
+            // selection, the cursor, the filter and the sort are the same ones.
+            browser.apply_tab_state(saved);
+            assert_eq!(browser.prefix, "photos/2026/");
+            assert_eq!(browser.entries.len(), 2);
+            assert!(browser.selection.contains("b.txt"));
+            assert_eq!(browser.cursor.as_deref(), Some("b.txt"));
+            assert_eq!(browser.filter, "b");
+            assert_eq!(browser.sort.key, SortKey::Size);
+        });
+    }
+
+    #[test]
+    fn the_number_keys_pick_a_tab_and_nine_means_the_last_one() {
+        assert_eq!(tab_shortcut("1", 3), Some(0));
+        assert_eq!(tab_shortcut("3", 3), Some(2));
+        // Past the end does nothing rather than jumping somewhere arbitrary.
+        assert_eq!(tab_shortcut("4", 3), None);
+        // 9 has to go somewhere with three tabs open, and the end is where every
+        // browser sends it.
+        assert_eq!(tab_shortcut("9", 3), Some(2));
+        assert_eq!(tab_shortcut("9", 12), Some(11));
+        // There is no tab zero.
+        assert_eq!(tab_shortcut("0", 3), None);
+    }
+
+    #[test]
+    fn a_tab_is_named_after_the_deepest_part_of_where_it_is() {
+        let bucket = SharedString::from("demo-bucket");
+
+        // At the root there is no segment, so the bucket names the tab.
+        assert_eq!(Tab::title(Some(&bucket), ""), "demo-bucket");
+        // Deeper, the last segment is what tells two tabs in the same bucket
+        // apart — "demo-bucket" three times over says nothing.
+        assert_eq!(Tab::title(Some(&bucket), "photos/2026/"), "2026");
+        // With or without the trailing slash.
+        assert_eq!(Tab::title(Some(&bucket), "photos/2026"), "2026");
+        // A tab that is not anywhere yet still needs a name.
+        assert_eq!(Tab::title(None, ""), "Trống");
     }
 
     #[test]

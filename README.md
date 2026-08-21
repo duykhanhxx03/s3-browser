@@ -38,6 +38,8 @@ hoá luôn cái kho khoá.
 | `Enter` trong ô lọc | Quét cả bucket tìm chuỗi đó, dừng được giữa chừng |
 | `⌘N` / `⌘⇧N` | Thư mục mới / bucket mới |
 | `⌘R` | Tải lại prefix hiện tại |
+| `⌘T` / `⌘W` | Tab mới / đóng tab |
+| `⌘1`…`⌘9` | Chuyển tab (`⌘9` là tab cuối) |
 | `⌘⌫` | Xoá các mục đang chọn |
 | `⌘↑` | Lên một cấp |
 | `↑` `↓` | Đổi dòng đang chọn |
