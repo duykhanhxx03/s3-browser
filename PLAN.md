@@ -451,7 +451,9 @@ tính năng sau.
 
 ### Rẻ mà đáng làm ngay
 
-1. **Content-Type khi upload**, đoán từ đuôi file. Sửa lỗi ở trên.
+1. ~~**Content-Type khi upload**~~ — xong (21/08/2026). Đoán từ đuôi file bằng
+   `mime_guess`, đặt ở cả `PutObject` lẫn `CreateMultipartUpload`. Không có đuôi
+   thì không đặt gì, vì bịa một kiểu còn tệ hơn mặc định của provider.
 2. **Sửa header của object đã có**: Content-Type, Cache-Control,
    Content-Disposition. S3 sửa metadata bằng cách copy đè lên chính nó với
    `MetadataDirective=REPLACE` — `copy_object` đã có sẵn, chỉ thiếu đường trong

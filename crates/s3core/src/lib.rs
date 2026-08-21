@@ -661,6 +661,7 @@ impl S3Client {
             .bucket(bucket)
             .key(key)
             .checksum_crc32(checksum)
+            .set_content_type(content_type_for(key))
             .body(body.into());
         match self.encryption() {
             Encryption::BucketDefault => {}
@@ -723,6 +724,9 @@ impl S3Client {
             .create_multipart_upload()
             .bucket(bucket)
             .key(key)
+            // Here too, and only here: the parts inherit it, and
+            // `CompleteMultipartUpload` has nowhere to put it.
+            .set_content_type(content_type_for(key))
             .checksum_algorithm(ChecksumAlgorithm::Crc32);
         match self.encryption() {
             Encryption::BucketDefault => {}
@@ -1837,6 +1841,28 @@ pub fn detect_local_offset() -> i32 {
         .unwrap_or(0)
 }
 
+/// The Content-Type an object should be stored under, guessed from its name.
+///
+/// **Why this has to exist.** S3 stores whatever it is handed and never looks at
+/// the bytes, so an upload that sends no type is stored as
+/// `application/octet-stream`. Nothing in this app reveals that, because the
+/// inspector reads the type back from `HeadObject` and faithfully reports what
+/// was stored. The damage shows up elsewhere: a browser given a presigned URL
+/// for an image downloads it instead of displaying it, and a static site served
+/// from the bucket does not work at all.
+///
+/// A guess from the extension is what the AWS console does and what every other
+/// client does. Occasionally wrong; never absent, which is the state that
+/// actually breaks things.
+///
+/// `None` for a name with no extension or one nobody has registered — claiming
+/// a type there would be worse than the provider's own default.
+pub fn content_type_for(key: &str) -> Option<String> {
+    mime_guess::from_path(key)
+        .first()
+        .map(|mime| mime.essence_str().to_string())
+}
+
 /// Seconds since the Unix epoch. Public because the UI stamps its own events
 /// with it, and two clocks would eventually disagree.
 pub fn now_epoch() -> i64 {
@@ -2156,5 +2182,64 @@ mod tests {
             },
         );
         assert_eq!(entries[0].name, "small.txt");
+    }
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::content_type_for;
+
+    #[test]
+    fn the_types_that_matter_for_a_link_are_guessed() {
+        // These are the ones where getting it wrong is visible: a browser handed
+        // a presigned URL either renders them or downloads them, and that turns
+        // on this header alone.
+        assert_eq!(content_type_for("a.jpg").as_deref(), Some("image/jpeg"));
+        assert_eq!(content_type_for("a.png").as_deref(), Some("image/png"));
+        assert_eq!(content_type_for("a.pdf").as_deref(), Some("application/pdf"));
+        assert_eq!(content_type_for("index.html").as_deref(), Some("text/html"));
+        assert_eq!(content_type_for("a.json").as_deref(), Some("application/json"));
+        assert_eq!(content_type_for("a.csv").as_deref(), Some("text/csv"));
+    }
+
+    #[test]
+    fn the_key_is_a_path_not_a_file_name() {
+        // Keys carry their prefix, and the extension is at the end of the whole
+        // thing. Reading the first dot would type `photos.2026/a.png` as
+        // whatever `.2026` is.
+        assert_eq!(
+            content_type_for("photos/2026/a.png").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            content_type_for("photos.2026/a.png").as_deref(),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn an_uppercase_extension_is_the_same_extension() {
+        // Cameras and Windows both produce these, and a `.JPG` stored as
+        // octet-stream is exactly the bug this function exists to stop.
+        assert_eq!(content_type_for("IMG_0001.JPG").as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn no_extension_means_no_claim() {
+        // Guessing here would be inventing. The provider's own default is the
+        // honest answer, and it is what omitting the header produces.
+        assert_eq!(content_type_for("README"), None);
+        assert_eq!(content_type_for("archive.zzznotathing"), None);
+        assert_eq!(content_type_for(""), None);
+    }
+
+    #[test]
+    fn the_header_carries_no_parameters() {
+        // `essence_str`, not `to_string`: some entries come with `; charset=`
+        // attached, and a charset guessed from a file extension is a guess about
+        // the bytes that nothing here has read.
+        let text = content_type_for("notes.txt").unwrap();
+        assert_eq!(text, "text/plain");
+        assert!(!text.contains(';'), "{text}");
     }
 }

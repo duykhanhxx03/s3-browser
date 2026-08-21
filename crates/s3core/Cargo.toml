@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 time.workspace = true
 crc32fast = "1"
+mime_guess = "2"
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts.workspace = true

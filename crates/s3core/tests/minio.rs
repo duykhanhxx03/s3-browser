@@ -796,3 +796,85 @@ async fn acl_reads_grants_and_flags_public_ones() {
 
     client.delete_object(bucket, key).await.unwrap();
 }
+
+/// The bug this catches: uploads used to send no Content-Type at all, and the
+/// only place it showed was outside the app — a browser handed a presigned URL
+/// for an image downloading it instead of displaying it. Asserting against a
+/// real server rather than against the guesser, because the guess being right
+/// and the header actually arriving are two different claims.
+#[tokio::test]
+async fn an_upload_stores_the_content_type_its_name_implies() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+
+    // A one-pixel PNG, so the object really is what its name says.
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+    let key = "content-type-tests/pixel.png";
+    client.put_object(bucket, key, png).await.unwrap();
+    assert_eq!(
+        client.head_object(bucket, key).await.unwrap().content_type.as_deref(),
+        Some("image/png")
+    );
+
+    let key = "content-type-tests/page.html";
+    client
+        .put_object(bucket, key, b"<h1>xin chao</h1>".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        client.head_object(bucket, key).await.unwrap().content_type.as_deref(),
+        Some("text/html")
+    );
+
+    // No extension: the app claims nothing and the provider applies its own
+    // default. Sending a made-up type here would be worse than sending none.
+    let key = "content-type-tests/README";
+    client
+        .put_object(bucket, key, b"khong co duoi".to_vec())
+        .await
+        .unwrap();
+    let head = client.head_object(bucket, key).await.unwrap();
+    assert!(
+        head.content_type.as_deref() == Some("application/octet-stream")
+            || head.content_type.is_none(),
+        "expected the provider default, got {:?}",
+        head.content_type
+    );
+
+    // Multipart is a separate call and a separate place to forget it. Big
+    // uploads are exactly the ones that go this way, so a fix that only covered
+    // `PutObject` would leave every large image untyped.
+    let key = "content-type-tests/big.jpg";
+    let upload_id = client
+        .create_multipart_upload(bucket, key)
+        .await
+        .unwrap();
+    // 5 MiB is S3's minimum for any part but the last.
+    let part = client
+        .upload_part(bucket, key, &upload_id, 1, vec![7u8; 5 * 1024 * 1024])
+        .await
+        .unwrap();
+    client
+        .complete_multipart_upload(
+            bucket,
+            key,
+            &upload_id,
+            vec![s3core::CompletedPart {
+                part_number: 1,
+                etag: part.etag,
+                checksum_crc32: part.checksum_crc32,
+                size: 5 * 1024 * 1024,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client.head_object(bucket, key).await.unwrap().content_type.as_deref(),
+        Some("image/jpeg")
+    );
+}

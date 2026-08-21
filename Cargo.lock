@@ -6211,6 +6211,7 @@ dependencies = [
  "aws-sdk-ssooidc",
  "aws-sdk-sts",
  "crc32fast",
+ "mime_guess",
  "time",
  "tokio",
 ]
