@@ -531,6 +531,10 @@ pub struct Search {
     /// Whether the scan reached the end of the bucket. Until it does, a count
     /// of results is "so far" and must not be worded as though it were final.
     complete: bool,
+    /// A cap stopped it. Different from being stopped by hand, and both are
+    /// different from finishing: only one of the three means "this is the whole
+    /// answer".
+    capped: bool,
     /// Whether a request is in flight.
     running: bool,
 }
@@ -1678,6 +1682,7 @@ impl Browser {
             scanned: 0,
             requests: 0,
             complete: false,
+            capped: false,
             running: true,
         });
         self.status = self.search_summary();
@@ -1727,12 +1732,24 @@ impl Browser {
                             .cloned()
                             .collect();
 
+                        let held = this.entries.len();
                         if let Some(search) = this.search.as_mut() {
                             search.requests += 1;
                             search.scanned += page.entries.len();
                             search.continuation = page.continuation;
                             search.complete = search.continuation.is_none();
-                            if search.complete {
+
+                            // Caps, because the person who pressed Enter is not
+                            // the person who reads the bill. A bucket with ten
+                            // million keys is ten thousand LIST requests, and
+                            // nothing about pressing Enter said that.
+                            if search.requests >= SEARCH_MAX_REQUESTS
+                                || search.scanned >= SEARCH_MAX_KEYS
+                                || held + matched.len() >= SEARCH_MAX_MATCHES
+                            {
+                                search.capped = true;
+                            }
+                            if search.complete || search.capped {
                                 search.running = false;
                             }
                         }
@@ -1788,13 +1805,14 @@ impl Browser {
         let Some(search) = self.search.as_ref() else {
             return self.listing_summary();
         };
-        search_summary(
-            self.entries.len(),
-            search.scanned,
-            search.requests,
-            search.complete,
-            search.running,
-        )
+        search_summary(SearchProgress {
+            found: self.entries.len(),
+            scanned: search.scanned,
+            requests: search.requests,
+            complete: search.complete,
+            capped: search.capped,
+            running: search.running,
+        })
         .into()
     }
 
@@ -5873,17 +5891,26 @@ impl Browser {
                 .items_center()
                 .justify_center()
                 .gap_3()
-                .child(div().text_color(theme.text_muted).child(if complete {
-                    "Không có object nào khớp"
-                } else if search.running {
-                    "Đang quét…"
-                } else {
-                    "Chưa thấy gì, và đã dừng giữa chừng"
-                }))
+                .child(div().text_color(theme.text_muted).child(
+                    if search.capped {
+                        "Chưa thấy gì, và đã quét tới mức trần"
+                    } else if complete {
+                        "Không có object nào khớp"
+                    } else if search.running {
+                        "Đang quét…"
+                    } else {
+                        "Chưa thấy gì, và đã dừng giữa chừng"
+                    },
+                ))
                 .child(div().text_xs().text_color(theme.text_faint).child(
                     SharedString::from(if complete {
                         format!(
                             "Đã quét hết bucket: {} mục trong {} yêu cầu.",
+                            search.scanned, search.requests
+                        )
+                    } else if search.capped {
+                        format!(
+                            "Đã quét {} mục trong {} yêu cầu rồi dừng theo mức trần. Thu hẹp prefix rồi tìm lại.",
                             search.scanned, search.requests
                         )
                     } else {
@@ -8819,20 +8846,43 @@ fn wrap_words(text: &str, max_chars: usize) -> Vec<String> {
 /// a finished scan and a stopped one: "12 kết quả" and "12 kết quả (đã dừng)"
 /// are different claims about the bucket, and reporting the second as the first
 /// tells someone a file is not there when the scan simply never reached it.
-fn search_summary(
+struct SearchProgress {
     found: usize,
     scanned: usize,
     requests: usize,
     complete: bool,
+    capped: bool,
     running: bool,
-) -> String {
-    let state = match (complete, running) {
-        (true, _) => "xong",
-        (false, true) => "đang quét",
-        (false, false) => "đã dừng",
+}
+
+fn search_summary(progress: SearchProgress) -> String {
+    let SearchProgress {
+        found,
+        scanned,
+        requests,
+        complete,
+        capped,
+        running,
+    } = progress;
+    // A cap is checked before completion: a scan that hit the ceiling on its
+    // last page did not cover the bucket, whatever the continuation token says.
+    let state = match (capped, complete, running) {
+        (true, _, _) => "chạm trần",
+        (_, true, _) => "xong",
+        (_, false, true) => "đang quét",
+        (_, false, false) => "đã dừng",
     };
     format!("{found} kết quả, quét {scanned} mục trong {requests} yêu cầu ({state})")
 }
+
+/// What a deep search will spend before it gives up on its own.
+///
+/// The person who presses Enter is not the person who reads the bill, and a
+/// bucket with ten million keys is ten thousand LIST requests. Same numbers
+/// Brows3 uses, for the same reason.
+const SEARCH_MAX_REQUESTS: usize = 100;
+const SEARCH_MAX_KEYS: usize = 100_000;
+const SEARCH_MAX_MATCHES: usize = 10_000;
 
 /// Collapses a multi-line error into one paragraph, for display only.
 ///
@@ -10000,21 +10050,45 @@ mod tests {
 
     #[test]
     fn a_stopped_scan_never_reads_as_a_finished_one() {
+        let line = |complete, capped, running| {
+            search_summary(SearchProgress {
+                found: 12,
+                scanned: 4000,
+                requests: 4,
+                complete,
+                capped,
+                running,
+            })
+        };
+
         // The whole point of saying anything at all. "Không tìm thấy" from a
         // scan that covered a tenth of the bucket is a claim the app has no
         // basis for, and it is the claim that sends someone looking for a file
         // somewhere else entirely.
-        assert!(search_summary(12, 4000, 4, true, false).contains("xong"));
-        assert!(search_summary(12, 4000, 4, false, true).contains("đang quét"));
-        assert!(search_summary(12, 4000, 4, false, false).contains("đã dừng"));
+        assert!(line(true, false, false).contains("xong"));
+        assert!(line(false, false, true).contains("đang quét"));
+        assert!(line(false, false, false).contains("đã dừng"));
+        assert!(line(false, true, false).contains("chạm trần"));
+
+        // A cap reached on the very last page did not cover the bucket, whatever
+        // the continuation token happened to say.
+        assert!(line(true, true, false).contains("chạm trần"));
 
         // The request count is there because that is the line item on the bill,
         // not the key count.
-        let line = search_summary(0, 9000, 9, false, true);
+        let line = search_summary(SearchProgress {
+            found: 0,
+            scanned: 9000,
+            requests: 9,
+            complete: false,
+            capped: false,
+            running: true,
+        });
         assert!(line.contains("9 yêu cầu"), "{line}");
         assert!(line.contains("9000 mục"), "{line}");
         assert!(line.starts_with("0 kết quả"), "{line}");
     }
+
 
     #[test]
     fn flattening_makes_one_paragraph_of_a_cause_chain() {

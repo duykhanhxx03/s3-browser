@@ -556,9 +556,9 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
    Cần khoá theo kích thước và cảnh báo ghi đè.
 10. **Preview audio, video, PDF.** Hiện chỉ ảnh, text và bảng — nhưng đã ra
     modal riêng (21/08/2026) nên chỗ để hiển thị đã có sẵn.
-11. **Trần cho tìm kiếm sâu.** Phần quét ở §7.5 dừng được nhưng không có trần tự
-    động. Brows3 đặt sẵn 100.000 mục / 100 LIST / 10.000 kết quả. Nên có, vì người
-    bấm tìm không phải người nhìn hoá đơn.
+11. ~~**Trần cho tìm kiếm sâu**~~ — xong (21/08/2026). 100 yêu cầu / 100.000 mục
+    / 10.000 kết quả, và "chạm trần" là một trạng thái riêng chứ không lẫn vào
+    "xong" hay "đã dừng".
 12. **Cache danh sách bucket** theo profile. Brows3 để 30 phút.
 13. **Chép đường dẫn `s3://`** và key, không chỉ URL công khai.
 14. **ACL đệ quy cho cả prefix**, không chỉ cho vùng đang chọn.
