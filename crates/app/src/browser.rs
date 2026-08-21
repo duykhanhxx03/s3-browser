@@ -134,6 +134,8 @@ gpui::actions!(
         ActionOpenExternally,
         ActionEditHeaders,
         ActionOpenInTab,
+        ActionCopyPath,
+        ActionCopyKey,
     ]
 );
 
@@ -3161,6 +3163,8 @@ impl Browser {
                 self.settings_open = true;
                 cx.notify();
             }
+            Command::CopyPath => self.copy_location(true, cx),
+            Command::CopyKey => self.copy_location(false, cx),
             Command::Filter => {
                 if let Some(window) = window {
                     self.focus_filter(window, cx);
@@ -3993,6 +3997,42 @@ impl Browser {
     /// The unsigned URL. Only useful when the object is public, which the app
     /// cannot know without reading the bucket policy — so the panel says so
     /// rather than implying the link works for anyone.
+    /// Copies what the selection is called, as a path or as a bare key.
+    ///
+    /// Two forms because they go to different places: `s3://bucket/key` is what
+    /// the AWS CLI and every other tool take, and the bare key is what goes into
+    /// code that already knows the bucket.
+    ///
+    /// Several selected join with newlines, which is what a shell loop or a
+    /// spreadsheet wants and what one long comma-run is not.
+    fn copy_location(&mut self, as_path: bool, cx: &mut Context<Self>) {
+        // Folders included: a prefix is a perfectly good thing to paste into
+        // `aws s3 sync`, and leaving them out would silently copy less than was
+        // selected.
+        let keys: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| self.selection.contains(&entry.key))
+            .map(|entry| entry.key.clone())
+            .collect();
+        let keys = if keys.is_empty() {
+            self.cursor.clone().into_iter().collect()
+        } else {
+            keys
+        };
+        if keys.is_empty() {
+            return;
+        }
+
+        let Some(bucket) = self.bucket.clone() else {
+            return;
+        };
+        let text = location_text(&bucket, &keys, as_path);
+
+        let what = if as_path { "đường dẫn" } else { "key" };
+        self.copy_to_clipboard(text, what, cx);
+    }
+
     fn copy_public_url(&mut self, cx: &mut Context<Self>) {
         let (Some(bucket), Some(share)) = (self.bucket.clone(), self.share.as_ref()) else {
             return;
@@ -6347,6 +6387,20 @@ impl Browser {
                                 Box::new(ActionDownload),
                             )
                             .separator()
+                            // Their own group, away from "Chép": that one puts
+                            // objects on the clipboard for a paste, these two
+                            // put text on it for somewhere else entirely.
+                            .menu_with_icon(
+                                "Chép đường dẫn s3://",
+                                menu_icon("path"),
+                                Box::new(ActionCopyPath),
+                            )
+                            .menu_with_icon(
+                                "Chép key",
+                                menu_icon("copy"),
+                                Box::new(ActionCopyKey),
+                            )
+                            .separator()
                             .menu_with_icon("Xoá", menu_icon("trash"), Box::new(ActionDelete))
                         })
                         .into_any_element()
@@ -7900,6 +7954,12 @@ impl Render for Browser {
             .on_action(cx.listener(|this, _: &ActionOpenInTab, window, cx| {
                 this.open_cursor_in_tab(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActionCopyPath, _window, cx| {
+                this.copy_location(true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionCopyKey, _window, cx| {
+                this.copy_location(false, cx)
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -9198,6 +9258,24 @@ fn choice_chip(
         .child(label)
 }
 
+/// What lands on the clipboard when a selection is copied as text.
+///
+/// Newline-separated because the two things anyone does with several keys —
+/// a shell loop and a spreadsheet column — both want one per line, and one long
+/// comma run wants neither.
+fn location_text(bucket: &str, keys: &[String], as_path: bool) -> String {
+    keys.iter()
+        .map(|key| {
+            if as_path {
+                format!("s3://{bucket}/{key}")
+            } else {
+                key.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A heading with no control beside it, unlike `section_header`.
 fn section_label(text: &'static str, theme: Theme) -> impl IntoElement {
     div()
@@ -9350,6 +9428,8 @@ pub enum Command {
     GoToPath,
     ToggleFavorite,
     Settings,
+    CopyPath,
+    CopyKey,
     GoUp,
     Filter,
     NewFolder,
@@ -9388,6 +9468,8 @@ impl Command {
             Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
             Command::ToggleFavorite => ("Ghim nơi này", ""),
             Command::Settings => ("Cài đặt", ""),
+            Command::CopyPath => ("Chép đường dẫn s3://", ""),
+            Command::CopyKey => ("Chép key", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -9410,7 +9492,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 29] {
+    fn all() -> [Command; 31] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -9441,6 +9523,8 @@ impl Command {
             Command::GoToPath,
             Command::ToggleFavorite,
             Command::Settings,
+            Command::CopyPath,
+            Command::CopyKey,
         ]
     }
 }
@@ -10419,7 +10503,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 29);
+        assert_eq!(all.len(), 31);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -10599,6 +10683,27 @@ mod tests {
         // send someone to a bucket they did not name.
         assert_eq!(path("s3://demo-bucket@/x"), None);
         assert_eq!(path("s3://@eu-west-1/x"), None);
+    }
+
+    #[test]
+    fn copying_a_selection_gives_one_key_per_line() {
+        let keys = vec!["reports/q1.txt".to_string(), "photos/".to_string()];
+
+        // The form every other tool takes, folders included: a prefix is a
+        // perfectly good thing to paste into `aws s3 sync`.
+        assert_eq!(
+            location_text("demo", &keys, true),
+            "s3://demo/reports/q1.txt\ns3://demo/photos/"
+        );
+
+        // And the bare form, for code that already knows the bucket.
+        assert_eq!(location_text("demo", &keys, false), "reports/q1.txt\nphotos/");
+
+        // One key is one line with nothing appended.
+        assert_eq!(
+            location_text("demo", &keys[..1], true),
+            "s3://demo/reports/q1.txt"
+        );
     }
 
     #[test]
