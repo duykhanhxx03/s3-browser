@@ -5110,14 +5110,11 @@ impl Browser {
         // Typing in the path box: Escape hands the keyboard back to the list,
         // everything else is the field's.
         if self.path_focused(window, cx) {
-            match keystroke.key.as_str() {
-                "escape" => {
-                    self.path_suggesting = false;
-                    self.path_choice = None;
-                    self.focus.focus(window);
-                    cx.notify();
-                }
-                _ => {}
+            if keystroke.key == "escape" {
+                self.path_suggesting = false;
+                self.path_choice = None;
+                self.focus.focus(window);
+                cx.notify();
             }
             return;
         }
