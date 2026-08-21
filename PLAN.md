@@ -534,8 +534,9 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
    vào là thành ô nhập, `⌘L` cũng vậy. Nhận cả dạng không có `s3://`, tự thêm dấu
    `/` cuối, và nếu đường dẫn ghi region khác profile thì nói ngay chứ không để
    request đi lạc endpoint.
-3. **Favorites và Recent** ở sidebar. Prefix hay dùng nằm sâu ba bốn cấp là chuyện
-   thường, mà đường duy nhất tới đó hiện giờ là bấm từng cấp.
+3. ~~**Favorites và Recent**~~ — xong (21/08/2026). Lưu ở `places.json` cạnh
+   profiles, gắn với profile id vì cùng một `bucket/prefix` dưới hai profile là
+   hai nơi khác nhau.
 4. ~~**Nhãn loại tệp**~~ — xong (21/08/2026), nhưng ở **cột riêng** chứ không phải
    cạnh tên: một nhãn nằm sau tên thì mỗi dòng một vị trí, quét cả danh sách tìm
    "mấy cái CSV" là phải đọc từng dòng.

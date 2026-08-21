@@ -22,7 +22,7 @@ use s3core::{
     Encryption, ObjectAcl, ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
-use vault::{ProfileStore, Provider, StoredProfile};
+use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
 
 use crate::failure::{Failure, Fix};
 use crate::platform::{self, Chrome};
@@ -83,6 +83,9 @@ const TYPE_WIDTH: f32 = 52.;
 const CHECK_WIDTH: f32 = 22.;
 /// Three small icon buttons.
 const ACTIONS_WIDTH: f32 = 72.;
+/// How many recent places the sidebar lists. The store keeps more; this is what
+/// fits above the bucket list without pushing it off screen.
+const RECENT_SHOWN: usize = 5;
 /// Fixed, so tabs do not resize under the pointer as their titles change.
 const TAB_WIDTH: f32 = 132.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
@@ -554,6 +557,9 @@ pub struct Browser {
     profiles: Vec<StoredProfile>,
     active_profile: Option<usize>,
     store: Option<ProfileStore>,
+    /// Pinned and recently visited locations, kept on disk beside the profiles.
+    places: Places,
+    place_store: Option<PlaceStore>,
 
     client: Option<S3Client>,
     buckets: Vec<SharedString>,
@@ -794,6 +800,11 @@ impl Browser {
         );
 
         let store = ProfileStore::default_location().ok();
+        let place_store = store.as_ref().map(|store| PlaceStore::beside(store.path()));
+        let places = place_store
+            .as_ref()
+            .map(|store| store.load())
+            .unwrap_or_default();
         let profiles = store
             .as_ref()
             .and_then(|store| store.load().ok())
@@ -825,6 +836,8 @@ impl Browser {
             profiles,
             active_profile: None,
             store,
+            places,
+            place_store,
             client: None,
             buckets: Vec::new(),
             bucket_filter: String::new(),
@@ -1158,6 +1171,9 @@ impl Browser {
                         this.entries = page.entries;
                         this.continuation = page.continuation;
                         this.resort_and_filter();
+                        // Recorded on arrival, not on request: a prefix that
+                        // fails to open is not somewhere anyone has been.
+                        this.record_visit();
                         this.status = this.listing_summary();
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
@@ -1930,6 +1946,67 @@ impl Browser {
         }
 
         self.open(path.bucket.into(), path.prefix, cx);
+    }
+
+    // ------------------------------------------------------ places
+
+    /// Where we are, as something that can be pinned or listed.
+    fn here(&self) -> Option<Place> {
+        let profile = self.active_profile.and_then(|ix| self.profiles.get(ix))?;
+        Some(Place {
+            profile: profile.id.clone(),
+            bucket: self.bucket.clone()?.to_string(),
+            prefix: self.prefix.clone(),
+        })
+    }
+
+    fn save_places(&mut self) {
+        let Some(store) = self.place_store.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.save(&self.places) {
+            // Not worth a dialog: losing a favourite is an annoyance, and the
+            // list is a convenience in the first place.
+            self.fail(Failure::known(
+                "Không lưu được danh sách nơi đã ghim",
+                format!("{error}"),
+                None,
+            ));
+        }
+    }
+
+    fn record_visit(&mut self) {
+        let Some(place) = self.here() else {
+            return;
+        };
+        self.places.visit(place);
+        self.save_places();
+    }
+
+    fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
+        let Some(place) = self.here() else {
+            return;
+        };
+        let pinned = self.places.toggle_favorite(place);
+        self.save_places();
+        self.status = if pinned {
+            "Đã ghim".into()
+        } else {
+            "Đã bỏ ghim".into()
+        };
+        cx.notify();
+    }
+
+    fn open_place(&mut self, place: &Place, cx: &mut Context<Self>) {
+        self.open(place.bucket.clone().into(), place.prefix.clone(), cx);
+    }
+
+    /// The profile whose places are worth showing. `None` means show none:
+    /// a place from another profile opens a bucket these credentials cannot see.
+    fn places_profile(&self) -> Option<&str> {
+        self.active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .map(|profile| profile.id.as_str())
     }
 
     /// `photos/2026/` → [("photos", "photos/"), ("2026", "photos/2026/")]
@@ -2913,6 +2990,7 @@ impl Browser {
                     self.edit_path(window, cx);
                 }
             }
+            Command::ToggleFavorite => self.toggle_favorite(cx),
             Command::Filter => {
                 if let Some(window) = window {
                     self.focus_filter(window, cx);
@@ -4606,6 +4684,7 @@ impl Browser {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
+            .children(self.render_places(cx))
             .child(
                 section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
                     |this, _event, window, cx| {
@@ -4660,6 +4739,86 @@ impl Browser {
                 this.child(skeleton_sidebar(theme))
             })
             .child(div().flex_1())
+    }
+
+    /// The pinned and recent sections above the bucket list.
+    ///
+    /// Only when they have something in them. Two permanently empty headings
+    /// above the bucket list would cost the buckets two rows of height to say
+    /// nothing.
+    fn render_places(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let theme = self.theme;
+        let profile = self.places_profile()?;
+        let favorites: Vec<Place> = self.places.for_profile(profile).cloned().collect();
+        // The place you are already at is not somewhere to go back to, and it
+        // is the top of this list on every single navigation.
+        let here = self.here();
+        let recent: Vec<Place> = self
+            .places
+            .recent_for_profile(profile)
+            .filter(|place| Some(*place) != here.as_ref())
+            .take(RECENT_SHOWN)
+            .cloned()
+            .collect();
+
+        if favorites.is_empty() && recent.is_empty() {
+            return None;
+        }
+
+        let row = |place: &Place, id: SharedString, pinned: bool| {
+            let target = place.clone();
+            let label = place.label();
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(theme.text_muted)
+                .hover(|this| this.bg(theme.hover))
+                .child(sized_icon(
+                    if pinned { "star" } else { "clock" },
+                    11.,
+                    theme.text_faint,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        // Elided in the middle: the bucket at the front and the
+                        // last segment at the end are the two halves that tell
+                        // two places apart, and the middle is what they share.
+                        .child(SharedString::from(elide_middle(&label, 26))),
+                )
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.open_place(&target, cx)
+                }))
+        };
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .when(!favorites.is_empty(), |this| {
+                    this.child(section_label("ĐÃ GHIM", theme))
+                        .children(favorites.iter().enumerate().map(|(ix, place)| {
+                            row(place, SharedString::from(format!("fav-{ix}")), true)
+                        }))
+                })
+                .when(!recent.is_empty(), |this| {
+                    this.child(section_label("GẦN ĐÂY", theme))
+                        .children(recent.iter().enumerate().map(|(ix, place)| {
+                            row(place, SharedString::from(format!("recent-{ix}")), false)
+                        }))
+                }),
+        )
     }
 
     /// The bucket names the sidebar shows, after the filter.
@@ -5124,6 +5283,20 @@ impl Browser {
             // filter you forget is on, and then the list is missing rows for no
             // reason you can point at. ⌘F now moves the caret here rather than
             // opening anything.
+            // Beside the path it pins, not in a menu: the answer to "is this
+            // one pinned" has to be visible without opening anything.
+            .when(self.bucket.is_some(), |this| {
+                let pinned = self
+                    .here()
+                    .is_some_and(|place| self.places.is_favorite(&place));
+                this.child(
+                    icon_button("pin", "star", theme)
+                        .text_color(if pinned { theme.accent } else { theme.text_faint })
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.toggle_favorite(cx)
+                        })),
+                )
+            })
             .when_some(self.filter_input.clone(), |this, input| {
                 this.child(
                     div().w(px(FILTER_WIDTH)).flex_shrink_0().child(
@@ -8559,6 +8732,16 @@ fn row_action(
         .child(sized_icon(name, 13., theme.text_faint))
 }
 
+/// A heading with no control beside it, unlike `section_header`.
+fn section_label(text: &'static str, theme: Theme) -> impl IntoElement {
+    div()
+        .px_2()
+        .pt_2()
+        .text_xs()
+        .text_color(theme.text_faint)
+        .child(text)
+}
+
 fn check_box(checked: bool, theme: Theme) -> impl IntoElement {
     div()
         .size(px(14.))
@@ -8699,6 +8882,7 @@ pub enum Command {
     NewTab,
     CloseTab,
     GoToPath,
+    ToggleFavorite,
     GoUp,
     Filter,
     NewFolder,
@@ -8735,6 +8919,7 @@ impl Command {
             Command::NewTab => ("Tab mới", "⌘T"),
             Command::CloseTab => ("Đóng tab", "⌘W"),
             Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
+            Command::ToggleFavorite => ("Ghim nơi này", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -8757,7 +8942,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 27] {
+    fn all() -> [Command; 28] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -8786,6 +8971,7 @@ impl Command {
             Command::NewTab,
             Command::CloseTab,
             Command::GoToPath,
+            Command::ToggleFavorite,
         ]
     }
 }
@@ -8994,6 +9180,8 @@ mod tests {
             profiles: Vec::new(),
             active_profile: None,
             store: None,
+            places: Places::default(),
+            place_store: None,
             client: None,
             buckets: Vec::new(),
             bucket_filter: String::new(),
@@ -9731,7 +9919,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 27);
+        assert_eq!(all.len(), 28);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

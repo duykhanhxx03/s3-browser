@@ -146,6 +146,120 @@ impl Provider {
 
 }
 
+/// A location worth getting back to.
+///
+/// Carries the profile it belongs to: the same `bucket/prefix` under two
+/// profiles is two different places, and offering one from the wrong profile
+/// would open a bucket the credentials cannot see.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Place {
+    pub profile: String,
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+impl Place {
+    /// `bucket/prefix`, for showing in a list one line high.
+    pub fn label(&self) -> String {
+        if self.prefix.is_empty() {
+            self.bucket.clone()
+        } else {
+            format!("{}/{}", self.bucket, self.prefix.trim_end_matches('/'))
+        }
+    }
+}
+
+/// Pinned and recently visited locations.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Places {
+    #[serde(default)]
+    pub favorites: Vec<Place>,
+    /// Newest first.
+    #[serde(default)]
+    pub recent: Vec<Place>,
+}
+
+/// How many places back the list remembers. Long enough to cover a session's
+/// worth of jumping about, short enough that the sidebar stays a sidebar.
+pub const RECENT_LIMIT: usize = 12;
+
+impl Places {
+    /// Records a visit, newest first, without repeating one already there.
+    ///
+    /// Moving a repeat to the front rather than adding a second copy: a list
+    /// that fills up with the same prefix has nothing older left in it, which
+    /// is the one thing it is for.
+    pub fn visit(&mut self, place: Place) {
+        self.recent.retain(|existing| existing != &place);
+        self.recent.insert(0, place);
+        self.recent.truncate(RECENT_LIMIT);
+    }
+
+    pub fn is_favorite(&self, place: &Place) -> bool {
+        self.favorites.contains(place)
+    }
+
+    /// Pins or unpins. Returns whether it is pinned afterwards.
+    pub fn toggle_favorite(&mut self, place: Place) -> bool {
+        if let Some(index) = self.favorites.iter().position(|existing| existing == &place) {
+            self.favorites.remove(index);
+            false
+        } else {
+            self.favorites.push(place);
+            true
+        }
+    }
+
+    /// Only what the given profile can actually open.
+    pub fn for_profile<'a>(&'a self, profile: &'a str) -> impl Iterator<Item = &'a Place> + 'a {
+        self.favorites
+            .iter()
+            .filter(move |place| place.profile == profile)
+    }
+
+    pub fn recent_for_profile<'a>(
+        &'a self,
+        profile: &'a str,
+    ) -> impl Iterator<Item = &'a Place> + 'a {
+        self.recent
+            .iter()
+            .filter(move |place| place.profile == profile)
+    }
+}
+
+/// Reads and writes `places.json`, beside the profiles.
+pub struct PlaceStore {
+    path: PathBuf,
+}
+
+impl PlaceStore {
+    pub fn beside(profiles: &Path) -> Self {
+        Self {
+            path: profiles.with_file_name("places.json"),
+        }
+    }
+
+    /// A missing or unreadable file is an empty list, not an error: favourites
+    /// are a convenience, and refusing to start the app over one is not a trade
+    /// anybody wants.
+    pub fn load(&self) -> Places {
+        fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, places: &Places) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let text = serde_json::to_string_pretty(places)?;
+        fs::write(&self.path, text).with_context(|| format!("writing {}", self.path.display()))
+    }
+}
+
 /// Reads and writes the profile list plus its secrets.
 pub struct ProfileStore {
     path: PathBuf,
@@ -345,6 +459,64 @@ mod tests {
         // Unset and empty both mean "use the store", not "sign with nothing".
         assert_eq!(resolve_dev_secret(None, true), None);
         assert_eq!(resolve_dev_secret(Some(String::new()), true), None);
+    }
+
+    fn place(bucket: &str, prefix: &str) -> Place {
+        Place {
+            profile: "p1".into(),
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+        }
+    }
+
+    #[test]
+    fn revisiting_moves_a_place_up_rather_than_adding_it_twice() {
+        let mut places = Places::default();
+        places.visit(place("a", ""));
+        places.visit(place("b", "x/"));
+        places.visit(place("a", ""));
+
+        // A list that fills with the same prefix has nothing older left in it,
+        // which is the one thing it is for.
+        assert_eq!(places.recent, vec![place("a", ""), place("b", "x/")]);
+
+        // And it stops growing.
+        for i in 0..RECENT_LIMIT * 2 {
+            places.visit(place(&format!("bucket{i}"), ""));
+        }
+        assert_eq!(places.recent.len(), RECENT_LIMIT);
+    }
+
+    #[test]
+    fn a_place_belongs_to_the_profile_that_can_open_it() {
+        let mut places = Places::default();
+        places.favorites.push(place("a", ""));
+        places.favorites.push(Place {
+            profile: "p2".into(),
+            bucket: "b".into(),
+            prefix: String::new(),
+        });
+
+        // The same `bucket/prefix` under two profiles is two different places,
+        // and offering one from the wrong profile opens a bucket the
+        // credentials cannot see.
+        let mine: Vec<_> = places.for_profile("p1").collect();
+        assert_eq!(mine, vec![&place("a", "")]);
+    }
+
+    #[test]
+    fn pinning_is_a_toggle() {
+        let mut places = Places::default();
+        assert!(places.toggle_favorite(place("a", "x/")));
+        assert!(places.is_favorite(&place("a", "x/")));
+        assert!(!places.toggle_favorite(place("a", "x/")));
+        assert!(places.favorites.is_empty());
+    }
+
+    #[test]
+    fn a_place_reads_as_a_path() {
+        assert_eq!(place("demo", "").label(), "demo");
+        assert_eq!(place("demo", "photos/2026/").label(), "demo/photos/2026");
     }
 
     #[test]
