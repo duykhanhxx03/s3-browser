@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
@@ -618,6 +618,8 @@ pub struct Browser {
     settings_store: Option<SettingsStore>,
     /// Whether the settings panel is open.
     settings_open: bool,
+    /// Whether the About dialog is open.
+    about_open: bool,
 
     client: Option<S3Client>,
     buckets: Vec<SharedString>,
@@ -968,6 +970,7 @@ impl Browser {
             settings: settings.clone(),
             settings_store,
             settings_open: false,
+            about_open: false,
             client: None,
             buckets: Vec::new(),
             bucket_cache: HashMap::new(),
@@ -3388,6 +3391,7 @@ impl Browser {
                 self.settings_open = true;
                 cx.notify();
             }
+            Command::About => self.open_about(cx),
             Command::CopyPath => self.copy_location(true, cx),
             Command::CopyKey => self.copy_location(false, cx),
             Command::AclFolderPrivate => self.set_acl_recursive("private", cx),
@@ -5532,7 +5536,7 @@ impl Browser {
             })
             .child(div().flex_1())
             // At the foot of the sidebar, where Brows3 has it and where every
-            // app of this shape has it.
+            // app of this shape has it. Giới thiệu sits under it as a pair.
             .child(
                 sidebar_item("settings-open".into(), "more", "Cài đặt".into(), false, theme)
                     .on_click(
@@ -5541,6 +5545,13 @@ impl Browser {
                         cx.notify();
                     }),
                 ),
+            )
+            // Beside it rather than only in the palette: the person who needs
+            // the version number is the one writing a bug report, and asking
+            // them to find a command palette first is where that report stops.
+            .child(
+                sidebar_item("about-open".into(), "info", "Giới thiệu".into(), false, theme)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.open_about(cx))),
             )
     }
 
@@ -6555,6 +6566,136 @@ impl Browser {
                                 .child(action_button("settings-close", "Xong", theme).on_click(
                                     cx.listener(|this, _event, _window, cx| {
                                         this.settings_open = false;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                ),
+        )
+    }
+
+    /// Opens About, closing whatever else was open.
+    ///
+    /// The palette paints over every dialog, so ⌘K from inside Cài đặt could
+    /// stack a second scrim on the first — and dismissing this one revealed the
+    /// settings panel still sitting underneath.
+    fn open_about(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.profiles_open = false;
+        self.about_open = true;
+        cx.notify();
+    }
+
+    /// Which build this is, and where it keeps its files.
+    ///
+    /// The two paths are the point. A crash report nobody can find is a crash
+    /// report nobody sends, and "look in your Application Support folder" over
+    /// a support thread is where most of them are lost.
+    fn render_about(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.about_open {
+            return None;
+        }
+        let theme = self.theme;
+        let crash_dir = crate::crash::report_dir();
+
+        // Both paths get the same row: the button's label *is* the path, so it
+        // answers the question without being clicked — which matters on a
+        // machine where nothing is registered to open a folder.
+        let path_row = |id: &'static str,
+                        label: &'static str,
+                        note: &'static str,
+                        dir: Option<PathBuf>,
+                        cx: &mut Context<Self>| {
+            // 44 is what fits this dialog's control column.
+            let shown = SharedString::from(dir_label(dir.as_deref(), 44));
+            let control = match dir {
+                Some(dir) => action_button_dyn(id.into(), shown, theme)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        let target = revealable(&dir);
+                        // Opening the parent when the folder itself is not
+                        // there yet is the useful answer, but doing it in
+                        // silence means the window that opens is not the one
+                        // whose name is on the button.
+                        if target != dir {
+                            this.status = SharedString::from(format!(
+                                "Chưa có {}, đã mở thư mục cha",
+                                dir.display()
+                            ));
+                        }
+                        if let Err(error) = opener::open(target) {
+                            this.report(format!("Không mở được thư mục: {error}"));
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                // Not a button. One that hovers and does nothing is a promise
+                // the row cannot keep.
+                None => div()
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child(shown)
+                    .into_any_element(),
+            };
+            setting_row(label, Some(note), control, theme)
+        };
+
+        Some(
+            div()
+                .id("about-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.about_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("about")
+                        // The settings panel's width, not the narrow one: this
+                        // dialog is mostly file paths, and eliding a path in
+                        // the dialog whose job is to hand it over defeats it.
+                        .w(px(PROFILE_DIALOG_WIDTH))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_lg()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(div().text_color(theme.text).child("Giới thiệu"))
+                        .child(setting_row(
+                            "Phiên bản",
+                            None,
+                            div()
+                                .text_xs()
+                                .text_color(theme.text)
+                                .child(SharedString::from(version_line())),
+                            theme,
+                        ))
+                        // Only the crash folder. The config folder has its own
+                        // row in Cài đặt, one line above this in the sidebar,
+                        // and a second copy here would be two Vietnamese
+                        // literals and one elision width to keep in step.
+                        .child(path_row(
+                            "about-crashes",
+                            "Thư mục báo cáo crash",
+                            "Chỉ có tệp khi app từng tắt đột ngột",
+                            crash_dir,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .child(action_button("about-close", "Xong", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.about_open = false;
                                         cx.notify();
                                     }),
                                 )),
@@ -9171,6 +9312,7 @@ impl Render for Browser {
             .children(self.render_failures(cx))
             .children(self.render_preview(cx))
             .children(self.render_settings(cx))
+            .children(self.render_about(cx))
             .children(self.render_path_suggestions(cx))
             // Last, so it paints over everything. The palette can be summoned
             // from on top of any of these — "Sửa nội dung" only makes sense
@@ -9341,6 +9483,42 @@ fn elide_middle(value: &str, max_chars: usize) -> String {
     )
 }
 
+/// Which build this is, in one line.
+///
+/// The name travels with the number because this string is written down by
+/// hand into bug reports and read back off screenshots, and "0.1.0" alone
+/// names no program.
+fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+/// What the About dialog prints for a folder it may not know.
+///
+/// `None` is reachable without anything being broken — the settings store is
+/// absent when no config directory resolves — and a blank there would read as
+/// a half-drawn row rather than as an answer.
+fn dir_label(dir: Option<&Path>, max_chars: usize) -> String {
+    match dir {
+        Some(dir) => elide_middle(&dir.display().to_string(), max_chars),
+        None => "Không rõ".to_string(),
+    }
+}
+
+/// The nearest folder that exists at or above `dir`.
+///
+/// The crash folder is created by the first crash, so on a healthy machine the
+/// path the dialog names is not there yet. Handing that path to `opener` fails
+/// with the system complaining about a missing file, which reads as a broken
+/// button; opening the folder the crashes will appear in answers the question
+/// instead.
+///
+/// Infallible: `ancestors()` on an absolute path ends at `/`, which exists, and
+/// both callers pass absolute paths from `dirs::config_dir()`. An `Option` here
+/// bought a `None` arm and an error message that nothing could ever reach.
+fn revealable(dir: &Path) -> &Path {
+    dir.ancestors().find(|dir| dir.exists()).unwrap_or(dir)
+}
+
 /// One icon, tinted to `color` and sized to the row it sits in.
 ///
 /// 16px is the size the set is drawn for; scaling a 24-grid stroke much beyond
@@ -9423,8 +9601,8 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
 /// One row of the sidebar: an icon, a label, and a highlight when you are on it.
 ///
 /// **Every** row in there is this shape — the two nav entries at the top, the
-/// pinned places, the bucket list, and Cài đặt at the foot. It used to be
-/// three: nav rows carried an icon, bucket rows carried none — so their text
+/// pinned places, the bucket list, and Cài đặt with Giới thiệu at the foot. It
+/// used to be three: nav rows carried an icon, bucket rows carried none — so their text
 /// began where everyone else's *icon* did, and the column had a ragged left
 /// edge — and the pinned list was a size smaller again on a theory about
 /// sub-lists that only ever read as an accident.
@@ -10776,6 +10954,9 @@ pub enum Command {
     Recent,
     Buckets,
     Settings,
+    /// Version and where the files are. Also at the foot of the sidebar; this
+    /// is the way in for someone who lives in the palette.
+    About,
     CopyPath,
     CopyKey,
     AclFolderPrivate,
@@ -10822,6 +11003,7 @@ impl Command {
             Command::Recent => ("Gần đây", ""),
             Command::Buckets => ("Tất cả bucket", ""),
             Command::Settings => ("Cài đặt", ""),
+            Command::About => ("Giới thiệu", ""),
             Command::CopyPath => ("Chép đường dẫn s3://", ""),
             Command::CopyKey => ("Chép key", ""),
             Command::AclFolderPrivate => ("Thư mục: đặt riêng tư", ""),
@@ -10850,7 +11032,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 37] {
+    fn all() -> [Command; 38] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -10883,6 +11065,7 @@ impl Command {
             Command::Recent,
             Command::Buckets,
             Command::Settings,
+            Command::About,
             Command::CopyPath,
             Command::CopyKey,
             Command::AclFolderPrivate,
@@ -11103,6 +11286,7 @@ mod tests {
             settings: Settings::default(),
             settings_store: None,
             settings_open: false,
+            about_open: false,
             client: None,
             buckets: Vec::new(),
             bucket_cache: HashMap::new(),
@@ -11909,7 +12093,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 37);
+        assert_eq!(all.len(), 38);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -11921,6 +12105,53 @@ mod tests {
         let before = labels.len();
         labels.dedup();
         assert_eq!(before, labels.len(), "duplicate command labels");
+    }
+
+    #[test]
+    fn the_version_line_names_the_program_and_a_missing_path_says_so() {
+        // The number alone identifies nothing when it arrives in a bug report
+        // without the program it came from.
+        let line = version_line();
+        assert!(line.starts_with("s3browser"), "{line}");
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+
+        // A folder the app cannot locate still says so out loud. An empty row
+        // would leave the reader unable to tell "there is no such folder" from
+        // "this dialog is broken".
+        assert_eq!(dir_label(None, 44), "Không rõ");
+
+        // A long path keeps both ends: the front says whose home it is under,
+        // the last segment says which of the two folders it is.
+        let shown = dir_label(
+            Some(Path::new(
+                "/Users/ai/Library/Application Support/s3browser/crashes",
+            )),
+            44,
+        );
+        assert!(shown.starts_with("/Users/ai/"), "{shown}");
+        assert!(shown.ends_with("crashes"), "{shown}");
+        assert!(shown.chars().count() <= 44, "{shown}");
+    }
+
+    #[test]
+    fn a_crash_folder_that_does_not_exist_yet_reveals_its_parent() {
+        let root = std::env::temp_dir().join(format!("s3b-about-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let crashes = root.join("crashes");
+
+        // Nothing has crashed, so the folder named in the dialog is not there.
+        // Opening the path itself would fail with the system's own words about
+        // a missing file, which reads as a broken button rather than as good
+        // news.
+        assert_eq!(revealable(&crashes), root.as_path());
+
+        // Once it exists it is what opens; the walk up must not overshoot the
+        // folder holding the reports.
+        std::fs::create_dir_all(&crashes).unwrap();
+        assert_eq!(revealable(&crashes), crashes.as_path());
+
+        _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

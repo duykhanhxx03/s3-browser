@@ -786,8 +786,11 @@ Nguyên văn mục gốc: Trạng thái cache ("Cached 5m ago" /
 region **hiện khác đi khi nó là do tự dò** chứ không phải do gõ vào. Mình có
 profile · region · phím tắt.
 
-**g. Hộp thoại About** có số phiên bản và link. Trong UI của mình **không chỗ nào**
-nói đang chạy bản nào.
+**g. ~~Hộp thoại About~~** — xong (21/08/2026). Số phiên bản và **thư mục báo cáo
+crash**, không phải link: link thì trình duyệt mở được từ đâu cũng được, còn một
+tệp crash không ai tìm thấy là một tệp crash không ai gửi. Thư mục cấu hình không
+lặp lại ở đây — nó đã có hàng riêng trong Cài đặt, ngay trên Giới thiệu ở chân
+sidebar.
 
 **h. ~~Ô lọc có nút `×` ngay trong ô~~** — xong (21/08/2026), và **tiền đề ban đầu
 sai**. Lúc đối chiếu tôi kết luận là mình không có nút nào; thật ra cả hai ô lọc
