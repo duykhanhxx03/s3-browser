@@ -109,6 +109,7 @@ gpui::actions!(
         ActionNewFolder,
         ActionPreview,
         ActionOpenExternally,
+        ActionEditHeaders,
     ]
 );
 
@@ -130,9 +131,10 @@ pub enum FormKind {
     /// `Rename`.
     Duplicate(String),
     OpenBucket,
-    /// Rewriting an object's HTTP headers. Carries the key for the same reason
-    /// `Rename` does.
-    EditHeaders(String),
+    /// Rewriting HTTP headers. Carries every key it will be applied to, for the
+    /// same reason `Rename` carries one: the selection can change while the
+    /// dialog is open.
+    EditHeaders(Vec<String>),
     AddTag,
     KmsKey,
     AssumeRole,
@@ -140,7 +142,7 @@ pub enum FormKind {
 }
 
 impl FormKind {
-    fn title(&self) -> &'static str {
+    fn title(&self) -> String {
         match self {
             FormKind::NewProfile => "Profile mới",
             FormKind::NewFolder => "Thư mục mới",
@@ -148,12 +150,18 @@ impl FormKind {
             FormKind::Rename(_) => "Đổi tên",
             FormKind::Duplicate(_) => "Sao chép",
             FormKind::OpenBucket => "Mở bucket",
+            // The count, because setting a header on four hundred objects and
+            // on one look identical once the dialog is open.
+            FormKind::EditHeaders(keys) if keys.len() > 1 => {
+                return format!("Sửa header cho {} mục", keys.len())
+            }
             FormKind::EditHeaders(_) => "Sửa header",
             FormKind::AddTag => "Thẻ mới",
             FormKind::KmsKey => "Mã hoá KMS",
             FormKind::AssumeRole => "Nhận role",
             FormKind::SsoStart => "Đăng nhập SSO",
         }
+        .to_string()
     }
 
     /// Label and placeholder for each field. One entry means a single-field
@@ -373,6 +381,30 @@ impl Form {
     }
 }
 
+/// One operation applied to every object in a selection.
+///
+/// Driven a key at a time from the UI rather than looped inside one task: five
+/// hundred objects is five hundred round trips, and a job that shows nothing
+/// until it finishes cannot be judged or stopped. This is the same shape the
+/// bucket scan uses, for the same reason.
+pub struct Bulk {
+    what: &'static str,
+    keys: Vec<String>,
+    done: usize,
+    /// Keys that failed, with the reason. Collected rather than aborting on the
+    /// first: one object with an ACL nobody may change should not stop the other
+    /// four hundred and ninety nine.
+    failed: Vec<String>,
+    op: BulkOp,
+    running: bool,
+}
+
+#[derive(Clone)]
+pub enum BulkOp {
+    Headers(s3core::ObjectHeaders),
+    Acl(&'static str),
+}
+
 /// A scan of the whole bucket, running or finished.
 ///
 /// Kept apart from the filter on purpose. The filter narrows what is already on
@@ -492,6 +524,8 @@ pub struct Browser {
     thumbnails: HashMap<String, Option<std::sync::Arc<gpui::Image>>>,
     /// Whether the profile manager dialog is open.
     profiles_open: bool,
+    /// An operation running over a selection.
+    bulk: Option<Bulk>,
     /// A whole-bucket scan, when one is running or its results are on screen.
     /// While this is `Some`, `entries` holds results rather than one prefix.
     search: Option<Search>,
@@ -535,6 +569,8 @@ pub struct Browser {
     /// The scan's own slot, so stopping a search is dropping one task and not
     /// cancelling whatever else was in flight.
     search_task: Option<Task<()>>,
+    /// Likewise for a bulk edit, which outlives several other operations.
+    bulk_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
     /// Kept alive, not read: dropping it would silently stop the filter from
     /// reacting to what is typed into it.
@@ -677,6 +713,7 @@ impl Browser {
             thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
+            bulk: None,
             search: None,
             palette: None,
             palette_selected: 0,
@@ -695,6 +732,7 @@ impl Browser {
             thumb_task: None,
             tick_task: None,
             search_task: None,
+            bulk_task: None,
             _appearance: Some(appearance),
             _filter_events: Some(filter_events),
             _bucket_filter_events: Some(bucket_filter_events),
@@ -1061,6 +1099,144 @@ impl Browser {
             return;
         }
         self.open(bucket, parent, cx);
+    }
+
+    // ------------------------------------------------------------ bulk edits
+
+    /// The selected objects, in the order they appear on screen.
+    ///
+    /// Folders are left out on purpose: a folder is a common prefix, not an
+    /// object, and copying one onto itself to rewrite its headers would ask the
+    /// provider about a key that does not exist.
+    fn selected_object_keys(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.is_folder && self.selection.contains(&entry.key))
+            .map(|entry| entry.key.clone())
+            .collect()
+    }
+
+    /// Starts an operation over `keys`.
+    fn start_bulk(
+        &mut self,
+        what: &'static str,
+        keys: Vec<String>,
+        op: BulkOp,
+        cx: &mut Context<Self>,
+    ) {
+        if keys.is_empty() || self.client.is_none() || self.bucket.is_none() {
+            return;
+        }
+        self.bulk = Some(Bulk {
+            what,
+            keys,
+            done: 0,
+            failed: Vec::new(),
+            op,
+            running: true,
+        });
+        self.status = self.bulk_summary();
+        self.bulk_step(cx);
+        cx.notify();
+    }
+
+    /// Does one key, then queues the next.
+    fn bulk_step(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(bulk)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.bulk.as_ref(),
+        ) else {
+            return;
+        };
+        if !bulk.running {
+            return;
+        }
+        let Some(key) = bulk.keys.get(bulk.done).cloned() else {
+            // Nothing left. Say how it went, once, rather than per key.
+            return self.finish_bulk(cx);
+        };
+
+        let op = bulk.op.clone();
+        let running = Tokio::spawn(cx, async move {
+            match op {
+                BulkOp::Headers(headers) => {
+                    client.set_object_headers(&bucket, &key, &headers).await
+                }
+                BulkOp::Acl(canned) => client.set_object_acl(&bucket, &key, canned).await,
+            }
+        });
+
+        self.bulk_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = running.await;
+            _ = this.update(cx, |this, cx| {
+                let Some(bulk) = this.bulk.as_mut() else {
+                    return;
+                };
+                let key = bulk.keys[bulk.done].clone();
+                bulk.done += 1;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => bulk.failed.push(format!("{key}: {error}")),
+                    Err(error) => bulk.failed.push(format!("{key}: task lỗi: {error}")),
+                }
+                this.status = this.bulk_summary();
+                this.bulk_step(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn finish_bulk(&mut self, cx: &mut Context<Self>) {
+        let Some(bulk) = self.bulk.take() else {
+            return;
+        };
+        self.bulk_task = None;
+
+        if bulk.failed.is_empty() {
+            self.status = format!("{} xong {} mục", bulk.what, bulk.done).into();
+        } else {
+            // One summary with every reason under it, not one red line per key:
+            // the log holds more than one failure precisely so a batch can
+            // report as a batch.
+            self.fail(Failure::known(
+                &format!(
+                    "{} được {}/{} mục",
+                    bulk.what,
+                    bulk.done - bulk.failed.len(),
+                    bulk.keys.len()
+                ),
+                bulk.failed.join("\n"),
+                None,
+            ));
+        }
+        // The panel is showing what the object used to be.
+        if let Some(inspector) = self.inspector.as_ref() {
+            let key = inspector.key.clone();
+            self.load_inspection(key, cx);
+        }
+        cx.notify();
+    }
+
+    fn stop_bulk(&mut self, cx: &mut Context<Self>) {
+        if let Some(bulk) = self.bulk.as_mut() {
+            bulk.running = false;
+        }
+        self.bulk_task = None;
+        self.finish_bulk(cx);
+    }
+
+    fn bulk_summary(&self) -> SharedString {
+        match self.bulk.as_ref() {
+            Some(bulk) => format!(
+                "{} {}/{}…",
+                bulk.what,
+                bulk.done,
+                bulk.keys.len()
+            )
+            .into(),
+            None => self.search_summary(),
+        }
     }
 
     // ------------------------------------------------------------- searching
@@ -1798,14 +1974,14 @@ impl Browser {
                 let bucket = SharedString::from(first);
                 self.open(bucket, String::new(), cx);
             }
-            FormKind::EditHeaders(key) => {
+            FormKind::EditHeaders(keys) => {
                 let headers = s3core::ObjectHeaders {
                     content_type: some_if_filled(first),
                     cache_control: some_if_filled(form.value("Cache-Control", cx)),
                     content_disposition: some_if_filled(form.value("Content-Disposition", cx)),
                 };
                 self.form = None;
-                self.apply_headers(key, headers, cx);
+                self.start_bulk("Sửa header", keys, BulkOp::Headers(headers), cx);
             }
             FormKind::AddTag => {
                 let value = form.value("Giá trị", cx);
@@ -2022,14 +2198,34 @@ impl Browser {
     /// Prefilled rather than blank, because a blank field means "remove this
     /// header" once submitted — an empty editor would quietly strip everything
     /// the user did not retype.
-    fn start_edit_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(inspector) = self.inspector.as_ref() else {
-            return;
-        };
-        let key = inspector.key.clone();
-        let head = inspector.head.clone();
+    /// Opens the header editor on everything selected.
+    ///
+    /// Blank fields here, not prefilled: several objects have several current
+    /// values and showing one of them would be a claim about all of them. What
+    /// is typed becomes exactly what they all get.
+    fn edit_headers_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = self.selected_object_keys();
 
-        self.open_form(FormKind::EditHeaders(key), window, cx);
+        match keys.len() {
+            0 => {}
+            // One object has one set of current values, so it gets them.
+            1 => {
+                let key = keys[0].clone();
+                self.open_form(FormKind::EditHeaders(keys), window, cx);
+                self.prefill_headers(&key, window, cx);
+            }
+            _ => self.open_form(FormKind::EditHeaders(keys), window, cx),
+        }
+    }
+
+    /// Fills the header fields from what the object has now, so an untouched
+    /// field submits the value it is showing rather than removing it.
+    fn prefill_headers(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let head = self
+            .inspector
+            .as_ref()
+            .filter(|inspector| inspector.key == key)
+            .and_then(|inspector| inspector.head.clone());
 
         let Some((form, head)) = self.form.as_ref().zip(head) else {
             return;
@@ -2046,38 +2242,13 @@ impl Browser {
         cx.notify();
     }
 
-    fn apply_headers(
-        &mut self,
-        key: String,
-        headers: s3core::ObjectHeaders,
-        cx: &mut Context<Self>,
-    ) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+    /// Opens the header editor on the inspected object, prefilled.
+    fn start_edit_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.inspector.as_ref().map(|inspector| inspector.key.clone()) else {
             return;
         };
-        self.status = format!("Đang sửa header {}…", entry_name_of(&key)).into();
-
-        let target = key.clone();
-        let writing = Tokio::spawn(cx, async move {
-            client.set_object_headers(&bucket, &target, &headers).await
-        });
-
-        self.op_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = writing.await;
-            _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok(Ok(())) => {
-                        this.status = format!("Đã sửa header {}", entry_name_of(&key)).into();
-                        // The object is a new version of itself now, so the
-                        // panel is showing the old headers until it reloads.
-                        this.load_inspection(key, cx);
-                    }
-                    Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
-                }
-                cx.notify();
-            });
-        }));
+        self.open_form(FormKind::EditHeaders(vec![key.clone()]), window, cx);
+        self.prefill_headers(&key, window, cx);
     }
 
     fn ask_remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2791,35 +2962,18 @@ impl Browser {
         }));
     }
 
+    /// Sets a canned ACL on everything selected, or on the inspected object when
+    /// nothing is.
+    ///
+    /// One path for one object and for four hundred: the runner reports progress
+    /// and collects failures either way, and a second single-object path would
+    /// be a second place for the reporting to drift.
     fn set_acl(&mut self, canned: &'static str, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket), Some(inspector)) = (
-            self.client.clone(),
-            self.bucket.clone(),
-            self.inspector.as_ref(),
-        ) else {
-            return;
-        };
-        let key = inspector.key.clone();
-        let reload = key.clone();
-
-        let setting = Tokio::spawn(cx, async move {
-            client.set_object_acl(&bucket, &key, canned).await
-        });
-
-        self.op_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = setting.await;
-            _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok(Ok(())) => {
-                        this.status = "Đã đổi quyền truy cập".into();
-                        this.load_inspection(reload, cx);
-                    }
-                    Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
-                }
-                cx.notify();
-            });
-        }));
+        let mut keys = self.selected_object_keys();
+        if keys.is_empty() {
+            keys.extend(self.inspector.as_ref().map(|inspector| inspector.key.clone()));
+        }
+        self.start_bulk("Đổi quyền", keys, BulkOp::Acl(canned), cx);
     }
 
     fn remove_tag(&mut self, tag_key: String, cx: &mut Context<Self>) {
@@ -4568,6 +4722,11 @@ impl Browser {
                                     menu_icon("info"),
                                     Box::new(ActionInspect),
                                 )
+                                .menu_with_icon(
+                                    "Sửa header",
+                                    menu_icon("rename"),
+                                    Box::new(ActionEditHeaders),
+                                )
                             };
 
                             menu.menu_with_icon(
@@ -4663,6 +4822,18 @@ impl Browser {
                     .into_any_element(),
             })
             .child(div().flex_1())
+            // A batch of four hundred copies takes long enough that "no way to
+            // stop it" is not an acceptable answer.
+            .when_some(
+                self.bulk.as_ref().filter(|bulk| bulk.running).map(|_| ()),
+                |this, ()| {
+                    this.child(
+                        action_button("bulk-stop", "Dừng", theme).on_click(cx.listener(
+                            |this, _event, _window, cx| this.stop_bulk(cx),
+                        )),
+                    )
+                },
+            )
             .child(
                 div()
                     .text_color(theme.text_faint)
@@ -6160,6 +6331,9 @@ impl Render for Browser {
             .on_action(cx.listener(|this, _: &ActionOpenExternally, _window, cx| {
                 this.open_externally(cx)
             }))
+            .on_action(cx.listener(|this, _: &ActionEditHeaders, window, cx| {
+                this.edit_headers_for_selection(window, cx)
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -7554,6 +7728,7 @@ mod tests {
             thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
+            bulk: None,
             search: None,
             palette: None,
             palette_selected: 0,
@@ -7572,6 +7747,7 @@ mod tests {
             thumb_task: None,
             tick_task: None,
             search_task: None,
+            bulk_task: None,
             _appearance: None,
             _filter_events: None,
             _bucket_filter_events: None,
@@ -8288,6 +8464,47 @@ mod tests {
         assert_eq!(
             next_encryption(&Encryption::Kms("k".into())),
             Some(Encryption::BucketDefault)
+        );
+    }
+
+    #[gpui::test]
+    fn a_bulk_edit_never_includes_a_folder(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("reports", true, 0),
+                    entry("a.txt", false, 1),
+                    entry("b.txt", false, 2),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, _| {
+            browser.selection.insert("reports/".into());
+            browser.selection.insert("a.txt".into());
+            browser.selection.insert("b.txt".into());
+
+            // A folder is a common prefix, not an object. Sending it would ask
+            // the provider to copy a key that does not exist.
+            assert_eq!(browser.selected_object_keys(), vec!["a.txt", "b.txt"]);
+
+            browser.selection.clear();
+            assert!(browser.selected_object_keys().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_batch_header_edit_says_how_many_it_will_change() {
+        // Once the dialog is open, setting a header on one object and on four
+        // hundred look exactly the same.
+        assert_eq!(
+            FormKind::EditHeaders(vec!["a".into()]).title(),
+            "Sửa header"
+        );
+        assert_eq!(
+            FormKind::EditHeaders(vec!["a".into(), "b".into(), "c".into()]).title(),
+            "Sửa header cho 3 mục"
         );
     }
 

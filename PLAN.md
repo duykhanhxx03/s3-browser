@@ -462,9 +462,13 @@ tính năng sau.
 3. ~~**Xem CSV dạng bảng**~~ — xong (21/08/2026). Cả `.csv` lẫn `.tsv`. Parser
    viết tay theo RFC 4180; cột rộng theo ô dài nhất; cắt ở 200 dòng và 24 cột,
    và nói ra phần bị cắt. Parquet vẫn cần thêm thư viện, tính sau.
-4. **Áp hàng loạt**: ACL và header cho nhiều object một lúc. Cả hai đã có đường
-   đơn lẻ; cái thiếu là vòng lặp có tiến trình và báo lỗi theo từng key — đúng
-   mô hình `delete_prefix` đang dùng.
+4. ~~**Áp hàng loạt**~~ — xong (21/08/2026). ACL và header cho cả vùng chọn, một
+   key mỗi lượt để có tiến trình và dừng được, lỗi gom lại thành một mục trong
+   nhật ký chứ không phải một dòng đỏ mỗi key. Đường đơn lẻ và đường hàng loạt là
+   cùng một đường, để phần báo cáo không trôi ra hai kiểu.
+
+   Còn nợ kiểm chứng với server thật: Docker trên máy này hỏng vì ổ đầy đúng lúc
+   làm phần này.
 
 ### Vừa sức, nhưng chưa gấp
 
