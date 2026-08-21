@@ -2701,6 +2701,13 @@ impl Browser {
         let mut form = Form::new(kind, window, cx);
 
         if is_profile {
+            // The machine already knows which region it works in; opening a new
+            // profile at `us-east-1` for someone whose buckets are all in
+            // Frankfurt is a redirect error waiting to happen.
+            if let Some(region) = vault::system_default_region() {
+                form.set_owned("Region", region, window, cx);
+            }
+
             // Built here rather than in `Form::new` because the subscription
             // has to be owned by the browser's context, and `Form::new` only
             // has an `App`.

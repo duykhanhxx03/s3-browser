@@ -565,9 +565,10 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
     key một dòng, thư mục cũng chép.
 14. ~~**ACL đệ quy cho cả prefix**~~ — xong (21/08/2026). Đi hết prefix rồi chạy
     qua bộ chạy hàng loạt, có trần như tìm kiếm sâu. Chưa nhìn thấy chạy thật.
-15. **Xoá lùi về từng object** khi provider từ chối `DeleteObjects`. Đây là ca
-    tương thích thật, Brows3 gặp đủ nhiều để viết hẳn vào README.
-16. **Tự dò region** từ cấu hình hệ thống.
+15. ~~**Xoá lùi về từng object**~~ — xong (21/08/2026). Chỉ lùi khi provider
+    *không có* lệnh gộp, không lùi khi nó từ chối những key này.
+16. ~~**Tự dò region**~~ — xong (21/08/2026). Từ `AWS_REGION` rồi `[default]`
+    trong `~/.aws/config`, và lỗi sai region giờ nói luôn region đúng.
 
 ### Đề nghị không làm
 

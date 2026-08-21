@@ -87,6 +87,19 @@ impl Failure {
     }
 }
 
+/// The region S3 named in a redirect, if it named one.
+///
+/// The message reads `... the region 'us-east-1' is wrong; expecting
+/// 'eu-west-1'`, and the second one is the useful half — pulling it out is the
+/// difference between "change the region" and "change it to this".
+fn expected_region(raw: &str) -> Option<String> {
+    let after = raw.split("expecting").nth(1)?;
+    let start = after.find('\'')? + 1;
+    let rest = &after[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
 /// The summary is the first line: SDK errors carry a chain of `source:` causes
 /// that runs for paragraphs, and a status bar can hold one line.
 fn first_line(raw: &str) -> &str {
@@ -130,6 +143,16 @@ fn classify(raw: &str) -> (Option<String>, Option<Fix>) {
         // function only has the text. Guessing a button here would send people
         // to edit a profile that is perfectly correct.
         return (Some("Token không có quyền cho thao tác này".into()), None);
+    }
+
+    // A bucket in another region. S3 says so precisely and then buries it in a
+    // sentence about malformed authorization headers, which reads like a bug in
+    // the client rather than one field being wrong.
+    if has("PermanentRedirect") || has("AuthorizationHeaderMalformed") {
+        let named = expected_region(raw)
+            .map(|region| format!("Bucket nằm ở region {region}"))
+            .unwrap_or_else(|| "Bucket nằm ở region khác".to_string());
+        return (Some(named), Some(Fix::EditProfile));
     }
 
     if has("NoSuchBucket") {
@@ -202,6 +225,29 @@ mod tests {
         let (summary, fix) = classify("AccessDenied when calling ListBuckets");
         assert_eq!(summary.as_deref(), Some("Token không có quyền liệt kê bucket"));
         assert_eq!(fix, Some(Fix::OpenBucketByName));
+    }
+
+    #[test]
+    fn a_bucket_in_another_region_says_which_region() {
+        // S3 names it precisely and then buries it in a sentence about
+        // malformed authorization headers, which reads like a bug in the client
+        // rather than one field being wrong.
+        let raw = "AuthorizationHeaderMalformed: The authorization header is \
+                   malformed; the region 'us-east-1' is wrong; expecting 'eu-west-1'";
+        let (summary, fix) = classify(raw);
+        assert_eq!(summary.as_deref(), Some("Bucket nằm ở region eu-west-1"));
+        assert_eq!(fix, Some(Fix::EditProfile));
+
+        // Some providers redirect without naming anything. Still worth saying
+        // what kind of wrong it is; inventing a region would be worse than
+        // saying "another one".
+        let (summary, fix) = classify("PermanentRedirect: the bucket is in another region");
+        assert_eq!(summary.as_deref(), Some("Bucket nằm ở region khác"));
+        assert_eq!(fix, Some(Fix::EditProfile));
+
+        // And the extractor does not go hunting in unrelated text.
+        assert_eq!(expected_region("no quotes here"), None);
+        assert_eq!(expected_region("expecting nothing in particular"), None);
     }
 
     #[test]

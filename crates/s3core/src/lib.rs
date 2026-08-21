@@ -293,6 +293,20 @@ pub const CANNED_ACLS: [(&str, &str); 4] = [
     ("bucket-owner-full-control", "Chủ bucket toàn quyền"),
 ];
 
+/// Whether a provider refused `DeleteObjects` because it does not have it.
+///
+/// Told apart from a refusal about *these* keys: `AccessDenied` means the batch
+/// call exists and this token may not use it, and retrying one key at a time
+/// would be a thousand more requests all failing the same way.
+fn is_batch_unsupported(error: &str) -> bool {
+    error.contains("NotImplemented")
+        || error.contains("MethodNotAllowed")
+        || error.contains("XAmzContentSHA256Mismatch")
+        // What a few gateways answer for a POST they do not route.
+        || error.contains("status: 501")
+        || error.contains("status: 405")
+}
+
 /// Result of moving a whole prefix. A partial move is a real outcome, not an
 /// error: whatever succeeded stays moved, so the caller has to be able to say
 /// what is now where.
@@ -583,8 +597,24 @@ impl S3Client {
                 .bucket(bucket)
                 .delete(delete.build()?)
                 .send()
-                .await
-                .with_context(|| format!("DeleteObjects failed for {bucket}"))?;
+                .await;
+
+            let out = match out {
+                Ok(out) => out,
+                // Some S3-compatible providers do not implement the batch call
+                // at all. Failing the whole delete there would mean the app can
+                // delete nothing on those stores, when deleting one object at a
+                // time works perfectly well — slower, and slower is a better
+                // answer than "cannot".
+                Err(error) if is_batch_unsupported(&format!("{error:?}")) => {
+                    self.delete_one_by_one(bucket, chunk, &mut report).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("DeleteObjects failed for {bucket}"))
+                }
+            };
 
             report.deleted += out.deleted().len();
             for error in out.errors() {
@@ -596,6 +626,20 @@ impl S3Client {
             }
         }
         Ok(report)
+    }
+
+    /// The slow path, for providers without `DeleteObjects`.
+    ///
+    /// Collects failures rather than stopping at the first: one key nobody may
+    /// delete should not strand the other nine hundred and ninety nine, and the
+    /// report already has a place to say which ones did not go.
+    async fn delete_one_by_one(&self, bucket: &str, keys: &[String], report: &mut DeleteReport) {
+        for key in keys {
+            match self.delete_object(bucket, key).await {
+                Ok(()) => report.deleted += 1,
+                Err(error) => report.errors.push(format!("{key}: {error}")),
+            }
+        }
     }
 
     // ------------------------------------------------------------- transfers
@@ -2271,6 +2315,29 @@ mod tests {
             },
         );
         assert_eq!(entries[0].name, "small.txt");
+    }
+}
+
+#[cfg(test)]
+mod delete_fallback_tests {
+    use super::is_batch_unsupported;
+
+    #[test]
+    fn only_a_missing_batch_call_falls_back() {
+        // The provider does not have `DeleteObjects`. One key at a time is
+        // slower, and slower is a better answer than "this app cannot delete
+        // anything on your store".
+        assert!(is_batch_unsupported("NotImplemented"));
+        assert!(is_batch_unsupported("MethodNotAllowed"));
+        assert!(is_batch_unsupported("service error: status: 501"));
+
+        // These are about the keys, not the call. Retrying one at a time would
+        // be a thousand more requests all failing the same way, and a thousand
+        // more lines in the error log.
+        assert!(!is_batch_unsupported("AccessDenied"));
+        assert!(!is_batch_unsupported("NoSuchBucket"));
+        assert!(!is_batch_unsupported("dispatch failure"));
+        assert!(!is_batch_unsupported("SlowDown"));
     }
 }
 

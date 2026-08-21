@@ -12,7 +12,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 mod aws_config_file;
-pub use aws_config_file::{import_aws_profiles, parse_aws_files, ImportedProfile};
+pub use aws_config_file::{
+    import_aws_profiles, parse_aws_files, system_default_region, ImportedProfile,
+};
 
 const KEYRING_SERVICE: &str = "dev.s3browser.credentials";
 

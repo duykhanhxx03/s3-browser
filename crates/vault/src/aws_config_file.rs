@@ -27,6 +27,42 @@ pub struct ImportedProfile {
 /// Reads `~/.aws/credentials` and `~/.aws/config`, honouring the standard
 /// `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` overrides. Missing files are
 /// not an error — most machines have neither, one, or both.
+/// The region this machine is already set up for.
+///
+/// Looked up so that a new profile does not open with `us-east-1` for someone
+/// whose every bucket is in Frankfurt — a wrong region is not a friendly
+/// failure, it is a redirect error from deep inside the SDK.
+///
+/// The order the AWS tools themselves use: the environment first, then the
+/// default profile in `~/.aws/config`. `None` when neither says anything, which
+/// is a real answer and not a reason to invent one.
+pub fn system_default_region() -> Option<String> {
+    for name in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+        if let Ok(region) = std::env::var(name) {
+            if !region.trim().is_empty() {
+                return Some(region.trim().to_string());
+            }
+        }
+    }
+
+    let home = dirs::home_dir()?;
+    let config = std::fs::read_to_string(home.join(".aws").join("config")).ok()?;
+    default_region_in(&config)
+}
+
+/// The `[default]` section's region, if it has one.
+///
+/// Read straight from the ini rather than through `parse_aws_files`, which
+/// drops every profile without static keys — and a `[default]` section that
+/// only sets a region is exactly such a profile, and exactly the common case.
+fn default_region_in(config: &str) -> Option<String> {
+    parse_ini(config)
+        .into_iter()
+        .find(|(name, _)| name == "default" || name == "profile default")
+        .and_then(|(_, settings)| settings.get("region").cloned())
+        .filter(|region| !region.trim().is_empty())
+}
+
 pub fn import_aws_profiles() -> Result<Vec<ImportedProfile>> {
     let home = dirs::home_dir();
 
@@ -214,5 +250,31 @@ aws_secret_access_key = s1
         let imported = parse_aws_files("", config);
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].profile.region, "us-west-2");
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::default_region_in;
+
+    #[test]
+    fn the_default_profiles_region_is_the_one_worth_reading() {
+        // What `system_default_region` reaches for once the environment has
+        // said nothing. Anything but `default` belongs to some other profile
+        // and using it would set up a new connection pointing somewhere the
+        // user never named.
+        // A `[default]` section with nothing but a region is the common case,
+        // and it is exactly what `parse_aws_files` throws away — it only keeps
+        // profiles with static keys.
+        let config = "[default]\nregion = eu-west-1\n\n[profile work]\nregion = ap-southeast-1\n";
+        assert_eq!(default_region_in(config).as_deref(), Some("eu-west-1"));
+
+        // Anything but `default` belongs to some other profile, and borrowing
+        // its region would point a new connection somewhere never named.
+        let config = "[profile work]\nregion = ap-southeast-1\n";
+        assert_eq!(default_region_in(config), None);
+
+        // No region at all is a real answer, not a reason to invent one.
+        assert_eq!(default_region_in("[default]\noutput = json\n"), None);
     }
 }
