@@ -337,6 +337,10 @@ pub struct Browser {
     continuation: Option<String>,
     loading: bool,
     loading_more: bool,
+    /// Whether a connection is being made. Separate from `loading`: the sidebar
+    /// and the object list wait on different requests, and one shared flag
+    /// cannot say which of them is the one still busy.
+    connecting: bool,
     /// Bumped on every navigation so a late response for an abandoned prefix is
     /// dropped instead of overwriting the current listing.
     generation: u64,
@@ -474,6 +478,7 @@ impl Browser {
             continuation: None,
             loading: false,
             loading_more: false,
+            connecting: false,
             generation: 0,
             sort: Sort::default(),
             filter: String::new(),
@@ -578,6 +583,7 @@ impl Browser {
         self.entries.clear();
         self.visible.clear();
         self.error = None;
+        self.connecting = true;
         self.status = format!("Đang kết nối {}…", stored.name).into();
 
         let profile = Profile {
@@ -604,6 +610,7 @@ impl Browser {
         let task = cx.spawn(async move |this, cx| {
             let outcome = connecting.await;
             _ = this.update(cx, |this, cx| {
+                this.connecting = false;
                 match outcome {
                     Ok(Ok((client, listed))) => {
                         let buckets = match listed {
@@ -684,8 +691,9 @@ impl Browser {
         self.error = None;
         self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
 
-        let listing =
-            Tokio::spawn(cx, async move { client.list_page(&bucket, &prefix, None).await });
+        let listing = Tokio::spawn(cx, async move {
+            client.list_page(&bucket, &prefix, None).await
+        });
 
         let task = cx.spawn(async move |this, cx| {
             let outcome = listing.await;
@@ -740,6 +748,16 @@ impl Browser {
         });
 
         let task = cx.spawn(async move |this, cx| {
+            // Repaint before waiting, not during. Paging is decided inside the
+            // list's own processor, which runs after this frame's element tree
+            // was already built, and a `notify` from there is swallowed — the
+            // frame doing the rendering is not going to render itself again. So
+            // the request for a repaint has to be made from outside the frame,
+            // and the first thing this task does is step outside it. Without
+            // this the "loading more" line appears only once the page it
+            // announces has already arrived, which is to say never.
+            _ = this.update(cx, |_this, cx| cx.notify());
+
             let outcome = listing.await;
             _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -2995,6 +3013,11 @@ impl Browser {
                     })
                     .collect::<Vec<_>>(),
             )
+            // Only while there is nothing yet: a reconnect that already has
+            // names on screen should not replace them with placeholders.
+            .when(self.connecting && self.buckets.is_empty(), |this| {
+                this.child(skeleton_sidebar(theme))
+            })
             // Buckets are browsed constantly and profiles are switched rarely,
             // so the list gets the height and the profile gets a footer.
             .child(div().flex_1())
@@ -3387,6 +3410,84 @@ impl Browser {
             )
     }
 
+    /// The body of the object pane: placeholders, a reason there is nothing, or
+    /// the rows.
+    ///
+    /// One place rather than three `when`s at the call site, because the three
+    /// are mutually exclusive and reading them as separate conditions is what
+    /// lets an empty message and a list of rows end up on screen together.
+    fn render_listing(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+
+        if self.loading || self.connecting {
+            return skeleton_rows(theme).into_any_element();
+        }
+        if self.visible.is_empty() {
+            return self.render_nothing_here(cx).into_any_element();
+        }
+
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(div().flex_1().min_h(px(0.)).child(self.render_rows(cx)))
+            // Paging appends to a list already on screen, so it gets a line
+            // under the rows rather than replacing them with placeholders.
+            .when(self.loading_more, |this| {
+                this.child(loading_strip("Đang tải thêm…", theme))
+            })
+            .into_any_element()
+    }
+
+    /// Why the list is empty. An empty prefix and a filter that matched nothing
+    /// look identical on screen and are entirely different situations — one is
+    /// a fact about the bucket, the other is undone by pressing Escape.
+    fn render_nothing_here(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let filtered_out = emptiness(&self.filter, self.entries.len()) == Emptiness::Filtered;
+
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(div().text_color(theme.text_muted).child(if filtered_out {
+                "Không có mục nào khớp"
+            } else {
+                "Thư mục trống"
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(if filtered_out {
+                        format!(
+                            "Bộ lọc “{}” không khớp mục nào trong {} mục đã tải",
+                            self.filter,
+                            self.entries.len()
+                        )
+                    } else {
+                        "Kéo tệp vào đây để tải lên".to_string()
+                    })),
+            )
+            .when(filtered_out, |this| {
+                this.child(
+                    action_button("empty-clear-filter", "Xoá bộ lọc", theme).on_click(
+                        cx.listener(|this, _event, _window, cx| {
+                            this.filter.clear();
+                            this.prompt_text.clear();
+                            this.resort_and_filter();
+                            this.status = this.listing_summary();
+                            cx.notify();
+                        }),
+                    ),
+                )
+            })
+    }
+
     fn render_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
@@ -3569,9 +3670,6 @@ impl Browser {
                         m = platform::primary_modifier()
                     ))),
             )
-            .when(self.loading || self.loading_more, |this| {
-                this.child(div().text_color(theme.accent).child("đang tải…"))
-            })
             .when(!queue_label.is_empty(), |this| {
                 let open = self.drawer_open;
                 this.child(
@@ -3709,12 +3807,9 @@ impl Browser {
         let theme = self.theme;
 
         let body = match (&inspector.head, inspector.loading) {
-            (None, true) => div()
-                .p_3()
-                .text_xs()
-                .text_color(theme.text_faint)
-                .child("Đang tải…")
-                .into_any_element(),
+            // Same placeholders as the list and the sidebar, so all three areas
+            // say "waiting" in one visual language rather than three.
+            (None, true) => skeleton_details(theme).into_any_element(),
             (None, false) => div()
                 .p_3()
                 .text_xs()
@@ -4960,9 +5055,13 @@ impl Render for Browser {
                             .when_some(self.render_empty_state(cx), |this, empty| {
                                 this.child(empty)
                             })
-                            .when(self.bucket.is_some(), |this| {
+                            // `connecting` too: the pane is waiting on the same
+                            // request the sidebar is, and leaving it blank until
+                            // a bucket exists reads as a broken window rather
+                            // than as a wait.
+                            .when(self.bucket.is_some() || self.connecting, |this| {
                                 this.child(self.render_columns(cx))
-                                    .child(self.render_rows(cx))
+                                    .child(self.render_listing(cx))
                             }),
                     )
                     .children(self.render_inspector(cx)),
@@ -5307,6 +5406,158 @@ fn object_row(
 /// Bandwidth presets the drawer button cycles through, in bytes per second.
 /// Zero is unlimited and comes last, so one more click always gets back to it.
 const BANDWIDTH_PRESETS: [u64; 4] = [1_000_000, 5_000_000, 20_000_000, 0];
+
+/// Why a listing has no rows to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Emptiness {
+    /// The prefix holds nothing. Nothing the user can undo.
+    Prefix,
+    /// Rows were loaded and the filter is hiding every one of them. Escape
+    /// brings them back, so this state comes with a button.
+    Filtered,
+}
+
+/// Which of the two an empty list is.
+///
+/// The subtle case is a filter typed against a prefix that was empty to begin
+/// with: the filter is not the reason there is nothing, and offering to clear
+/// it would send someone chasing a cause that is not there.
+fn emptiness(filter: &str, loaded: usize) -> Emptiness {
+    if !filter.is_empty() && loaded > 0 {
+        Emptiness::Filtered
+    } else {
+        Emptiness::Prefix
+    }
+}
+
+/// How many placeholder rows the object list shows while it loads.
+///
+/// Enough to overflow a tall window, because the container clips what does not
+/// fit but cannot invent what is missing: a count that stops short leaves a
+/// band of empty floor under the placeholders, which reads as "this folder has
+/// twenty things in it" rather than as "still loading".
+const SKELETON_ROWS: usize = 48;
+
+/// A placeholder bar, standing in for text that has not arrived.
+///
+/// Static rather than shimmering. An animated placeholder needs a repaint every
+/// frame for as long as the wait lasts; the app already runs one such loop for
+/// transfer progress, and starting a second one so that a half-second listing
+/// can glimmer is not a trade worth making. The shape alone says "not yet".
+fn skeleton_bar(width: f32, theme: Theme) -> impl IntoElement {
+    div().h(px(8.)).w(px(width)).rounded_sm().bg(theme.hover)
+}
+
+/// Placeholder rows shaped like the object list.
+///
+/// Shaped rather than a centred "loading…" so the columns are already where
+/// they will be: the real rows arrive into the same geometry instead of shoving
+/// a message out of the way.
+fn skeleton_rows(theme: Theme) -> impl IntoElement {
+    // Varied widths on purpose. Identical bars down the column read as a
+    // rendering fault rather than as names of different lengths.
+    const WIDTHS: [f32; 7] = [186., 124., 238., 152., 96., 208., 144.];
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .children((0..SKELETON_ROWS).map(|row| {
+            div()
+                .h(px(ROW_HEIGHT))
+                // Without this, forty-eight rows in a shorter pane each shrink
+                // to fit and the placeholders come out half-height — the flex
+                // default is to shrink, and the clipping has to be done by the
+                // container instead.
+                .flex_shrink_0()
+                .w_full()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                // The same three slots `object_row` uses, at the same widths.
+                .child(
+                    div()
+                        .w(px(22.))
+                        .flex()
+                        .child(div().size(px(15.)).rounded_sm().bg(theme.hover)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .child(skeleton_bar(WIDTHS[row % WIDTHS.len()], theme)),
+                )
+                .child(div().w(px(84.)).child(skeleton_bar(38., theme)))
+                .child(div().w(px(132.)).child(skeleton_bar(94., theme)))
+        }))
+}
+
+/// Placeholder bucket names, for the sidebar while a connection is being made.
+fn skeleton_sidebar(theme: Theme) -> impl IntoElement {
+    const WIDTHS: [f32; 4] = [108., 82., 130., 96.];
+
+    div().flex().flex_col().gap_1().children(
+        WIDTHS
+            .iter()
+            .map(|&width| {
+                div()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .h(px(ROW_HEIGHT))
+                    .child(skeleton_bar(width, theme))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Placeholder metadata rows, mirroring `detail_row`'s two columns.
+fn skeleton_details(theme: Theme) -> impl IntoElement {
+    const WIDTHS: [(f32, f32); 6] = [
+        (52., 128.),
+        (40., 92.),
+        (64., 156.),
+        (48., 108.),
+        (58., 136.),
+        (44., 84.),
+    ];
+
+    div()
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .children(
+            WIDTHS
+                .iter()
+                .map(|&(label, value)| {
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().w(px(84.)).child(skeleton_bar(label, theme)))
+                        .child(skeleton_bar(value, theme))
+                })
+                .collect::<Vec<_>>(),
+        )
+}
+
+/// A one-line note under a list that is still growing.
+fn loading_strip(label: &'static str, theme: Theme) -> impl IntoElement {
+    div()
+        .h(px(HEADER_HEIGHT))
+        .w_full()
+        .px_3()
+        .flex()
+        .items_center()
+        .border_t_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_faint)
+        .child(label)
+}
 
 /// Which end of the viewport to align a row against when scrolling it into
 /// view.
@@ -5944,6 +6195,7 @@ mod tests {
             continuation: None,
             loading: false,
             loading_more: false,
+            connecting: false,
             generation: 0,
             sort: Sort::default(),
             filter: String::new(),
@@ -6253,6 +6505,19 @@ mod tests {
             browser.click_row(0, Modifiers::shift(), cx);
             assert_eq!(selected_names(browser), vec!["a.txt", "b.txt"]);
         });
+    }
+
+    #[test]
+    fn an_empty_list_says_which_kind_of_empty_it_is() {
+        // Nothing loaded and nothing typed: the prefix is empty, full stop.
+        assert_eq!(emptiness("", 0), Emptiness::Prefix);
+        // Rows loaded, filter hiding all of them. Escape undoes it, so this is
+        // the one that gets a button.
+        assert_eq!(emptiness("xyz", 12), Emptiness::Filtered);
+        // A filter typed against a prefix that was already empty. The filter is
+        // not why there is nothing here, and offering to clear it would send
+        // someone chasing a cause that does not exist.
+        assert_eq!(emptiness("xyz", 0), Emptiness::Prefix);
     }
 
     #[test]

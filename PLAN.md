@@ -357,10 +357,25 @@ chung cơ chế đó, nên phần nó còn thiếu cũng xong luôn.
 con trỏ chạm mép, `⇧↑` chọn đúng dải liên tiếp. Phím giả lập tới được GPUI, khác
 với chuột giả lập ở §5.
 
-### 7.3 Trạng thái đang tải theo từng vùng
-Hiện chỉ có một dòng ở thanh trạng thái. Danh sách, inspector và sidebar cần
-trạng thái riêng, vì chúng tải độc lập và một dòng chung không nói được cái nào
-đang bận.
+### 7.3 Trạng thái đang tải theo từng vùng — xong
+Placeholder tĩnh theo đúng hình dạng của vùng: danh sách có hàng giả đúng ba cột,
+sidebar có tên bucket giả, inspector có hàng metadata giả. Tĩnh chứ không nhấp
+nháy: hiệu ứng động cần vẽ lại mỗi khung hình suốt thời gian chờ, mà app đã chạy
+một vòng lặp như thế cho tiến độ truyền rồi.
+
+Bỏ chữ "đang tải" chung ở thanh trạng thái, vì giờ mỗi vùng tự nói.
+
+Thêm cả trạng thái *hết* của vùng: thư mục trống và bộ lọc không khớp là hai
+chuyện khác nhau, trước đây trông giống hệt nhau. Cái sau có nút xoá bộ lọc.
+
+Một lỗi lộ ra khi làm: `cx.notify()` gọi từ trong processor của `uniform_list` bị
+bỏ qua, vì khung hình đang vẽ không tự vẽ lại chính nó. Nên dòng "đang tải thêm"
+chỉ hiện sau khi trang nó báo đã về, tức là không bao giờ. Sửa bằng cách xin vẽ
+lại từ bên ngoài khung hình, ở bước đầu của task.
+
+Đã xem tận mắt: placeholder sidebar, placeholder danh sách, thư mục trống, bộ lọc
+không khớp, và dòng "Đang tải thêm…" khi sang trang. Riêng placeholder của
+inspector thì chưa thấy chạy.
 
 ### 7.4 Thông báo lỗi thao tác được
 Lỗi hiện là chữ đỏ ở đáy màn hình, không thao tác được và tự biến mất khi có
