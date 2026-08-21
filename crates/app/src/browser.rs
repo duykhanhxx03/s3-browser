@@ -10190,7 +10190,11 @@ trait LiquidGlass: Styled + ParentElement + Sized {
                         window.paint_backdrop_glass(
                             bounds,
                             gpui::Corners::all(px(16.)),
-                            px(22.),
+                            // The rim band: 24pt is the pane figure from the
+                            // reverse-engineered catalogs, and it is also the
+                            // peak displacement — the profile keeps the mean
+                            // well under it.
+                            px(24.),
                             frost,
                         );
                     },

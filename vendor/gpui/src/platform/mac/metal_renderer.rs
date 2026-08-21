@@ -38,11 +38,10 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
 
-/// The gaussian sigma for backdrop glass, in device pixels. One knob rather
-/// than per-primitive: every pane of glass in one app should be made of the
-/// same material, and per-glass sigmas would mean re-blurring per primitive
-/// instead of once per batch.
-const GLASS_SIGMA: f32 = 36.;
+/// Gaussian sigma for the frost, in device pixels — the reverse-engineered
+/// figure is 8pt (16 device px at 2x), far softer than the first drafts here:
+/// the frost is a veil, not a wall, and the tint does the rest.
+const GLASS_SIGMA: f32 = 16.;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;

@@ -99,13 +99,17 @@ impl GlassSpec {
                 rim: rgba(0xffffff2b).into(),
                 shadow: rgba(0x00000094).into(),
                 shadow_geometry: (12., 36., -6.),
-                frost: 0.32,
+                // The reverse-engineered tables put dark panes at 0.40 —
+                // *more* opaque than light, the reverse of every earlier guess
+                // here: dark mode leans on tint for legibility where light
+                // mode can lean on a bright blur.
+                frost: 0.40,
             },
             Mode::Light => Self {
                 rim: rgba(0x1c202426).into(),
                 shadow: rgba(0x0000004a).into(),
                 shadow_geometry: (14., 44., -8.),
-                frost: 0.38,
+                frost: 0.25,
             },
         }
     }
@@ -338,7 +342,11 @@ mod tests {
         for (mode, glass) in [("dark", dark), ("light", light)] {
             assert!(glass.frost >= 0.2 && glass.frost <= 0.45, "{mode} frost");
         }
-        assert!(light.frost > dark.frost);
+        // Dark frosts harder than light — the reverse of this test's first
+        // guess. The reverse-engineered material tables put dark panes at
+        // 0.40 and light at 0.25: a dark pane cannot brighten its backdrop
+        // into legibility, so it has to tint it away instead.
+        assert!(dark.frost > light.frost);
     }
 
     #[test]

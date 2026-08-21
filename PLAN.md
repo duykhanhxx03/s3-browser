@@ -1032,3 +1032,39 @@ rỗng, ảnh chụp bắt được ngay. Và ngừng đụng vào settings.json
 light lúc 23:10 khi app đang mở mà nguồn ghi duy nhất là click chuột vào chip —
 tức là chính người dùng đang chọn theme trong lúc xem, còn tôi thì cứ "khôi
 phục" đè lên lựa chọn đó.
+
+### 10.19 Liquid Glass theo tài liệu, không theo phỏng đoán (22/08/2026)
+
+Sau góp ý "tệ quá, research đi": ba agent research song song (HIG/WWDC25 của
+Apple; các teardown có đo đạc — kube.io, ybouane, atlaspuplabs; các bản
+implement có công thức — Kyant/AndroidLiquidGlass đối chiếu ảnh iOS 26 thật,
+flutter liquid_glass_renderer, liquid-glass-studio) rồi một agent tổng hợp
+thành spec số. Shader viết lại theo spec, và spec bắt đúng bốn chỗ bản cũ sai:
+
+1. **Thấu kính toàn tấm 5% là "heat-shimmer fake".** Tiêu chí nghiệm thu số
+   một của mọi teardown: đường thẳng sau tấm phải thẳng tuyệt đối trong ruột,
+   chỉ được nén/bẻ trong vành ~24pt. Đã bỏ magnification; ruột phẳng quang học.
+2. **Profile vành là cung tròn với đạo hàm 0 tại ranh trong**
+   (`1 − √(1−x²)`), không phải luỹ thừa tuỳ tiện — đạo hàm 0 là thứ khiến chỗ
+   vành gặp ruột không tự vẽ thành một vòng seam. Kéo mẫu VÀO TRONG (offset
+   âm dọc gradient), không đẩy ra: vành thành bản nén của thứ ngay trong mép,
+   đúng vành kính lúp. Không Snell/IOR — Kyant đối chiếu ảnh thật kết luận
+   Apple dùng displacement thuần, các bản vật lý cho cùng đường cong với giá
+   đắt hơn và thêm một tham số không ràng buộc.
+3. **Highlight là hai thuỳ lệch 45°** (trên-trái sáng 1.0, dưới-phải 0.8, tối
+   ở hai góc vuông góc, vệt ~0.5pt) — không phải vòng đều, không phải
+   "−normal.y". Vòng đều là CSS border, không phải kính có đèn. Kèm inner
+   shadow mờ phía quay lưng nguồn sáng.
+4. **Tint dark ĐẬM hơn light** (0.40 so với 0.25) — ngược mọi phỏng đoán trước
+   của phiên này: tấm tối không làm sáng backdrop lên được nên phải tint đi;
+   test lật chiều với lý do ghi trong comment. Blur hạ về sigma 8pt (16 device
+   px) — sương là voan, không phải tường; bão hoà đúng 1.5 trên luma Rec.709
+   (Kyant lẫn Flutter cùng ship đúng 1.5). Tán sắc chỉ ở vành, ±6% trên chính
+   offset nên tự về 0 ở ruột.
+
+Nghiệm thu bằng chính ba bài test của spec, trên trang Gần đây (11 dòng chữ
+dày làm nền, vì Docker liệt — mc treo — không dựng được listing MinIO):
+đường dòng thẳng tuyệt đối dưới ruột tấm, chữ và icon màu ghosting qua sương,
+nén nhẹ đúng ở vành, không viền cầu vồng, không răng cưa mép. Chưa soi được
+dark mode trong phiên này (theme là lựa chọn đang mở của người dùng, không đè
+nữa) — token dark đi cùng một shader, khác mỗi frost/tint đã ghim bằng test.

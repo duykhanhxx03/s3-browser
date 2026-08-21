@@ -1281,21 +1281,31 @@ fragment float4 backdrop_glass_fragment(
     [[buffer(BackdropGlassInputIndex_ViewportSize)]],
     texture2d<float> blurred [[texture(0)]],
     texture2d<float> sharp [[texture(1)]]) {
-  constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
-                                 address::clamp_to_edge);
+  // The material below follows the reconciled Liquid Glass spec from the
+  // reverse-engineering literature (Kyant's side-by-side iOS 26 captures,
+  // kube.io's height-field analysis, the Flutter renderer). The three rules
+  // that matter, each of which an earlier draft here broke:
+  //  - the interior is OPTICALLY FLAT: lines behind the pane stay straight
+  //    everywhere except a ~24pt rim band. Whole-pane magnification reads as
+  //    heat shimmer, not glass.
+  //  - the rim displacement follows a circular arc with zero slope where the
+  //    band meets the flat centre, or the seam draws itself as a ring.
+  //  - the rim lighting is two lobes on the 45-degree diagonal, not a ring
+  //    and not "whatever faces up".
+  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
+                                     address::clamp_to_edge);
   BackdropGlass glass = glasses[input.glass_id];
 
   float2 pos = input.position.xy;
   float distance = quad_sdf(pos, glass.bounds, glass.corner_radii);
-  // Coverage first: outside the rounded rect nothing else is worth computing.
-  float coverage = saturate(0.5 - distance);
+  // ~1.5pt anti-aliased coverage ramp; a hard edge on a displaced band shows
+  // pixel crunch. Colour is returned straight (not premultiplied) because the
+  // pipeline blends with SourceAlpha.
+  float coverage = 1.0 - smoothstep(-3.0, 0.0, distance);
   if (coverage == 0.) {
     return float4(0.);
   }
 
-  // The SDF gradient by central differences. Two extra SDF evaluations per
-  // fragment is cheap next to a texture sample, and it handles the corner
-  // arcs that an axis-based normal would get wrong.
   float2 gradient = float2(
       quad_sdf(pos + float2(1., 0.), glass.bounds, glass.corner_radii) -
           quad_sdf(pos - float2(1., 0.), glass.bounds, glass.corner_radii),
@@ -1304,60 +1314,65 @@ fragment float4 backdrop_glass_fragment(
   float gradient_len = length(gradient);
   float2 normal = gradient_len > 0. ? gradient / gradient_len : float2(0.);
 
+  // Circular-arc displacement profile over the rim band. 1 at the boundary,
+  // falling to 0 with zero derivative at depth == band — the zero derivative
+  // is what keeps the band/centre junction seamless.
+  float band = max(glass.blur_radius, 1.);
+  float depth = -distance;
+  float profile = 0.;
+  if (depth < band) {
+    float x = 1.0 - depth / band;
+    profile = 1.0 - sqrt(max(1.0 - x * x, 0.));
+  }
+
+  // Stylised inward displacement, not Snell: the sample is pulled INWARD, so
+  // the band shows a compressed copy of what lies just inside the edge — the
+  // magnifying-lens rim — with peak displacement equal to the band width.
   float2 viewport = float2(float(viewport_size->width),
                            float(viewport_size->height));
+  float2 offset_px = -band * profile * normal;
   float2 uv = pos / viewport;
+  float2 uv_r = clamp(uv + offset_px * 0.94 / viewport, 0., 1.);
+  float2 uv_g = clamp(uv + offset_px / viewport, 0., 1.);
+  float2 uv_b = clamp(uv + offset_px * 1.06 / viewport, 0., 1.);
 
-  // The whole pane is a weak lens: the backdrop is magnified a few percent
-  // toward the pane's centre. This, more than the blur, is what reads as a
-  // slab of *material* rather than a screenshot filter — content slides
-  // differently under the pane than beside it.
-  float2 center = float2(glass.bounds.origin.x + glass.bounds.size.width / 2.,
-                         glass.bounds.origin.y + glass.bounds.size.height / 2.) /
-                  viewport;
-  float2 lens_uv = center + (uv - center) / 1.05;
-  float4 base = blurred.sample(blur_sampler, lens_uv);
+  // Sharp at the rim, frosted in the interior: crisp lensing is what sells
+  // the edge, and the fade between the two runs across the same band as the
+  // displacement. Chromatic dispersion rides the offset itself — blue bends
+  // more than red — so it is zero wherever the displacement is.
+  float frost_mix = smoothstep(0.0, band, depth);
+  float3 sharp_rgb = float3(sharp.sample(backdrop_sampler, uv_r).r,
+                            sharp.sample(backdrop_sampler, uv_g).g,
+                            sharp.sample(backdrop_sampler, uv_b).b);
+  float3 blur_rgb = blurred.sample(backdrop_sampler, uv_g).rgb;
+  float3 base = mix(sharp_rgb, blur_rgb, frost_mix);
 
-  // Vibrancy: push saturation past neutral so the colours behind glow through
-  // the frost instead of dying into grey. Every Apple material does this; a
-  // blur without it reads as fog, not glass.
-  float luma = dot(base.rgb, float3(0.299, 0.587, 0.114));
-  base.rgb = clamp(mix(float3(luma), base.rgb, 1.45), 0., 1.);
+  // Saturation 1.5 over Rec.709 luma: the backdrop's colour glows through the
+  // frost instead of greying out.
+  float luma = dot(base, float3(0.2126, 0.7152, 0.0722));
+  base = clamp(mix(float3(luma), base, 1.5), 0., 1.);
 
-  // The rim bends *sharp* imagery, not the blur. A refracted blur is mush; a
-  // real slab shows a crisp, stretched band of what lies just outside its
-  // edge. The band is narrower than the blur and the falloff cubic, so the
-  // lens reads as a defined ring hugging the edge rather than a wide smear —
-  // the wide quadratic version is exactly what looked unrefined. The three
-  // taps a hair apart are chromatic dispersion: the faint colour fringing at
-  // the very edge that says "lens" to an eye that never names it.
-  float band = max(glass.blur_radius * 0.6, 8.);
-  float rim = saturate(1. + distance / band);
-  float bend = rim * rim * rim;
-  float2 shift = normal * bend * band * 1.4 / viewport;
-  float3 rim_rgb = float3(sharp.sample(blur_sampler, uv + shift * 1.06).r,
-                          sharp.sample(blur_sampler, uv + shift).g,
-                          sharp.sample(blur_sampler, uv + shift * 0.94).b);
-  float3 color = mix(base.rgb, rim_rgb, bend * 0.85);
-
-  // The frost, thin enough to stay glass.
+  // The frost tint.
   float4 tint = hsla_to_rgba(glass.tint);
-  color = mix(color, tint.rgb, tint.a);
+  float3 color = mix(base, tint.rgb, tint.a);
 
-  // Edge lighting lives here, on the SDF, not in overlay bands. The app used
-  // to lay horizontal gradient strips over the pane — a top band, a bottom
-  // band, a 1px line — and straight bands over a curved rim is what made the
-  // whole thing read as a mockup: light that ignores the shape it sits on.
-  // On the SDF the arc brightens exactly where the edge curves toward the
-  // key light, corners included, because -normal.y *is* "how much this edge
-  // faces up". A small direction-free term is the fresnel glint every edge
-  // gets; the underside subtracts instead — thickness reads as shade.
-  float top = saturate(-normal.y);
-  float bottom = saturate(normal.y);
-  color += bend * (0.20 * top + 0.05);
-  color -= bend * 0.10 * bottom;
+  // The key light sits up-left on the 45-degree diagonal. Two thin additive
+  // lobes where the rim faces it and where it faces exactly away, dark gaps
+  // at the perpendicular corners — dot(normal, light) wraps the corners for
+  // free. A uniform ring is a CSS border, not lit glass.
+  float2 light = float2(-0.7071, -0.7071);
+  float facing = dot(normal, light);
+  float rim_line = exp(-(distance * distance) / (2. * 0.7 * 0.7));
+  float lobe = abs(facing) * (facing > 0. ? 1.0 : 0.8);
+  // A faint inner shadow on the away side, under the highlight: the depth cue
+  // that separates pane from backdrop where no light catches the edge.
+  float shade_mask =
+      (1.0 - smoothstep(0.0, 20.0, depth)) * max(0., -facing);
+  float shade_alpha = tint.r + tint.g + tint.b < 1.5 ? 0.20 : 0.12;
+  color = mix(color, float3(0.), shade_mask * shade_alpha);
+  color += 0.5 * rim_line * lobe;
 
-  return float4(color * coverage, coverage);
+  return float4(color, coverage);
 }
 
 // One pass of the separable gaussian, at whatever resolution the target has.
