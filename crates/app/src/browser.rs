@@ -739,16 +739,13 @@ impl Browser {
             &path_input,
             window,
             |this: &mut Self, state, event: &InputEvent, window, cx| {
-                match event {
-                    InputEvent::PressEnter { .. } => {
-                        let text = state.read(cx).value().to_string();
-                        this.go_to_path(&text, cx);
-                        // Back to the list, so the arrow keys work again
-                        // without a trip to the mouse.
-                        this.focus.focus(window);
-                        cx.notify();
-                    }
-                    _ => {}
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let text = state.read(cx).value().to_string();
+                    this.go_to_path(&text, cx);
+                    // Back to the list, so the arrow keys work again without a
+                    // trip to the mouse.
+                    this.focus.focus(window);
+                    cx.notify();
                 }
             },
         );
@@ -5687,7 +5684,15 @@ impl Browser {
                             .into_any_element();
 
                         object_row(
-                            position, entry, selected, is_cursor, thumbnail, checkbox, actions,
+                            entry,
+                            RowState {
+                                position,
+                                selected,
+                                cursor: is_cursor,
+                                thumbnail,
+                            },
+                            checkbox,
+                            actions,
                             theme,
                         )
                             .on_click(cx.listener(
@@ -7644,12 +7649,18 @@ fn crumb(id: SharedString, label: SharedString, theme: Theme) -> gpui::Stateful<
         .child(label)
 }
 
-fn object_row(
+/// How a row is drawn, apart from what it holds. Grouped because the list of
+/// them had grown past the point where a call site says anything.
+struct RowState {
     position: usize,
-    entry: &Entry,
     selected: bool,
     cursor: bool,
     thumbnail: Option<std::sync::Arc<gpui::Image>>,
+}
+
+fn object_row(
+    entry: &Entry,
+    state: RowState,
     // Built by the caller because it needs a listener of its own, and a listener
     // needs the view's context. Its click must not also reach the row, or
     // ticking a box would clear the selection and select that one row.
@@ -7658,6 +7669,12 @@ fn object_row(
     actions: gpui::AnyElement,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
+    let RowState {
+        position,
+        selected,
+        cursor,
+        thumbnail,
+    } = state;
     let size_label = if entry.is_folder {
         SharedString::from("")
     } else {
