@@ -309,8 +309,14 @@ pub enum Preview {
     Text(SharedString),
     /// Delimited text, laid out in columns.
     Table(Table),
-    /// Fetched, but not something worth rendering as either.
-    Unsupported,
+    /// Nothing to draw here, and why.
+    ///
+    /// One variant rather than several because the panel is the same either
+    /// way: say what this is, say why it is not on screen, and offer the app on
+    /// the machine that *can* open it. The reason is carried because "không xem
+    /// trước được" for a ZIP, a corrupt PNG and a file of raw bytes are three
+    /// different facts and the user can act on only one of them.
+    Handoff(SharedString),
 }
 
 /// An in-flight SSO sign-in. The device flow is two waits with a browser trip
@@ -3602,12 +3608,20 @@ impl Browser {
         // An image has to arrive whole to decode, so an oversized one is refused
         // rather than fetched and shown broken. Text is fine truncated.
         let refusal = match kind {
-            PreviewKind::None => Some(Preview::Unsupported),
+            // Not a byte fetched: a video, a PDF, an archive. Pulling eight
+            // megabytes of one to end up drawing a label that says "this is a
+            // video" is paying for nothing.
+            PreviewKind::None => Some(Preview::Handoff("Không xem trước được kiểu này".into())),
             PreviewKind::Image if size > self.settings.preview_limit_bytes() as i64 => {
-                self.status = "Ảnh quá lớn để xem trước".into();
-                Some(Preview::Unsupported)
+                Some(Preview::Handoff(
+                    format!(
+                        "Ảnh lớn hơn mức xem trước {} MB",
+                        self.settings.preview_limit_bytes() / (1024 * 1024)
+                    )
+                    .into(),
+                ))
             }
-            _ if size <= 0 => Some(Preview::Unsupported),
+            _ if size <= 0 => Some(Preview::Handoff("Tệp rỗng".into())),
             _ => None,
         };
         if let Some(refusal) = refusal {
@@ -3660,6 +3674,18 @@ impl Browser {
         self.previewing.as_ref().is_some_and(|previewing| {
             preview_holds_whole_object(previewing.size, self.settings.preview_limit_bytes())
         })
+    }
+
+    /// Backs out of an edit, leaving the preview open on what was fetched.
+    ///
+    /// Not the same as closing the modal: the fetched bytes are still here, so
+    /// dropping the editor is free and keeps the reader where they were.
+    fn cancel_editing(&mut self, cx: &mut Context<Self>) {
+        if let Some(previewing) = self.previewing.as_mut() {
+            previewing.editing = None;
+            previewing.saving = false;
+        }
+        cx.notify();
     }
 
     /// Opens the text in an editor, seeded with exactly what was fetched.
@@ -3762,16 +3788,31 @@ impl Browser {
         cx.notify();
     }
 
+    /// Downloads to a temporary file and hands it to whatever the system opens
+    /// it with.
+    ///
+    /// Reads the preview first, then the inspector: the preview is what is in
+    /// front of the user when there is one, and for a video or a PDF it is the
+    /// only thing offering this at all.
     fn open_externally(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket), Some(inspector)) = (
-            self.client.clone(),
-            self.bucket.clone(),
-            self.inspector.as_ref(),
-        ) else {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
             return;
         };
-        let key = inspector.key.clone();
-        let size = inspector.head.as_ref().map(|head| head.size).unwrap_or(0).max(0) as u64;
+        let key = match (self.previewing.as_ref(), self.inspector.as_ref()) {
+            (Some(previewing), _) => previewing.key.clone(),
+            (None, Some(inspector)) => inspector.key.clone(),
+            (None, None) => return,
+        };
+        // From the listing, which has it, rather than from a HEAD that may not
+        // have happened.
+        let size = self
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.size)
+            .or_else(|| self.inspector.as_ref().and_then(|i| i.head.as_ref()).map(|h| h.size))
+            .unwrap_or(0)
+            .max(0) as u64;
         let name = entry_name_of(&key);
 
         self.status = format!("Đang tải {name} để mở…").into();
@@ -5515,6 +5556,26 @@ impl Browser {
     fn render_preview(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let previewing = self.previewing.as_ref()?;
         let theme = self.theme;
+        let limit_mb = self.settings.preview_limit_bytes() / (1024 * 1024);
+        let kind: SharedString = type_badge_of(&previewing.name).unwrap_or_else(|| "TỆP".into());
+        // Text is fetched only as far as the limit. Saying so in the header is
+        // the difference between reading a file and reading the start of one —
+        // and it is also why the "Sửa" button is missing, which otherwise looks
+        // like the button is broken.
+        let truncated = matches!(
+            previewing.content,
+            Some(Preview::Text(_)) | Some(Preview::Table(_))
+        ) && !self.preview_is_whole();
+        let subtitle: SharedString = {
+            let mut line = format!("{kind} · {}", format_size(previewing.size));
+            if truncated {
+                line.push_str(&format!(" · chỉ hiện {limit_mb} MB đầu"));
+            }
+            line.into()
+        };
+        let editable = previewing.editing.is_none()
+            && matches!(previewing.content, Some(Preview::Text(_)))
+            && self.preview_is_whole();
 
         Some(
             div()
@@ -5540,9 +5601,9 @@ impl Browser {
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .h(px(HEADER_HEIGHT))
                                 .flex_shrink_0()
                                 .px_3()
+                                .py_2()
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -5552,34 +5613,59 @@ impl Browser {
                                     div()
                                         .flex_1()
                                         .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_color(theme.text)
-                                        .child(previewing.name.clone()),
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_color(theme.text)
+                                                .child(previewing.name.clone()),
+                                        )
+                                        // Type and size belong here: the
+                                        // question a preview answers is "is this
+                                        // the file I wanted", and half of that
+                                        // answer is how big it is.
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .whitespace_nowrap()
+                                                .text_color(if truncated {
+                                                    theme.text_muted
+                                                } else {
+                                                    theme.text_faint
+                                                })
+                                                .child(subtitle),
+                                        ),
                                 )
                                 // Only for text, and only when the whole object
                                 // is here. Editing a preview that stopped at the
                                 // limit and saving it back would delete the rest
                                 // of the file.
-                                .when(
-                                    previewing.editing.is_none()
-                                        && matches!(
-                                            previewing.content,
-                                            Some(Preview::Text(_))
-                                        )
-                                        && self.preview_is_whole(),
-                                    |this| {
-                                        this.child(
-                                            action_button("preview-edit", "Sửa", theme).on_click(
-                                                cx.listener(|this, _event, window, cx| {
-                                                    this.start_editing(window, cx)
-                                                }),
-                                            ),
-                                        )
-                                    },
-                                )
+                                .when(editable, |this| {
+                                    this.child(
+                                        action_button("preview-edit", "Sửa", theme).on_click(
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.start_editing(window, cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                // A way out that is not "save" and not "close
+                                // the whole thing": backing out of an edit and
+                                // still being able to read the file is the
+                                // ordinary case, and closing the modal to do it
+                                // loses your place in the list.
                                 .when(previewing.editing.is_some(), |this| {
                                     this.child(
+                                        action_button("preview-cancel", "Huỷ", theme).on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.cancel_editing(cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
                                         action_button("preview-save", "Lưu", theme).on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.save_edit(cx)
@@ -5633,8 +5719,18 @@ impl Browser {
                                         .text_color(theme.text_faint)
                                         .child("Đang tải…")
                                         .into_any_element(),
-                                    Some(Preview::Image(image)) => gpui::img(image.clone())
-                                        .max_w_full()
+                                    // Centred and bounded. Left to itself a
+                                    // tall image runs past the bottom of the
+                                    // modal and a small one sits in the corner.
+                                    Some(Preview::Image(image)) => div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            gpui::img(image.clone())
+                                                .max_w_full()
+                                                .max_h(px(PREVIEW_HEIGHT - 140.)),
+                                        )
                                         .into_any_element(),
                                     Some(Preview::Text(text)) => div()
                                         .font_family(self.mono_font.clone())
@@ -5646,10 +5742,80 @@ impl Browser {
                                         render_table(table, self.mono_font.clone(), theme)
                                             .into_any_element()
                                     }
-                                    Some(Preview::Unsupported) => div()
-                                        .text_xs()
-                                        .text_color(theme.text_faint)
-                                        .child("Không xem trước được kiểu này")
+                                    // Nothing to draw, but every one of these
+                                    // has a viewer on the machine. Naming the
+                                    // type, saying why, and offering the door
+                                    // beats a flat "cannot" with nowhere to go.
+                                    Some(Preview::Handoff(reason)) => div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_1()
+                                        .py_8()
+                                        .child(
+                                            // A file-type tile: the same shape
+                                            // whatever the file is, readable at
+                                            // a glance, and it fills a panel
+                                            // that would otherwise be one
+                                            // apologetic sentence in the middle
+                                            // of a lot of nothing.
+                                            div()
+                                                .size(px(64.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded_md()
+                                                .bg(theme.hover)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child(kind.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .pt_2()
+                                                .text_color(theme.text)
+                                                .child(reason.clone()),
+                                        )
+                                        // No size here: the header already
+                                        // carries type and size, and printing
+                                        // it twice in one dialog reads as two
+                                        // different facts that happen to agree.
+                                        // Nothing to open and nothing to save
+                                        // when there are no bytes.
+                                        .when(previewing.size > 0, |this| {
+                                            this.child(
+                                                div()
+                                                    .pt_3()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        action_button(
+                                                            "preview-open-external",
+                                                            "Mở bằng app",
+                                                            theme,
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            |this, _event, _window, cx| {
+                                                                this.open_externally(cx)
+                                                            },
+                                                        )),
+                                                    )
+                                                    .child(
+                                                        action_button(
+                                                            "preview-download",
+                                                            "Tải xuống",
+                                                            theme,
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            |this, _event, _window, cx| {
+                                                                this.download_selection(cx)
+                                                            },
+                                                        )),
+                                                    ),
+                                            )
+                                        })
                                         .into_any_element(),
                                 })
                                 }),
@@ -8335,13 +8501,17 @@ impl Render for Browser {
             .child(self.render_status(cx))
             .children(self.render_confirm(cx))
             .children(self.render_share(cx))
-            .children(self.render_palette(cx))
             .children(self.render_sso(cx))
             .children(self.render_form(cx))
             .children(self.render_profiles_dialog(cx))
             .children(self.render_failures(cx))
             .children(self.render_preview(cx))
             .children(self.render_settings(cx))
+            // Last, so it paints over everything. The palette can be summoned
+            // from on top of any of these — "Sửa nội dung" only makes sense
+            // while a preview is open — and it used to come up *behind* the
+            // preview modal, half of it hidden by the thing it acts on.
+            .children(self.render_palette(cx))
     }
 }
 
@@ -9141,17 +9311,18 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
             Some(format) => {
                 Preview::Image(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
             }
-            None => Preview::Unsupported,
+            None => Preview::Handoff("Không nhận ra định dạng ảnh".into()),
         },
         PreviewKind::Text => match String::from_utf8(bytes) {
             Ok(text) => Preview::Text(text.into()),
-            Err(_) => Preview::Unsupported,
+            Err(_) => Preview::Handoff("Tệp không phải văn bản UTF-8".into()),
         },
         PreviewKind::Table(delimiter) => match String::from_utf8(bytes) {
             Ok(text) => Preview::Table(parse_table(&text, delimiter)),
-            Err(_) => Preview::Unsupported,
+            Err(_) => Preview::Handoff("Tệp không phải văn bản UTF-8".into()),
         },
-        PreviewKind::None => Preview::Unsupported,
+        // Never reached with bytes in hand: nothing is fetched for these.
+        PreviewKind::None => Preview::Handoff("Không xem trước được kiểu này".into()),
     }
 }
 
@@ -9189,6 +9360,14 @@ enum PreviewKind {
     /// raw text is readable and not usable — the whole point of the file is the
     /// columns, and they only line up by accident.
     Table(char),
+    /// Everything else.
+    ///
+    /// Images and text are the whole of what this previews, deliberately.
+    /// Playing a video means a decoder, a clock and an audio path on top of
+    /// `gpui::surface`; drawing a PDF means bundling a rasteriser — a large
+    /// native library, signed and shipped, for one panel. Every one of those
+    /// files already has a viewer on the machine, so `None` is not a dead end
+    /// here: it is the handoff.
     None,
 }
 
@@ -9216,10 +9395,10 @@ fn preview_kind(key: &str, content_type: Option<&str>) -> PreviewKind {
         if image_format_for_mime(mime).is_some() {
             return PreviewKind::Image;
         }
-        // Structured text is still text: JSON and XML are worth reading inline.
         if mime == "text/csv" || mime == "text/tab-separated-values" {
             return PreviewKind::Table(if mime.ends_with("csv") { ',' } else { '\t' });
         }
+        // Structured text is still text: JSON and XML are worth reading inline.
         if mime.starts_with("text/")
             || matches!(mime, "application/json" | "application/xml" | "application/yaml")
         {
@@ -9656,7 +9835,13 @@ fn type_badge(entry: &Entry) -> Option<SharedString> {
     if entry.is_folder {
         return None;
     }
-    let (_, extension) = entry.name.rsplit_once('.')?;
+    type_badge_of(&entry.name)
+}
+
+/// The same, for a name with no listing row behind it — the preview knows what
+/// it opened but not which `Entry` it came from.
+fn type_badge_of(name: &str) -> Option<SharedString> {
+    let (_, extension) = name.rsplit_once('.')?;
     // Long enough to be a suffix rather than an extension — `archive.backup2026`
     // is not a file type, and neither is the half of a name after a stray dot.
     if extension.is_empty() || extension.len() > 6 || !extension.chars().all(char::is_alphanumeric)
@@ -11285,6 +11470,43 @@ mod tests {
     }
 
     #[test]
+    fn only_images_and_text_are_drawn_here() {
+        // Deliberately the whole of it. A video would mean a decoder, a clock
+        // and an audio path; a PDF a rasteriser bundled and signed. Everything
+        // outside those two lands on `None`, which is not a dead end — it is
+        // the panel that hands the file to the app on the machine.
+        for name in [
+            "phim.mp4",
+            "bai-hat.mp3",
+            "hop-dong.pdf",
+            "luu-tru.zip",
+            "so-lieu.xlsx",
+            "khong-duoi",
+        ] {
+            assert_eq!(preview_kind(name, None), PreviewKind::None, "{name}");
+        }
+        assert_eq!(
+            preview_kind("khong-duoi", Some("video/quicktime")),
+            PreviewKind::None
+        );
+
+        // And what the app *can* draw still gets drawn.
+        assert!(matches!(preview_kind("anh.png", None), PreviewKind::Image));
+        assert!(matches!(preview_kind("ghi-chu.txt", None), PreviewKind::Text));
+    }
+
+    #[test]
+    fn a_file_with_nothing_to_draw_still_says_what_it_is() {
+        // The panel names the type from the key, because there is no listing
+        // row in hand — and falls back rather than showing an empty tile.
+        assert_eq!(type_badge_of("hop-dong.pdf").unwrap(), "PDF");
+        assert_eq!(type_badge_of("phim.mp4").unwrap(), "MP4");
+        assert_eq!(type_badge_of("khong-duoi"), None);
+        // A suffix is not an extension: `sao-luu.backup2026` has no type.
+        assert_eq!(type_badge_of("sao-luu.backup2026"), None);
+    }
+
+    #[test]
     fn csv_and_tsv_preview_as_tables_not_as_text() {
         // Shown as raw text a CSV is readable and not usable: the columns only
         // line up by accident.
@@ -11338,8 +11560,14 @@ mod tests {
     fn undecodable_text_is_not_shown_as_mojibake() {
         // Invalid UTF-8 rendered with replacement characters looks like the
         // object itself is corrupt, which is a worse lie than declining.
+        // And the reason is carried, not flattened: "not UTF-8" and "not a
+        // kind we draw" are different facts, and only one of them means the
+        // file is fine and this app is the wrong tool.
         let preview = build_preview(PreviewKind::Text, "a.txt", vec![0xff, 0xfe, 0x00]);
-        assert!(matches!(preview, Preview::Unsupported));
+        match preview {
+            Preview::Handoff(reason) => assert!(reason.contains("UTF-8"), "{reason}"),
+            _ => panic!("undecodable bytes must not render as text"),
+        }
 
         let preview = build_preview(PreviewKind::Text, "a.txt", "xin chào".as_bytes().to_vec());
         match preview {
@@ -11350,7 +11578,7 @@ mod tests {
         // An image whose extension gives no format cannot be decoded.
         assert!(matches!(
             build_preview(PreviewKind::Image, "mystery", vec![1, 2, 3]),
-            Preview::Unsupported
+            Preview::Handoff(_)
         ));
     }
 

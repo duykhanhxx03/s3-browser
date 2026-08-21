@@ -553,8 +553,14 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
 
 9. ~~**Sửa tệp tại chỗ**~~ — xong (21/08/2026). `Input` nhiều dòng trong modal
    xem trước, chỉ mở khi preview giữ *trọn* object, và giữ lại thẻ khi lưu.
-10. **Preview audio, video, PDF.** Hiện chỉ ảnh, text và bảng — nhưng đã ra
-    modal riêng (21/08/2026) nên chỗ để hiển thị đã có sẵn.
+10. ~~**Preview audio, video, PDF**~~ — quyết định không làm (21/08/2026).
+    Xem trước chỉ dựng **ảnh và văn bản** (kể cả CSV/TSV thành bảng), có chủ ý:
+    video cần bộ giải mã, đồng hồ và đường âm thanh dựng trên `gpui::surface`,
+    PDF cần nhúng một thư viện dựng hình lớn — ký và đóng gói kèm — chỉ để phục
+    vụ một khung. Mọi tệp đó đã có ứng dụng sẵn trên máy, nên thứ còn thiếu
+    không phải bộ giải mã mà là **cánh cửa**: giờ mọi kiểu không dựng được đều
+    ra chung một khung nói rõ đây là gì, vì sao không hiện, kèm "Mở bằng app" và
+    "Tải xuống" — và không tải về một byte nào để nói câu đó.
 11. ~~**Trần cho tìm kiếm sâu**~~ — xong (21/08/2026). 100 yêu cầu / 100.000 mục
     / 10.000 kết quả, và "chạm trần" là một trạng thái riêng chứ không lẫn vào
     "xong" hay "đã dừng".
