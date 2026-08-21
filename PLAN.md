@@ -500,3 +500,84 @@ nhưng sắp xếp và lọc thì chạy trên toàn bộ `entries` đang giữ 
 prefix triệu key sẽ là một triệu `Entry` trong RAM và một lần sort trên mỗi trang
 mới về. Chưa đo, nên chưa biết ngưỡng thật ở đâu — nhưng đây là thứ phải đo trước
 khi in con số đó lên trang bán hàng.
+
+---
+
+## 9. Đối chiếu với Brows3 (21/08/2026)
+
+`github.com/rgcsekaraa/brows3` — Tauri + Next.js, Rust ở lõi, cùng hạng sản phẩm.
+Đọc README và mã nguồn.
+
+### Một lỗi lộ ra khi đối chiếu
+
+**Sắp xếp chỉ đúng trên phần đã tải.** `resort_and_filter` sắp `entries`, mà
+`entries` chỉ là những trang đã về. Sắp theo kích thước trên một prefix 1200 key
+cho ra *cái lớn nhất trong 1000 key đầu*, không phải cái lớn nhất trong prefix —
+và không có gì trên màn hình nói rằng đó là câu trả lời một phần.
+
+Tệ hơn: `load_more` nối trang mới rồi sắp lại toàn bộ, nên **các dòng đang nhìn
+nhảy chỗ** trong lúc cuộn. Brows3 giải quyết bằng cách sắp trọn bộ kết quả trước
+khi phân trang, có trần rõ ràng (100.000 mục hoặc 100 lượt LIST) và cache lại
+theo phiên.
+
+Đây là lỗi trước, tính năng sau — và cùng loại với lỗi Content-Type: app không sai
+một cách ồn ào, nó trả lời một câu hỏi khác với câu được hỏi.
+
+### UI
+
+1. **Tab** — làm ngay, theo yêu cầu. Xem §9.1.
+2. **Ô đường dẫn `s3://bucket/prefix/`** ở thanh trên, gõ vào là tới thẳng. App
+   đang có "Mở bucket theo tên" nhưng không dán được một đường dẫn đầy đủ. Với
+   token không có `ListBuckets` thì đây là lối vào chính chứ không phải lối phụ.
+3. **Favorites và Recent** ở sidebar. Prefix hay dùng nằm sâu ba bốn cấp là chuyện
+   thường, mà đường duy nhất tới đó hiện giờ là bấm từng cấp.
+4. **Nhãn loại tệp** cạnh tên (PNG, JSON, PDF). Rẻ, và đọc nhanh hơn phần đuôi.
+5. **Nút thao tác trên từng dòng** khi rê chuột, thay vì phải chọn rồi lên toolbar.
+6. **Chân danh sách nói rõ hơn**: "3 thư mục, 5 tệp" thay vì "8 mục".
+7. **Màn hình Cài đặt.** App chưa có cái nào: chủ đề, region mặc định, số luồng
+   truyền, giới hạn preview, xoá cache. Hiện mỗi thứ nằm rải rác hoặc không đổi
+   được.
+8. **Bảng theo dõi API**: số request thành công/thất bại và log trực tiếp. Hợp với
+   phần nhật ký lỗi ở §7.4.
+
+### Tính năng
+
+9. **Sửa tệp tại chỗ.** Brows3 nhúng Monaco. Với GPUI thì không có sẵn editor,
+   nhưng `Input` nhiều dòng đủ cho JSON và text nhỏ — đó cũng là phần lớn ca dùng.
+   Cần khoá theo kích thước và cảnh báo ghi đè.
+10. **Preview audio, video, PDF.** Hiện chỉ ảnh, text và bảng.
+11. **Trần cho tìm kiếm sâu.** Phần quét ở §7.5 dừng được nhưng không có trần tự
+    động. Brows3 đặt sẵn 100.000 mục / 100 LIST / 10.000 kết quả. Nên có, vì người
+    bấm tìm không phải người nhìn hoá đơn.
+12. **Cache danh sách bucket** theo profile. Brows3 để 30 phút.
+13. **Chép đường dẫn `s3://`** và key, không chỉ URL công khai.
+14. **ACL đệ quy cho cả prefix**, không chỉ cho vùng đang chọn.
+15. **Xoá lùi về từng object** khi provider từ chối `DeleteObjects`. Đây là ca
+    tương thích thật, Brows3 gặp đủ nhiều để viết hẳn vào README.
+16. **Tự dò region** từ cấu hình hệ thống.
+
+### Đề nghị không làm
+
+- **Auto-update.** Vẫn chờ hạ tầng ký và chỗ host, đã ghi ở M10.
+- **Nhúng một editor đầy đủ.** Monaco là một WebView; GPUI không có, và dựng lại
+  một editor là một sản phẩm khác. Sửa text nhỏ thì được, còn "VS Code trong app"
+  thì không.
+
+### 9.1 Tab
+
+Một tab là một vị trí đang duyệt, và giữ đủ thứ để quay lại thấy đúng chỗ đã rời:
+bucket, prefix, danh sách đã tải, vùng chọn, con trỏ, bộ lọc, sắp xếp, vị trí
+cuộn, và cả kết quả tìm kiếm nếu có.
+
+**Chỉ tab đang mở giữ trạng thái sống.** Các tab khác giữ một bản chụp, đổi tab là
+tráo bản chụp vào chỗ trạng thái sống. Cách này giữ nguyên khoảng 150 chỗ đang đọc
+`self.entries`, `self.prefix`, `self.selection`… thay vì phải sửa hết thành
+`self.tab().entries` — một lần refactor như thế trên 7500 dòng là mời lỗi vào nhà,
+để đổi lấy đúng một thứ: các tab chạy nền cùng lúc, mà tải nền cho tab không nhìn
+thấy thì cũng là tiền LIST tiêu cho cái không ai xem.
+
+Đổi tab mà tab đó chưa có gì thì mới nạp; có rồi thì hiện lại bản chụp, không tốn
+request nào.
+
+Trùng chỗ thì nhảy tới tab đang mở chứ không mở thêm — Brows3 gọi đây là "smart
+tab management" và nó đúng.
