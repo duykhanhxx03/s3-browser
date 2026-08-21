@@ -1096,3 +1096,26 @@ mờ phía sau; nắp, vành, ring accent của chip chọn còn nguyên; nhãn 
 tint đè (lớp chọn chèn trước nhãn). Chưa đo được chi phí GPU — một capture
 chung cho mọi control cộng một capture mỗi pane là thiết kế, nhưng con số là
 điều còn nợ.
+
+### 10.21 Revert liquid glass (22/08/2026)
+
+Theo yêu cầu: trả giao diện về trước khi làm liquid glass, tính năng khác giữ
+nguyên. Sau bốn vòng chỉnh (frost, kit, research, kính cho control), nhìn tổng
+thể vẫn không đạt — vòng cuối control-kính-shared còn tự đục lỗ xuyên pane vì
+đúng luật "kính không lấy mẫu kính". Cắt lỗ đúng chỗ:
+
+**Bỏ:** `GlassSpec` + token control trong theme (checkout thẳng bản trước
+kính); trait `LiquidGlass` — 11 dialog/popover về vỏ đục
+`bg(modal) + border_strong` cũ; kit control — nút/chip về style phẳng cũ,
+`BUTTON_HEIGHT` 22, `FIELD_HEIGHT` 26; **fork gpui** — gỡ `vendor/gpui` và
+`[patch.crates-io]`, build lại trên gpui crates.io, vì không còn ai gọi
+`paint_backdrop_glass` thì fork 8MB là gánh nặng chết. Toàn bộ nằm trong lịch
+sử git (3e48c59…f791ccd) nếu có ngày quay lại — cùng spec research §10.19 vẫn
+nguyên giá trị.
+
+**Giữ:** palette ⌘K bản làm lại (dòng tìm + keycap + footer); Escape đóng các
+dialog panel và ⌘K xuyên qua; mọi thứ trước mốc kính (sửa cửa sổ hẹp, thanh
+trạng thái, trang Gần đây / Tất cả bucket, hàng đợi gom nhóm…).
+
+Đã soi lại: hộp Cài đặt nền đục trắng, chip phẳng như cũ; palette giữ layout
+mới trên nền đục. 174 test pass trên gpui nguyên bản.

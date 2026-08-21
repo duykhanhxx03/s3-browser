@@ -5737,7 +5737,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -5905,7 +5908,10 @@ impl Browser {
                 .py_1()
                 .flex()
                 .flex_col()
-                .liquid_glass(theme)
+                        .rounded_lg()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
                 .children(places.into_iter().enumerate().map(|(index, place)| {
                     let target = place.clone();
                     let active = self.path_choice == Some(index);
@@ -6280,7 +6286,10 @@ impl Browser {
                         .max_h(px(PREVIEW_HEIGHT))
                         .flex()
                         .flex_col()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -6546,7 +6555,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Cài đặt"))
                         .child(settings_group("GIAO DIỆN", theme))
@@ -6777,7 +6789,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Giới thiệu"))
                         .child(setting_row(
@@ -6842,7 +6857,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child("Profile"))
                         .child(
@@ -8461,7 +8479,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
@@ -8679,7 +8700,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child(form.kind.title()))
                         // The preset comes first, because it decides what two
@@ -8818,7 +8842,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .child(div().text_color(theme.text).child("Đăng nhập AWS SSO"))
                         .when(flow.waiting, |this| {
                             this
@@ -8923,7 +8950,10 @@ impl Browser {
                         .h(px(PALETTE_HEIGHT))
                         .flex()
                         .flex_col()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         // The search line, drawn as a search line: icon, text,
                         // a caret. It used to be a bare string jammed into the
@@ -9075,7 +9105,10 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .liquid_glass(theme)
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
                         // Clicks inside the dialog must not reach the scrim.
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
@@ -9763,48 +9796,9 @@ fn sidebar_row(
         .child(label)
 }
 
-/// The one control material, shared by every button and chip.
-///
-/// A vertical gradient — brighter where a convex cap faces the key light,
-/// darker where it turns away — plus a hairline. This is what makes controls
-/// read as pieces of the same glass the panes are cut from; the flat grey
-/// wash each button used to carry read as a sticker on the pane.
-fn control_fill(theme: Theme) -> gpui::Background {
-    gpui::linear_gradient(
-        180.,
-        gpui::linear_color_stop(theme.control_top, 0.),
-        gpui::linear_color_stop(theme.control_bottom, 1.),
-    )
-}
-
-/// Hover is the cap catching a touch more light, not a different colour: the
-/// same gradient with both ends lifted.
-fn control_fill_hover(theme: Theme) -> gpui::Background {
-    let mut top = theme.control_top;
-    let mut bottom = theme.control_bottom;
-    top.a = (top.a * 1.5).min(1.);
-    bottom.a = (bottom.a * 1.5).min(1.);
-    gpui::linear_gradient(
-        180.,
-        gpui::linear_color_stop(top, 0.),
-        gpui::linear_color_stop(bottom, 1.),
-    )
-}
-
-/// Every plain control goes through here; the variants below only add their
-/// own colour on top. One place to change the material, thirty places wearing
-/// it.
-fn control_base(id: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
-    // Real glass under the cap. The shared-capture variant, so a toolbar of
-    // these costs one backdrop capture between them, not one each — correct
-    // because glass never samples other glass, and everything spatially
-    // beneath a control painted before it did. The gradient cap and hairline
-    // ride on top as the control's own lighting.
-    let mut frost = theme.modal;
-    frost.a = theme.glass.control_frost;
+fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .group("control")
         .h(px(BUTTON_HEIGHT))
         .px_2()
         .flex()
@@ -9812,45 +9806,12 @@ fn control_base(id: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .border_1()
-        .border_color(theme.control_border)
-        .child(
-            gpui::canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    window.paint_backdrop_glass_shared(
-                        bounds,
-                        gpui::Corners::all(px(6.)),
-                        // A control this small is nearly all rim: the band is
-                        // most of its height, which is exactly the full-lens
-                        // pill look the reference catalogs ship for buttons.
-                        px(8.),
-                        frost,
-                    );
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
-        // The cap gradient rides *over* the glass as its own layer. It cannot
-        // be this div's `.bg()`: an element paints its own background before
-        // its children, and the glass — opaque where it covers — would bury
-        // it. Hover goes through the group for the same reason.
-        .child(
-            div()
-                .absolute()
-                .inset_0()
-                .rounded_md()
-                .bg(control_fill(theme))
-                .group_hover("control", move |this| this.bg(control_fill_hover(theme))),
-        )
-}
-
-fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
-    control_base(id.into(), theme)
+        .bg(theme.hover)
         .text_color(theme.text)
+        .hover(|this| this.bg(theme.selected))
         .child(label)
 }
+
 
 /// A compact toggle showing what it is set to. The label is faint and the value
 /// is not, so the eye lands on the part that changes.
@@ -9860,11 +9821,22 @@ fn setting_chip(
     value: String,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    control_base(id.into(), theme)
+    div()
+        .id(id)
+        .h(px(BUTTON_HEIGHT))
+        .px_2()
+        .flex()
+        .items_center()
         .gap_1p5()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(theme.hover)
+        .hover(|this| this.bg(theme.selected))
         .child(div().text_color(theme.text_faint).child(label))
         .child(div().text_color(theme.text).child(SharedString::from(value)))
 }
+
 
 /// One `label: value` line in the inspector.
 fn detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElement {
@@ -10024,20 +9996,6 @@ fn action_button_dyn(
     label: SharedString,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    control_base(id, theme)
-        .text_color(theme.text)
-        .child(label)
-}
-
-fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
-    // The same convex cap as every other control, cut from red glass: the
-    // gradient runs between the danger colour lightened and darkened rather
-    // than the neutral fill. A flat red slab next to glass buttons read as a
-    // different toolkit.
-    let mut top = theme.danger;
-    top.l = (top.l + 0.06).min(1.);
-    let mut bottom = theme.danger;
-    bottom.l = (bottom.l - 0.05).max(0.);
     div()
         .id(id)
         .h(px(BUTTON_HEIGHT))
@@ -10046,17 +10004,29 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
         .items_center()
         .rounded_md()
         .text_xs()
+        .text_color(theme.text)
+        .bg(theme.hover)
+        .hover(|style| style.bg(theme.selected))
+        .child(label)
+}
+
+
+fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(BUTTON_HEIGHT))
+        .px_2()
+        .flex()
+        .items_center()
+        .py_1()
+        .rounded_md()
+        .text_xs()
         .cursor_pointer()
-        .bg(gpui::linear_gradient(
-            180.,
-            gpui::linear_color_stop(top, 0.),
-            gpui::linear_color_stop(bottom, 1.),
-        ))
-        .border_1()
-        .border_color(bottom)
+        .bg(theme.danger)
         .text_color(theme.text_on_accent)
         .child(label)
 }
+
 
 /// Why the sidebar's rows cannot be used, or `None` when they can.
 ///
@@ -10190,75 +10160,6 @@ fn queue_badge(stats: &transfer::Stats) -> Option<SharedString> {
     }
     None
 }
-
-/// Paints an element as a floating pane of liquid glass.
-///
-/// One method rather than a wrapper element, so the eleven dialogs that share
-/// this shape keep their own structure and only trade four style lines for one
-/// call. The light model lives in [`crate::theme::GlassSpec`]; this is just the
-/// brush that applies it: rim border, drop shadow, then three light overlays
-/// added as *first* children so every caller's own content paints on top of
-/// them.
-trait LiquidGlass: Styled + ParentElement + Sized {
-    fn liquid_glass(self, theme: Theme) -> Self {
-        let glass = theme.glass;
-        let (shadow_y, shadow_blur, shadow_spread) = glass.shadow_geometry;
-        // The pane itself: real backdrop glass from the forked renderer. The
-        // canvas is the first child, so it captures and blurs everything
-        // already on screen and every later child — the dialog's own content —
-        // paints on top of the pane.
-        //
-        // All the edge lighting lives in the glass shader now, on the SDF.
-        // Earlier versions layered horizontal gradient strips over the pane —
-        // a sheen band, a keel band, a 1px specular line — and straight bands
-        // over a curved rim read as a mockup: light that ignores the shape it
-        // sits on. The only things left out here are the ones a shader cannot
-        // own: the hairline border and the drop shadow.
-        let mut frost = theme.modal;
-        frost.a = glass.frost;
-        self.rounded_2xl()
-            .border_1()
-            .border_color(glass.rim)
-            .child(
-                gpui::canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, _| {
-                        window.paint_backdrop_glass(
-                            bounds,
-                            gpui::Corners::all(px(16.)),
-                            // The rim band: 24pt is the pane figure from the
-                            // reverse-engineered catalogs, and it is also the
-                            // peak displacement — the profile keeps the mean
-                            // well under it.
-                            px(24.),
-                            frost,
-                        );
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .shadow(vec![
-                gpui::BoxShadow {
-                    color: glass.shadow,
-                    offset: gpui::point(px(0.), px(shadow_y)),
-                    blur_radius: px(shadow_blur),
-                    spread_radius: px(shadow_spread),
-                },
-                // A tight contact shadow under the big soft one: the soft
-                // throw says "floating", this says "an edge is here". Either
-                // alone reads as a glow or a sticker.
-                gpui::BoxShadow {
-                    color: glass.shadow,
-                    offset: gpui::point(px(0.), px(1.)),
-                    blur_radius: px(3.),
-                    spread_radius: px(0.),
-                },
-            ])
-    }
-}
-
-impl<T: Styled + ParentElement> LiquidGlass for T {}
 
 /// A hairline between two groups on the status bar.
 ///
@@ -11729,27 +11630,21 @@ fn choice_chip(
     selected: bool,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    // The chosen chip is the same cap filled with the selection tint; the rest
-    // wear the shared control glass. Selection stays a colour, not a shape —
-    // a row of caps where one bulges differently reads as a broken row.
-    let base = control_base(id, theme)
-        .text_color(if selected { theme.text } else { theme.text_muted });
-    // The selection tint is an overlay for the same reason the cap gradient
-    // is: this div's own `.bg()` would paint under the glass and be buried.
-    // Inserted before the label so the text stays untinted on top.
-    let base = if selected {
-        base.border_color(theme.accent).child(
-            div()
-                .absolute()
-                .inset_0()
-                .rounded_md()
-                .bg(theme.selected),
-        )
-    } else {
-        base
-    };
-    base.child(label)
+    div()
+        .id(id)
+        .h(px(BUTTON_HEIGHT))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(if selected { theme.selected } else { theme.hover })
+        .text_color(if selected { theme.text } else { theme.text_muted })
+        .hover(|this| this.bg(theme.selected))
+        .child(label)
 }
+
 
 /// Whether a preview of an object that size holds all of it.
 ///
