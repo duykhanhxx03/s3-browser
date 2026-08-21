@@ -80,6 +80,9 @@ const ROW_NUMBER_WIDTH: f32 = 34.;
 /// The type column. Six characters is the longest thing `type_badge` will
 /// return, so nothing in it ever needs eliding.
 const TYPE_WIDTH: f32 = 52.;
+const CHECK_WIDTH: f32 = 22.;
+/// Three small icon buttons.
+const ACTIONS_WIDTH: f32 = 72.;
 /// Fixed, so tabs do not resize under the pointer as their titles change.
 const TAB_WIDTH: f32 = 132.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
@@ -4374,6 +4377,36 @@ impl Browser {
         }
     }
 
+    /// Makes one row the whole selection. What a per-row action button has to do
+    /// first: the actions below work on the selection, and acting on whatever
+    /// happened to be selected before would be a different object entirely.
+    fn select_only(&mut self, position: usize, cx: &mut Context<Self>) {
+        let Some(&entry_index) = self.visible.get(position) else {
+            return;
+        };
+        let key = self.entries[entry_index].key.clone();
+        self.selection.clear();
+        self.selection.insert(key.clone());
+        self.cursor = Some(key.clone());
+        self.anchor = Some(key);
+        cx.notify();
+    }
+
+    /// Adds or removes one row from the selection, leaving the rest alone.
+    /// What the tick box does, and what ⌘-click already did.
+    fn toggle_row(&mut self, position: usize, cx: &mut Context<Self>) {
+        let Some(&entry_index) = self.visible.get(position) else {
+            return;
+        };
+        let key = self.entries[entry_index].key.clone();
+        if !self.selection.remove(&key) {
+            self.selection.insert(key.clone());
+        }
+        self.cursor = Some(key.clone());
+        self.anchor = Some(key);
+        cx.notify();
+    }
+
     /// Takes a row number rather than an index into `entries`, because a
     /// Shift-range is a run of rows on screen and the two numbering schemes
     /// diverge the moment a filter is on.
@@ -5266,6 +5299,11 @@ impl Browser {
     fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let sort = self.sort;
+        let all_selected = !self.visible.is_empty()
+            && self
+                .visible
+                .iter()
+                .all(|&index| self.selection.contains(&self.entries[index].key));
 
         let header = |key: SortKey, label: &'static str| {
             let active = sort.key == key;
@@ -5310,6 +5348,28 @@ impl Browser {
                     .text_color(theme.text_faint)
                     .child("#"),
             )
+            // Select-all, in the place the per-row boxes are. Reflects the state
+            // rather than being a plain button: a tick that stays empty while
+            // every row below it is ticked is a control that lies.
+            .child(
+                div()
+                    .id("check-all")
+                    .w(px(CHECK_WIDTH))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(check_box(all_selected, theme))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if this.visible.iter().all(|&index| {
+                            this.selection.contains(&this.entries[index].key)
+                        }) {
+                            this.selection.clear();
+                            cx.notify();
+                        } else {
+                            this.select_all(cx);
+                        }
+                    })),
+            )
             .child(div().w(px(22.)))
             .child(
                 div().flex_1().child(header(SortKey::Name, "Tên").on_click(
@@ -5334,6 +5394,15 @@ impl Browser {
                     .child(header(SortKey::Modified, "Sửa đổi").on_click(cx.listener(
                         |this, _event, _window, cx| this.toggle_sort(SortKey::Modified, cx),
                     ))),
+            )
+            .child(
+                div()
+                    .w(px(ACTIONS_WIDTH))
+                    .flex()
+                    .justify_end()
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("Thao tác"),
             )
     }
 
@@ -5554,7 +5623,73 @@ impl Browser {
                         // clipboard, so it is decided per row rather than once.
                         let single = this.selection.len() <= 1;
                         let can_paste = this.clipboard.is_some();
-                        object_row(position, entry, selected, is_cursor, thumbnail, theme)
+                        let checkbox = div()
+                            .id(("check", position))
+                            .w(px(CHECK_WIDTH))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .child(check_box(selected, theme))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                // Or the row underneath also fires and turns a
+                                // tick into "select only this one".
+                                cx.stop_propagation();
+                                this.toggle_row(position, cx);
+                            }))
+                            .into_any_element();
+
+                        // Straight to the things worth one click, rather than
+                        // select-then-travel-to-the-toolbar. Only what applies:
+                        // a folder has nothing to preview and nothing to
+                        // download as one file.
+                        let actions = div()
+                            .w(px(ACTIONS_WIDTH))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_0p5()
+                            .when(!is_folder, |this| {
+                                this.child(
+                                    row_action(("row-preview", position), "eye", theme).on_click(
+                                        cx.listener(move |this, _event, _window, cx| {
+                                            cx.stop_propagation();
+                                            this.select_only(position, cx);
+                                            this.open_preview(cx);
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    row_action(("row-download", position), "download", theme)
+                                        .on_click(cx.listener(
+                                            move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.download_selection(cx);
+                                            },
+                                        )),
+                                )
+                            })
+                            .child(
+                                row_action(("row-info", position), "info", theme).on_click(
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.select_only(position, cx);
+                                        if this.inspector.is_none() {
+                                            this.toggle_inspector(cx);
+                                        } else {
+                                            this.open_inspector(cx);
+                                        }
+                                    }),
+                                ),
+                            )
+                            .into_any_element();
+
+                        object_row(
+                            position, entry, selected, is_cursor, thumbnail, checkbox, actions,
+                            theme,
+                        )
                             .on_click(cx.listener(
                             move |this, event: &ClickEvent, _window, cx| {
                                 // gpui 0.2.2 has no `on_double_click`, but the click
@@ -7515,6 +7650,12 @@ fn object_row(
     selected: bool,
     cursor: bool,
     thumbnail: Option<std::sync::Arc<gpui::Image>>,
+    // Built by the caller because it needs a listener of its own, and a listener
+    // needs the view's context. Its click must not also reach the row, or
+    // ticking a box would clear the selection and select that one row.
+    checkbox: gpui::AnyElement,
+    // Same reason as the checkbox.
+    actions: gpui::AnyElement,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let size_label = if entry.is_folder {
@@ -7563,6 +7704,11 @@ fn object_row(
                 .text_color(theme.text_faint)
                 .child(SharedString::from((position + 1).to_string())),
         )
+        // The checkbox. The row itself still selects on click, as it always
+        // did; this is the second way, for anyone who does not know that
+        // ⌘-click and ⇧-click are the first two. Brows3 has it, and so does
+        // every web file list.
+        .child(checkbox)
         .child(
             div()
                 .w(px(22.))
@@ -7619,9 +7765,11 @@ fn object_row(
         .child(
             div()
                 .w(px(132.))
+                .flex_shrink_0()
                 .text_color(theme.text_faint)
                 .child(SharedString::from(modified)),
         )
+        .child(actions)
 }
 
 // ------------------------------------------------------------------- helpers
@@ -8372,6 +8520,43 @@ fn needs_complete_listing(sort: Sort) -> bool {
 /// requests, and nobody agreed to that by clicking a column header.
 const COMPLETE_MAX_REQUESTS: usize = 100;
 const COMPLETE_MAX_KEYS: usize = 100_000;
+
+/// The tick itself, so the header box and the row boxes cannot drift apart.
+/// A small icon button for the actions column. Quieter than the toolbar's: one
+/// of these per row at full weight would be a wall of icons down the side of
+/// the list.
+fn row_action(
+    id: impl Into<gpui::ElementId>,
+    name: &'static str,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(20.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.selected))
+        .child(sized_icon(name, 13., theme.text_faint))
+}
+
+fn check_box(checked: bool, theme: Theme) -> impl IntoElement {
+    div()
+        .size(px(14.))
+        .flex_shrink_0()
+        .rounded_sm()
+        .border_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .border_color(if checked { theme.accent } else { theme.border_strong })
+        .when(checked, |this| this.bg(theme.accent))
+        .when(checked, |this| {
+            this.child(sized_icon("check", 10., theme.text_on_accent))
+        })
+}
 
 /// The extension, as a chip beside the name.
 ///
