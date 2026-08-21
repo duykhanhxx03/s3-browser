@@ -32,8 +32,8 @@ macro_rules! icons {
 
 icons![
     "arrow-up", "check", "chevron-down", "chevron-up", "close", "copy", "cut", "download",
-    "duplicate", "external", "eye", "file", "folder", "info", "link", "paste", "pause", "play",
-    "more", "plus", "refresh", "rename", "search", "trash", "upload",
+    "duplicate", "external", "eye", "file", "folder", "info", "link", "pause", "play",
+    "more", "paste", "path", "plus", "refresh", "rename", "search", "trash", "upload",
 ];
 
 /// The UI typeface, embedded so every machine renders the same.

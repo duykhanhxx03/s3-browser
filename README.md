@@ -40,6 +40,7 @@ hoá luôn cái kho khoá.
 | `⌘R` | Tải lại prefix hiện tại |
 | `⌘T` / `⌘W` | Tab mới / đóng tab |
 | `⌘1`…`⌘9` | Chuyển tab (`⌘9` là tab cuối) |
+| `⌘L` | Gõ thẳng đường dẫn `s3://bucket/prefix/` |
 | `⌘⌫` | Xoá các mục đang chọn |
 | `⌘↑` | Lên một cấp |
 | `↑` `↓` | Đổi dòng đang chọn |

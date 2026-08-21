@@ -530,9 +530,10 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
 ### UI
 
 1. ~~**Tab**~~ — xong (21/08/2026). Xem §9.1.
-2. **Ô đường dẫn `s3://bucket/prefix/`** ở thanh trên, gõ vào là tới thẳng. App
-   đang có "Mở bucket theo tên" nhưng không dán được một đường dẫn đầy đủ. Với
-   token không có `ListBuckets` thì đây là lối vào chính chứ không phải lối phụ.
+2. ~~**Ô đường dẫn `s3://bucket/prefix/`**~~ — xong (21/08/2026). Breadcrumb bấm
+   vào là thành ô nhập, `⌘L` cũng vậy. Nhận cả dạng không có `s3://`, tự thêm dấu
+   `/` cuối, và nếu đường dẫn ghi region khác profile thì nói ngay chứ không để
+   request đi lạc endpoint.
 3. **Favorites và Recent** ở sidebar. Prefix hay dùng nằm sâu ba bốn cấp là chuyện
    thường, mà đường duy nhất tới đó hiện giờ là bấm từng cấp.
 4. **Nhãn loại tệp** cạnh tên (PNG, JSON, PDF). Rẻ, và đọc nhanh hơn phần đuôi.

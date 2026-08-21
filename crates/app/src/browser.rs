@@ -552,6 +552,11 @@ pub struct Browser {
     /// What the filter field holds, mirrored here so the list can be narrowed
     /// without reading the widget on every frame.
     filter: String,
+    /// The breadcrumb, turned into a text field. `Some` only while it is being
+    /// edited: a permanent second input in the toolbar would crowd out the
+    /// breadcrumb it duplicates.
+    path_input: Option<Entity<InputState>>,
+    path_editing: bool,
     /// The filter field itself. A real input rather than a key-capture bar: it
     /// is on screen all the time now, and a permanent field that cannot take a
     /// paste or a cursor key is a worse lie than no field at all.
@@ -658,6 +663,7 @@ pub struct Browser {
     /// reacting to what is typed into it.
     _filter_events: Option<Subscription>,
     _bucket_filter_events: Option<Subscription>,
+    _path_events: Option<Subscription>,
 }
 
 impl Browser {
@@ -687,6 +693,33 @@ impl Browser {
                 cx.notify();
             });
         });
+
+        let path_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("s3://bucket/prefix/")
+        });
+        let path_events = cx.subscribe_in(
+            &path_input,
+            window,
+            |this: &mut Self, state, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::PressEnter { .. } => {
+                        let text = state.read(cx).value().to_string();
+                        this.go_to_path(&text, cx);
+                        this.path_editing = false;
+                        this.focus.focus(window);
+                        cx.notify();
+                    }
+                    // Clicking away is the same as changing your mind, and
+                    // leaving the field open over a breadcrumb that no longer
+                    // matches it is worse than closing it.
+                    InputEvent::Blur => {
+                        this.path_editing = false;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            },
+        );
 
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
@@ -778,6 +811,8 @@ impl Browser {
             generation: 0,
             sort: Sort::default(),
             filter: String::new(),
+            path_input: Some(path_input),
+            path_editing: false,
             filter_input: Some(filter_input),
             selection: HashSet::new(),
             cursor: None,
@@ -826,6 +861,7 @@ impl Browser {
             _appearance: Some(appearance),
             _filter_events: Some(filter_events),
             _bucket_filter_events: Some(bucket_filter_events),
+            _path_events: Some(path_events),
         };
 
         if !this.profiles.is_empty() {
@@ -1808,6 +1844,68 @@ impl Browser {
         }
     }
 
+    /// Navigates to a typed or pasted `s3://` path.
+    ///
+    /// The way in when the token cannot list buckets, which is the setup R2's
+    /// own documentation recommends — so this is a main road, not a shortcut.
+    /// Turns the breadcrumb into an editable path.
+    fn edit_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.path_input.clone() else {
+            return;
+        };
+        // Prefilled with where we are, so the common case is editing the tail
+        // rather than retyping the bucket.
+        let current = match self.bucket.as_ref() {
+            Some(bucket) => format!("s3://{bucket}/{}", self.prefix),
+            None => String::new(),
+        };
+        self.path_editing = true;
+        input.update(cx, |input, cx| {
+            input.set_value(current, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn go_to_path(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(path) = parse_s3_path(text) else {
+            if !text.trim().is_empty() {
+                self.fail(Failure::known(
+                    "Không đọc được đường dẫn",
+                    format!("{text}\nDạng đúng: s3://bucket/prefix/"),
+                    None,
+                ));
+                cx.notify();
+            }
+            return;
+        };
+
+        // A region in the path that is not the profile's would reach a
+        // different endpoint, so the request fails somewhere far from here with
+        // a message about redirects. Better to say it while the path is still
+        // on screen.
+        if let Some(region) = path.region {
+            let profile = self
+                .active_profile
+                .and_then(|index| self.profiles.get(index))
+                .map(|profile| profile.region.clone());
+            if profile.as_deref() != Some(region.as_str()) {
+                self.fail(Failure::known(
+                    "Đường dẫn ghi region khác với profile",
+                    format!(
+                        "Đường dẫn: {region}\nProfile: {}",
+                        profile.as_deref().unwrap_or("chưa có")
+                    ),
+                    Some(Fix::EditProfile),
+                ));
+                cx.notify();
+                return;
+            }
+        }
+
+        self.open(path.bucket.into(), path.prefix, cx);
+    }
+
     /// `photos/2026/` → [("photos", "photos/"), ("2026", "photos/2026/")]
     fn breadcrumbs(&self) -> Vec<(SharedString, String)> {
         let mut crumbs = Vec::new();
@@ -2782,6 +2880,11 @@ impl Browser {
                 if let Some(window) = window {
                     let index = self.active_tab;
                     self.close_tab(index, window, cx);
+                }
+            }
+            Command::GoToPath => {
+                if let Some(window) = window {
+                    self.edit_path(window, cx);
                 }
             }
             Command::Filter => {
@@ -4120,6 +4223,7 @@ impl Browser {
                 "i" => return self.toggle_inspector(cx),
                 "k" => return self.open_palette(cx),
                 "t" => return self.new_tab(window, cx),
+                "l" => return self.edit_path(window, cx),
                 // ⌘1 to ⌘9, like every browser. ⌘9 is the last tab rather than
                 // the ninth, which is also what every browser does and what the
                 // hand means by it.
@@ -4158,6 +4262,17 @@ impl Browser {
                 "enter" if !self.filter_focused(window, cx) => return self.open_cursor(cx),
                 _ => {}
             }
+        }
+
+        if self.path_editing {
+            if keystroke.key == "escape" {
+                self.path_editing = false;
+                self.focus.focus(window);
+                cx.notify();
+            }
+            // Enter is the field's, through `PressEnter`; everything else is
+            // typing.
+            return;
         }
 
         // Everything below is for the list, so it must not steal the keys that
@@ -4751,8 +4866,22 @@ impl Browser {
                     },
                 )),
             )
+            // While the path is being edited the field takes the breadcrumb's
+            // place rather than sitting beside it: they say the same thing, and
+            // two of them disagreeing mid-edit is worse than one.
+            .when_some(
+                self.path_input.clone().filter(|_| self.path_editing),
+                |this, input| {
+                    this.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(Input::new(&input).h(px(FIELD_HEIGHT))),
+                    )
+                },
+            )
             // Breadcrumb: bucket name, then one segment per prefix level.
-            .child(
+            .when(!self.path_editing, |this| this.child(
                 div()
                     .flex_1()
                     .flex()
@@ -4787,8 +4916,29 @@ impl Browser {
                                     }
                                 })),
                             )
-                    })),
-            )
+                    }))
+                    // The rest of the bar. Clicking the empty space beside a
+                    // path to edit it is what file managers do, but empty space
+                    // announces nothing, which is what the button beside it is
+                    // for.
+                    .child(
+                        div()
+                            .id("path-space")
+                            .flex_1()
+                            .h_full()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.edit_path(window, cx)
+                            })),
+                    ),
+            ))
+            .when(!self.path_editing && self.bucket.is_some(), |this| {
+                this.child(
+                    icon_button("edit-path", "path", theme).on_click(cx.listener(
+                        |this, _event, window, cx| this.edit_path(window, cx),
+                    )),
+                )
+            })
             // On screen always, not behind ⌘F. A filter you cannot see is a
             // filter you forget is on, and then the list is missing rows for no
             // reason you can point at. ⌘F now moves the caret here rather than
@@ -7930,6 +8080,60 @@ fn form_label_width(kind: &FormKind) -> f32 {
     (longest as f32 * CHAR_WIDTH + 8.0).max(84.)
 }
 
+/// A location typed or pasted as a path.
+#[derive(Debug, PartialEq, Eq)]
+pub struct S3Path {
+    pub bucket: String,
+    pub prefix: String,
+    /// The `bucket@region` form some tools print. Carried rather than dropped:
+    /// the endpoint comes from the profile, so a path naming a different region
+    /// would silently go somewhere else, and the caller has to be able to say so.
+    pub region: Option<String>,
+}
+
+/// Reads `s3://bucket/prefix/`, or the same thing without the scheme.
+///
+/// This is how a bucket gets reached when the token cannot list buckets — the
+/// normal setup on R2 — so it takes the forms people actually have in their
+/// clipboard rather than one canonical spelling.
+fn parse_s3_path(text: &str) -> Option<S3Path> {
+    let text = text.trim();
+    let text = text.strip_prefix("s3://").unwrap_or(text);
+    // Leading slashes are not trimmed on purpose: `s3:///photos/` names an
+    // empty bucket, and trimming would silently promote the first path segment
+    // into the bucket and open something the person did not type.
+
+    let (bucket, prefix) = match text.split_once('/') {
+        Some((bucket, prefix)) => (bucket, prefix),
+        None => (text, ""),
+    };
+    if bucket.is_empty() {
+        return None;
+    }
+
+    let (bucket, region) = match bucket.split_once('@') {
+        Some((bucket, region)) if !bucket.is_empty() && !region.is_empty() => {
+            (bucket, Some(region.to_string()))
+        }
+        // An `@` with nothing on one side is a typo, not a region.
+        Some(_) => return None,
+        None => (bucket, None),
+    };
+
+    // A prefix listing needs the trailing slash or the delimiter returns
+    // nothing; typing it is not something anyone should have to remember.
+    let prefix = match prefix.trim_end_matches('/') {
+        "" => String::new(),
+        trimmed => format!("{trimmed}/"),
+    };
+
+    Some(S3Path {
+        bucket: bucket.to_string(),
+        prefix,
+        region,
+    })
+}
+
 /// Whether a sort can be answered by the order S3 already returns.
 ///
 /// `ListObjectsV2` gives lexicographic order and nothing else, so name-ascending
@@ -8048,6 +8252,7 @@ pub enum Command {
     EditHeaders,
     NewTab,
     CloseTab,
+    GoToPath,
     GoUp,
     Filter,
     NewFolder,
@@ -8083,6 +8288,7 @@ impl Command {
             Command::EditHeaders => ("Sửa header", ""),
             Command::NewTab => ("Tab mới", "⌘T"),
             Command::CloseTab => ("Đóng tab", "⌘W"),
+            Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -8105,7 +8311,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 26] {
+    fn all() -> [Command; 27] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -8133,6 +8339,7 @@ impl Command {
             Command::EditHeaders,
             Command::NewTab,
             Command::CloseTab,
+            Command::GoToPath,
         ]
     }
 }
@@ -8356,6 +8563,8 @@ mod tests {
             generation: 0,
             sort: Sort::default(),
             filter: String::new(),
+            path_input: None,
+            path_editing: false,
             filter_input: None,
             selection: HashSet::new(),
             cursor: None,
@@ -8404,6 +8613,7 @@ mod tests {
             _appearance: None,
             _filter_events: None,
             _bucket_filter_events: None,
+            _path_events: None,
         };
         browser.resort_and_filter();
         browser
@@ -9073,7 +9283,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 26);
+        assert_eq!(all.len(), 27);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -9197,6 +9407,62 @@ mod tests {
             assert_eq!(browser.filter, "b");
             assert_eq!(browser.sort.key, SortKey::Size);
         });
+    }
+
+    #[test]
+    fn a_pasted_path_is_read_in_every_shape_it_arrives_in() {
+        let path = |text: &str| parse_s3_path(text).map(|p| (p.bucket, p.prefix, p.region));
+
+        // The canonical form, and the same thing with the scheme left off —
+        // both are what ends up in a clipboard.
+        assert_eq!(
+            path("s3://demo-bucket/photos/2026/"),
+            Some(("demo-bucket".into(), "photos/2026/".into(), None))
+        );
+        assert_eq!(
+            path("demo-bucket/photos/2026"),
+            Some(("demo-bucket".into(), "photos/2026/".into(), None))
+        );
+
+        // The trailing slash is added, because a prefix listing without it
+        // returns nothing and nobody should have to know that.
+        assert_eq!(
+            path("s3://demo-bucket/photos"),
+            Some(("demo-bucket".into(), "photos/".into(), None))
+        );
+
+        // Just a bucket, with or without the slash.
+        assert_eq!(
+            path("s3://demo-bucket"),
+            Some(("demo-bucket".into(), String::new(), None))
+        );
+        assert_eq!(
+            path("s3://demo-bucket/"),
+            Some(("demo-bucket".into(), String::new(), None))
+        );
+
+        // Whitespace from a copy-paste.
+        assert_eq!(
+            path("  s3://demo-bucket/x/  "),
+            Some(("demo-bucket".into(), "x/".into(), None))
+        );
+
+        // The `bucket@region` form other tools print. Kept, not dropped: the
+        // endpoint comes from the profile, so a path naming another region
+        // would quietly go somewhere else.
+        assert_eq!(
+            path("s3://demo-bucket@eu-west-1/x/"),
+            Some(("demo-bucket".into(), "x/".into(), Some("eu-west-1".into())))
+        );
+
+        // Nothing to go to.
+        assert_eq!(path(""), None);
+        assert_eq!(path("s3://"), None);
+        assert_eq!(path("s3:///photos/"), None);
+        // A stray `@` is a typo, and guessing which half is the bucket would
+        // send someone to a bucket they did not name.
+        assert_eq!(path("s3://demo-bucket@/x"), None);
+        assert_eq!(path("s3://@eu-west-1/x"), None);
     }
 
     #[test]
