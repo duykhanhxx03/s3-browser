@@ -82,6 +82,9 @@ const ROW_NUMBER_WIDTH: f32 = 34.;
 /// return, so nothing in it ever needs eliding.
 const TYPE_WIDTH: f32 = 52.;
 const CHECK_WIDTH: f32 = 22.;
+/// How long a bucket list stays good for. Buckets are created rarely and the
+/// list costs a request every time a profile is opened.
+const BUCKET_CACHE_TTL: i64 = 30 * 60;
 /// Three small icon buttons.
 const ACTIONS_WIDTH: f32 = 72.;
 /// How many recent places the sidebar lists. The store keeps more; this is what
@@ -576,6 +579,20 @@ pub struct Browser {
 
     client: Option<S3Client>,
     buckets: Vec<SharedString>,
+    /// The bucket list per profile, with when it was fetched.
+    ///
+    /// `ListBuckets` is one request and one bill line every time a profile is
+    /// switched to, and the answer changes about as often as someone creates a
+    /// bucket — which is to say rarely. In memory rather than on disk: a stale
+    /// list after a restart is a list nobody asked for, and the first request of
+    /// a session has to happen anyway.
+    bucket_cache: HashMap<String, (Vec<SharedString>, i64)>,
+    /// Whether what the sidebar shows came from that cache. Said out loud,
+    /// because a bucket someone just made in the console not appearing is
+    /// otherwise indistinguishable from the app being broken.
+    buckets_cached: bool,
+    /// Set for one connect, by the refresh control.
+    bucket_cache_bypass: bool,
     /// Narrows the sidebar. Only exists once there are enough buckets for the
     /// list to be worth narrowing — see `BUCKET_FILTER_MIN`.
     bucket_filter: String,
@@ -865,6 +882,9 @@ impl Browser {
             settings_open: false,
             client: None,
             buckets: Vec::new(),
+            bucket_cache: HashMap::new(),
+            buckets_cached: false,
+            bucket_cache_bypass: false,
             bucket_filter: String::new(),
             bucket_filter_input: Some(bucket_filter_input),
             bucket: None,
@@ -1003,7 +1023,17 @@ impl Browser {
             }
         };
 
+        // A list fetched minutes ago is the same list, and the request is not
+        // free. The refresh control beside the header forces past it.
+        let cached = self
+            .bucket_cache
+            .get(&stored.id)
+            .filter(|(_, at)| !self.bucket_cache_bypass && s3core::now_epoch() - at < BUCKET_CACHE_TTL)
+            .map(|(buckets, _)| buckets.clone());
+        self.bucket_cache_bypass = false;
+
         self.active_profile = Some(index);
+        self.buckets_cached = cached.is_some();
         self.client = None;
         self.buckets.clear();
         self.bucket = None;
@@ -1023,13 +1053,24 @@ impl Browser {
             relaxed_checksums: stored.relaxed_checksums,
         };
 
+        let profile_id = stored.id.clone();
+
         let connecting = Tokio::spawn(cx, async move {
             let client = S3Client::connect(&profile).await?;
             // Not `?`: a token scoped to one bucket — the normal, recommended
             // setup on R2 — is denied ListBuckets while the bucket itself works
             // fine. Failing the whole connection here left those users with no
             // way in at all.
-            let buckets = client.list_buckets().await;
+            let buckets = match cached {
+                Some(cached) => {
+                    debug_log!("buckets from cache: {}", cached.len());
+                    Ok(cached.iter().map(|b| b.to_string()).collect())
+                }
+                None => {
+                    debug_log!("buckets: asking the provider");
+                    client.list_buckets().await
+                }
+            };
             anyhow::Ok((client, buckets))
         });
 
@@ -1041,7 +1082,21 @@ impl Browser {
                     Ok(Ok((client, listed))) => {
                         let buckets = match listed {
                             Ok(buckets) => {
-                                this.status = format!("{} bucket", buckets.len()).into();
+                                this.status = SharedString::default();
+                                this.bucket_cache.insert(
+                                    profile_id.clone(),
+                                    (
+                                        buckets.iter().cloned().map(SharedString::from).collect(),
+                                        // Not refreshed on a cache hit: the age
+                                        // shown has to be the age of the answer,
+                                        // not of the last time it was reused.
+                                        this.bucket_cache
+                                            .get(&profile_id)
+                                            .map(|(_, at)| *at)
+                                            .filter(|_| this.buckets_cached)
+                                            .unwrap_or_else(s3core::now_epoch),
+                                    ),
+                                );
                                 buckets
                             }
                             Err(error) => {
@@ -2021,6 +2076,43 @@ impl Browser {
         cx.notify();
     }
 
+    /// Re-lists the buckets, past the cache.
+    ///
+    /// Only the list. Going through `connect` would rebuild the client and
+    /// navigate back to the first bucket, which is a strange thing for a button
+    /// labelled "refresh the sidebar" to do.
+    fn refresh_buckets(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(profile)) = (
+            self.client.clone(),
+            self.active_profile
+                .and_then(|ix| self.profiles.get(ix))
+                .map(|profile| profile.id.clone()),
+        ) else {
+            return;
+        };
+
+        let listing = Tokio::spawn(cx, async move { client.list_buckets().await });
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = listing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(buckets)) => {
+                        let buckets: Vec<SharedString> =
+                            buckets.into_iter().map(SharedString::from).collect();
+                        this.bucket_cache
+                            .insert(profile, (buckets.clone(), s3core::now_epoch()));
+                        this.buckets = buckets;
+                        this.buckets_cached = false;
+                    }
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
+                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn save_places(&mut self) {
         let Some(store) = self.place_store.as_ref() else {
             return;
@@ -2260,7 +2352,20 @@ impl Browser {
         self.op_task = Some(task);
     }
 
+    /// Creating a bucket makes any remembered list wrong, so the entry goes.
+    fn forget_bucket_cache(&mut self) {
+        if let Some(profile) = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .map(|profile| profile.id.clone())
+        {
+            self.bucket_cache.remove(&profile);
+        }
+        self.buckets_cached = false;
+    }
+
     fn create_bucket(&mut self, name: String, cx: &mut Context<Self>) {
+        self.forget_bucket_cache();
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -4751,17 +4856,56 @@ impl Browser {
             .border_color(theme.border)
             .children(self.render_places(cx))
             .child(
-                section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
-                    |this, _event, window, cx| {
-                        if this.client.is_some() {
-                            // Opening by name rather than creating: a scoped
-                            // token is denied CreateBucket too, and reaching an
-                            // existing bucket is the far more common need.
-                            this.open_form(FormKind::OpenBucket, window, cx);
-                        }
-                    },
-                )),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(section_header("BUCKETS", "add-bucket", theme).on_click(
+                                cx.listener(|this, _event, window, cx| {
+                                    if this.client.is_some() {
+                                        // Opening by name rather than creating:
+                                        // a scoped token is denied CreateBucket
+                                        // too, and reaching a bucket that exists
+                                        // is the far more common need.
+                                        this.open_form(FormKind::OpenBucket, window, cx);
+                                    }
+                                }),
+                            )),
+                    )
+                    // Only when the list is a remembered one. A refresh button
+                    // beside a list that was just fetched is a button that does
+                    // nothing, and the note beside it would be a lie.
+                    .when(self.buckets_cached, |this| {
+                        this.child(
+                            div()
+                                .id("buckets-refresh")
+                                .size(px(20.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|this| this.bg(theme.hover))
+                                .child(sized_icon("refresh", 11., theme.text_faint))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.refresh_buckets(cx)
+                                })),
+                        )
+                    }),
             )
+            .when(self.buckets_cached, |this| {
+                this.child(
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child("từ bộ nhớ tạm"),
+                )
+            })
             // Only past a threshold. Under a dozen buckets the whole list is
             // on screen already, and a search box over four rows is a control
             // nobody will ever use taking space from the rows they will.
@@ -9513,6 +9657,9 @@ mod tests {
             settings_open: false,
             client: None,
             buckets: Vec::new(),
+            bucket_cache: HashMap::new(),
+            buckets_cached: false,
+            bucket_cache_bypass: false,
             bucket_filter: String::new(),
             bucket_filter_input: None,
             bucket: Some("demo".into()),

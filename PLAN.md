@@ -559,7 +559,8 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
 11. ~~**Trần cho tìm kiếm sâu**~~ — xong (21/08/2026). 100 yêu cầu / 100.000 mục
     / 10.000 kết quả, và "chạm trần" là một trạng thái riêng chứ không lẫn vào
     "xong" hay "đã dừng".
-12. **Cache danh sách bucket** theo profile. Brows3 để 30 phút.
+12. ~~**Cache danh sách bucket**~~ — xong (21/08/2026). 30 phút, trong bộ nhớ,
+    theo profile; sidebar nói rõ "từ bộ nhớ tạm" và có nút làm mới.
 13. **Chép đường dẫn `s3://`** và key, không chỉ URL công khai.
 14. **ACL đệ quy cho cả prefix**, không chỉ cho vùng đang chọn.
 15. **Xoá lùi về từng object** khi provider từ chối `DeleteObjects`. Đây là ca
