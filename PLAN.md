@@ -729,7 +729,7 @@ của toolbar**. Tệ hơn: cắt thì cắt phần **đuôi**, tức là đúng
 đứng đâu. `elide_middle` đã dùng cho nơi đã ghim ở sidebar rồi, chỉ là chưa dùng
 ở đây.
 
-**b. Thanh đường dẫn gợi ý nơi vừa tới.** `⌘L` của họ là một autocomplete lấy
+**b. ~~Thanh đường dẫn gợi ý nơi vừa tới~~** — xong (21/08/2026). `⌘L` của họ là một autocomplete lấy
 `recentPaths` làm options, mỗi dòng có icon đồng hồ, và cuối danh sách có link
 "xoá lịch sử". Mình vừa dựng đúng cái kho dữ liệu đó (§9.3) mà thanh đường dẫn
 vẫn gõ chay. Placeholder của họ còn dạy luôn cú pháp:

@@ -94,6 +94,12 @@ const TAB_WIDTH: f32 = 132.;
 /// rest into `…`. Three plus the bucket is four things on screen, which is
 /// about what fits beside the filter box and the toolbar buttons.
 const CRUMBS_SHOWN: usize = 3;
+/// How many places the path box offers. Enough to cover a morning's jumping
+/// about, few enough that the list does not cover the thing it is helping you
+/// get back to.
+const PATH_SUGGESTIONS: usize = 8;
+/// Wide enough for `bucket/prefix/deeper/` without being as wide as the window.
+const PATH_SUGGEST_WIDTH: f32 = 460.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
 /// the log without bound otherwise, and nobody reads the fiftieth copy.
 const FAILURE_LIMIT: usize = 50;
@@ -715,6 +721,14 @@ pub struct Browser {
     /// The preview overlay, when one is open.
     previewing: Option<Previewing>,
     screen: Screen,
+    /// Whether the path box is showing where you have been.
+    ///
+    /// Driven by the field's own focus events rather than by whatever opened
+    /// it, so clicking into the box gets the same list that ⌘L does.
+    path_suggesting: bool,
+    /// Which suggestion the arrow keys are on. `None` means "none of them" —
+    /// Enter then goes to whatever is typed, which is what the box is for.
+    path_choice: Option<usize>,
     preview_task: Option<Task<()>>,
     /// Loading the rest of a prefix so the current sort is exact.
     completing: Option<Completing>,
@@ -810,10 +824,40 @@ impl Browser {
         let path_events = cx.subscribe_in(
             &path_input,
             window,
-            |this: &mut Self, state, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    let text = state.read(cx).value().to_string();
-                    this.go_to_path(&text, cx);
+            |this: &mut Self, state, event: &InputEvent, window, cx| match event {
+                // Focus rather than whatever opened the box: clicking into it
+                // has to offer the same list ⌘L does.
+                InputEvent::Focus => {
+                    this.path_suggesting = true;
+                    this.path_choice = None;
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.path_suggesting = false;
+                    cx.notify();
+                }
+                InputEvent::Change => {
+                    // The highlighted row belonged to the old list; keeping the
+                    // index would point it at a different place.
+                    this.path_choice = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    // A highlighted suggestion wins over the text, because the
+                    // text is the *old* text — arrowing down does not rewrite
+                    // the box, so what is typed is not what is chosen.
+                    let chosen = this
+                        .path_choice
+                        .and_then(|index| this.path_suggestions(cx).get(index).cloned());
+                    match chosen {
+                        Some(place) => this.open_place(&place, cx),
+                        None => {
+                            let text = state.read(cx).value().to_string();
+                            this.go_to_path(&text, cx);
+                        }
+                    }
+                    this.path_suggesting = false;
+                    this.path_choice = None;
                     // Back to the list, so the arrow keys work again without a
                     // trip to the mouse.
                     this.focus.focus(window);
@@ -959,6 +1003,8 @@ impl Browser {
             next_tab_id: 1,
             previewing: None,
             screen: Screen::default(),
+            path_suggesting: false,
+            path_choice: None,
             preview_task: None,
             completing: None,
             bulk: None,
@@ -2035,6 +2081,57 @@ impl Browser {
             input.set_value(current, window, cx);
             input.focus(window, cx);
         });
+        self.path_choice = None;
+        cx.notify();
+    }
+
+    /// Where you have been, as suggestions under the path box.
+    ///
+    /// The same list the Gần đây page draws, narrowed to what is typed. Here it
+    /// answers a different question though: not "where have I been" but "is the
+    /// place I am about to type already one keystroke away".
+    fn path_suggestions(&self, cx: &App) -> Vec<Place> {
+        let Some(profile) = self.places_profile() else {
+            return Vec::new();
+        };
+        let typed = self
+            .path_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        // Text that is still just *where you are* is not a filter. Both ways
+        // into this box put it there — ⌘L prefills it, and the box shows the
+        // current location the rest of the time — so filtering by it would
+        // leave only the places underneath here, which is a suggestion list
+        // that hides everywhere you have been.
+        //
+        // Compared rather than flagged: a flag has to be cleared, and the
+        // `Change` that `set_value` itself fires arrives *after* the line that
+        // sets it. That ordering is exactly what made this list come up empty.
+        let here_text = self
+            .bucket
+            .as_ref()
+            .map(|bucket| format!("s3://{bucket}/{}", self.prefix));
+        let needle = if Some(&typed) == here_text.as_ref() {
+            String::new()
+        } else {
+            fold(typed.trim_start_matches("s3://"))
+        };
+        let here = self.here();
+        self.places
+            .recent_for_profile(profile)
+            .filter(|place| Some(*place) != here.as_ref())
+            .filter(|place| needle.is_empty() || fold(&place.label()).contains(&needle))
+            .take(PATH_SUGGESTIONS)
+            .cloned()
+            .collect()
+    }
+
+    fn move_path_choice(&mut self, down: bool, count: usize, cx: &mut Context<Self>) {
+        if count == 0 {
+            return;
+        }
+        self.path_choice = next_choice(self.path_choice, down, count);
         cx.notify();
     }
 
@@ -4919,6 +5016,16 @@ impl Browser {
             }
         }
 
+        // The path box takes the arrows back while it is offering places —
+        // otherwise they walk the file list *behind* the open suggestion list,
+        // which is both invisible and not what was asked for. Above the block
+        // below rather than in the `path_focused` branch further down, because
+        // that branch never sees an arrow key: this one returns first.
+        if !primary && self.path_suggesting && matches!(keystroke.key.as_str(), "down" | "up") {
+            let count = self.path_suggestions(cx).len();
+            return self.move_path_choice(keystroke.key == "down", count, cx);
+        }
+
         // Arrows and Enter reach the list even while the caret is in the filter
         // field. A one-line input has nothing to do with up and down, and
         // narrowing the list then walking it should be one gesture rather than
@@ -4927,10 +5034,13 @@ impl Browser {
             match keystroke.key.as_str() {
                 "down" => return self.move_cursor(true, keystroke.modifiers.shift, cx),
                 "up" => return self.move_cursor(false, keystroke.modifiers.shift, cx),
-                // Only when the caret is not in the field: there Enter means
-                // "search the bucket", and opening the highlighted row as well
-                // would throw the results away in the same keystroke.
-                "enter" if !self.filter_focused(window, cx) => return self.open_cursor(cx),
+                // Only when the caret is in neither box. In the filter Enter
+                // means "search the bucket", and in the path box it means "go
+                // there" — opening the highlighted row as well would throw away
+                // what was just asked for, in the same keystroke.
+                "enter" if !self.filter_focused(window, cx) && !self.path_focused(window, cx) => {
+                    return self.open_cursor(cx)
+                }
                 _ => {}
             }
         }
@@ -4953,9 +5063,14 @@ impl Browser {
         // Typing in the path box: Escape hands the keyboard back to the list,
         // everything else is the field's.
         if self.path_focused(window, cx) {
-            if keystroke.key == "escape" {
-                self.focus.focus(window);
-                cx.notify();
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.path_suggesting = false;
+                    self.path_choice = None;
+                    self.focus.focus(window);
+                    cx.notify();
+                }
+                _ => {}
             }
             return;
         }
@@ -5581,6 +5696,79 @@ impl Browser {
                                 }),
                         ),
                 ),
+        )
+    }
+
+    /// Places under the path box, while it has the caret.
+    ///
+    /// Drawn from the root rather than inside the title bar so it paints over
+    /// the list instead of under it — the same ordering problem the command
+    /// palette had. Its own width rather than the field's, because matching a
+    /// `flex_1` field means measuring a layout that is not finished yet, and a
+    /// suggestion panel is allowed to be its own size.
+    fn render_path_suggestions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.path_suggesting {
+            return None;
+        }
+        let theme = self.theme;
+        let places = self.path_suggestions(cx);
+        if places.is_empty() {
+            return None;
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top(px(TOOLBAR_HEIGHT + 2.))
+                .left(px(platform::toolbar_leading_inset()))
+                .w(px(PATH_SUGGEST_WIDTH))
+                .py_1()
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
+                .children(places.into_iter().enumerate().map(|(index, place)| {
+                    let target = place.clone();
+                    let active = self.path_choice == Some(index);
+                    div()
+                        .id(SharedString::from(format!("path-suggest-{index}")))
+                        .h(px(ROW_HEIGHT))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(active, |this| this.bg(theme.selected))
+                        .hover(|this| this.bg(theme.hover))
+                        .child(sized_icon("clock", 12., theme.text_faint))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_color(theme.text)
+                                .child(SharedString::from(format!("s3://{}", target.label()))),
+                        )
+                        // Mouse *down*, not click: the click would land after
+                        // the field had already lost focus and taken this list
+                        // down with it.
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                cx.stop_propagation();
+                                this.path_suggesting = false;
+                                this.path_choice = None;
+                                this.open_place(&target, cx);
+                                this.focus.focus(window);
+                                cx.notify();
+                            }),
+                        )
+                }))
+                .into_any_element(),
         )
     }
 
@@ -8717,6 +8905,7 @@ impl Render for Browser {
             .children(self.render_failures(cx))
             .children(self.render_preview(cx))
             .children(self.render_settings(cx))
+            .children(self.render_path_suggestions(cx))
             // Last, so it paints over everything. The palette can be summoned
             // from on top of any of these — "Sửa nội dung" only makes sense
             // while a preview is open — and it used to come up *behind* the
@@ -8986,6 +9175,24 @@ fn icon_button(id: &'static str, name: &'static str, theme: Theme) -> gpui::Stat
         .cursor_pointer()
         .hover(|this| this.bg(theme.hover))
         .child(icon(name, theme.text_muted))
+}
+
+/// Where the highlight goes next in the path box's suggestions.
+///
+/// `None` is a real position, not "nothing selected": it means *the text you
+/// typed*, which is what the box is for. So walking off either end lands there
+/// rather than wrapping — someone arrowing back up past the first row is on
+/// their way to the text, not to the bottom of the list.
+fn next_choice(current: Option<usize>, down: bool, count: usize) -> Option<usize> {
+    match (current, down) {
+        (None, true) => Some(0),
+        // Up from the text goes to the last row, which is the one nearest it.
+        (None, false) => Some(count - 1),
+        (Some(index), true) if index + 1 < count => Some(index + 1),
+        (Some(_), true) => None,
+        (Some(0), false) => None,
+        (Some(index), false) => Some(index - 1),
+    }
 }
 
 /// The trailing crumbs to draw, and whether anything was dropped.
@@ -10610,6 +10817,8 @@ mod tests {
             next_tab_id: 1,
             previewing: None,
             screen: Screen::default(),
+            path_suggesting: false,
+            path_choice: None,
             preview_task: None,
             completing: None,
             bulk: None,
@@ -11785,6 +11994,26 @@ mod tests {
         // And what the app *can* draw still gets drawn.
         assert!(matches!(preview_kind("anh.png", None), PreviewKind::Image));
         assert!(matches!(preview_kind("ghi-chu.txt", None), PreviewKind::Text));
+    }
+
+    #[test]
+    fn the_path_box_highlight_walks_off_both_ends_into_the_text() {
+        // `None` is where what-you-typed lives, so both ends land on it rather
+        // than wrapping. Wrapping would make it impossible to get back to your
+        // own text without deleting a character.
+        assert_eq!(next_choice(None, true, 3), Some(0));
+        assert_eq!(next_choice(Some(0), true, 3), Some(1));
+        assert_eq!(next_choice(Some(2), true, 3), None);
+
+        // Up from the text goes to the *last* row — the one nearest it on
+        // screen, since the list hangs below the box.
+        assert_eq!(next_choice(None, false, 3), Some(2));
+        assert_eq!(next_choice(Some(2), false, 3), Some(1));
+        assert_eq!(next_choice(Some(0), false, 3), None);
+
+        // One suggestion: down onto it, down again back to the text.
+        assert_eq!(next_choice(None, true, 1), Some(0));
+        assert_eq!(next_choice(Some(0), true, 1), None);
     }
 
     #[test]
