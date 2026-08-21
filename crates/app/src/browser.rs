@@ -5455,7 +5455,20 @@ impl Browser {
                         .px_2()
                         .text_xs()
                         .text_color(theme.text_faint)
-                        .child("từ bộ nhớ tạm"),
+                        // With the age, not just the fact. Half an hour behind
+                        // and one minute behind are different things to be
+                        // looking at, and "từ bộ nhớ tạm" alone cannot tell
+                        // them apart.
+                        //
+                        // Here rather than in the status bar, which was the
+                        // first attempt: `buckets_cached` stays true for the
+                        // rest of the session, so down there the note outlived
+                        // its subject and sat next to an object listing fetched
+                        // seconds ago, saying nothing about it. Beside the
+                        // bucket list it cannot be read as being about anything
+                        // else.
+                        .whitespace_nowrap()
+                        .child(SharedString::from(self.bucket_cache_note())),
                 )
             })
             // Only past a threshold. Under a dozen buckets the whole list is
@@ -7654,6 +7667,32 @@ impl Browser {
                         cx.notify();
                     }))
             })
+            // Last, and the quietest thing on the bar. A bug report that does
+            // not say which build it is about costs a round trip, and this is
+            // the one place a user can read the answer off without hunting for
+            // an About box the app does not have.
+            .child(
+                div()
+                    .text_color(theme.text_faint)
+                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+            )
+    }
+
+    /// "bộ nhớ tạm", with how far behind it is when that can be worked out.
+    ///
+    /// Kept short enough to stay on one line of a 214px sidebar: the first
+    /// draft read "từ bộ nhớ tạm · dưới 1 phút trước" and wrapped, splitting
+    /// "trước" across two lines and pushing the bucket list down a row.
+    fn bucket_cache_note(&self) -> String {
+        let age = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .and_then(|profile| self.bucket_cache.get(&profile.id))
+            .map(|(_, at)| format_age(s3core::now_epoch() - at));
+        match age {
+            Some(age) => format!("bộ nhớ tạm · {age}"),
+            None => "bộ nhớ tạm".to_string(),
+        }
     }
 
     /// The transfer queue. Collapsed by default; the status bar toggles it.
@@ -9253,6 +9292,32 @@ fn format_duration(seconds: u64) -> String {
         s if s < 3600 => format!("{} phút", s / 60),
         s if s < 86_400 => format!("{} giờ {} phút", s / 3600, (s % 3600) / 60),
         s => format!("{} ngày", s / 86_400),
+    }
+}
+
+/// How long ago something was fetched, in one unit.
+///
+/// Not `format_duration`: that one is a countdown and keeps the minutes past an
+/// hour, which reads as precision an age does not have.
+///
+/// No seconds arm, for the same reason. This value is computed during a repaint
+/// and nothing schedules another one, so "12 giây" is only true for the instant
+/// it was drawn and then quietly rots. Everything under a minute says "vừa
+/// xong", which stays true for as long as anybody is looking.
+///
+/// "trước" is on every arm, because a bare duration in this app already means
+/// time *remaining* — the transfer queue renders "còn 2 phút" three lines from
+/// here, and "2 phút" alone would read as a countdown.
+///
+/// A negative age means the system clock went backwards between the fetch and
+/// now; clamped, because "-3 phút" reads as a bug in the app rather than one in
+/// the clock.
+fn format_age(seconds: i64) -> String {
+    match seconds.max(0) {
+        s if s < 60 => "vừa xong".to_string(),
+        s if s < 3600 => format!("{} phút trước", s / 60),
+        s if s < 86_400 => format!("{} giờ trước", s / 3600),
+        s => format!("{} ngày trước", s / 86_400),
     }
 }
 
@@ -11514,6 +11579,36 @@ mod tests {
         assert_eq!(format_duration(7_380), "2 giờ 3 phút");
         // A transfer measured in days does not need the hours.
         assert_eq!(format_duration(90_000), "1 ngày");
+    }
+
+    #[test]
+    fn an_age_is_one_unit_and_never_negative() {
+        // No number under a minute: this is computed during a repaint and
+        // nothing schedules another, so a seconds figure would be true for one
+        // instant and wrong from then on.
+        assert_eq!(format_age(0), "vừa xong");
+        assert_eq!(format_age(59), "vừa xong");
+        assert_eq!(format_age(60), "1 phút trước");
+        assert_eq!(format_age(300), "5 phút trước");
+        assert_eq!(format_age(3_599), "59 phút trước");
+
+        // One unit past the hour, unlike `format_duration`: the second unit
+        // there would claim the age is exact when it only moves on a redraw.
+        assert_eq!(format_age(3_600), "1 giờ trước");
+        assert_eq!(format_age(7_380), "2 giờ trước");
+        assert_eq!(format_age(86_399), "23 giờ trước");
+        assert_eq!(format_age(90_000), "1 ngày trước");
+
+        // Every arm says "trước". A bare duration in this app already means
+        // time remaining — the queue pill three lines away renders "còn 2 phút".
+        for seconds in [60, 3_600, 90_000] {
+            assert!(format_age(seconds).ends_with("trước"), "{seconds}");
+        }
+
+        // The clock moving backwards between the fetch and now. "-3 phút" in
+        // the status bar reads as a broken app rather than a broken clock.
+        assert_eq!(format_age(-1), "vừa xong");
+        assert_eq!(format_age(i64::MIN), "vừa xong");
     }
 
     #[test]

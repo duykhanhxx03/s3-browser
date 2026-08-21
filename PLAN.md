@@ -774,7 +774,14 @@ thứ một câu trả lời đã mang theo là loại lãng phí hiện lên ho
 Home/Favorites/Recent/Downloads/Uploads vẫn nằm đó, xám, tooltip "Create a profile
 first". Cách này dạy hình dáng ứng dụng trước khi dùng được nó.
 
-**f. Thanh trạng thái mang nhiều hơn.** Trạng thái cache ("Cached 5m ago" /
+**f. ~~Thanh trạng thái mang nhiều hơn~~** — xong một phần (21/08/2026): số phiên
+bản ở thanh trạng thái, tuổi bộ nhớ tạm **ở sidebar cạnh danh sách bucket** chứ
+không phải ở thanh trạng thái — `buckets_cached` đúng cho tới hết phiên, nên dưới
+đó nó sống lâu hơn cái nó nói về, ngồi cạnh một danh sách object vừa lấy về xong
+mà không nói gì về nó. Còn thiếu: đánh dấu region **tự dò** — phải chờ §10.3, vì
+hiện app dò xong rồi quên, không có chỗ nào đọc lại được lúc vẽ.
+
+Nguyên văn mục gốc: Trạng thái cache ("Cached 5m ago" /
 "● Live"), một dòng nhắc tiền ("S3 API calls incur charges"), số phiên bản, và
 region **hiện khác đi khi nó là do tự dò** chứ không phải do gõ vào. Mình có
 profile · region · phím tắt.
