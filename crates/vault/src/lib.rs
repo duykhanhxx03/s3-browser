@@ -153,13 +153,37 @@ impl Provider {
 /// Carries the profile it belongs to: the same `bucket/prefix` under two
 /// profiles is two different places, and offering one from the wrong profile
 /// would open a bucket the credentials cannot see.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Place {
     pub profile: String,
     pub bucket: String,
     #[serde(default)]
     pub prefix: String,
+    /// When it was last visited, in epoch seconds.
+    ///
+    /// Defaulted rather than required: a `places.json` written before this
+    /// field existed still loads, and its entries come back as zero — which the
+    /// UI shows as no time at all rather than as 1970.
+    #[serde(default)]
+    pub at: i64,
 }
+
+/// Equality is *where*, not *when*.
+///
+/// Written out rather than derived because `at` must stay out of it. Two visits
+/// to the same prefix are the same place, and the list's whole job depends on
+/// that: `visit` drops the old entry before inserting the new one, and pinning
+/// looks a place up by identity. Derive `PartialEq` over `at` and every revisit
+/// becomes a second row, until the list holds one prefix twelve times.
+impl PartialEq for Place {
+    fn eq(&self, other: &Self) -> bool {
+        self.profile == other.profile
+            && self.bucket == other.bucket
+            && self.prefix == other.prefix
+    }
+}
+
+impl Eq for Place {}
 
 impl Place {
     /// `bucket/prefix`, for showing in a list one line high.
@@ -182,9 +206,12 @@ pub struct Places {
     pub recent: Vec<Place>,
 }
 
-/// How many places back the list remembers. Long enough to cover a session's
-/// worth of jumping about, short enough that the sidebar stays a sidebar.
-pub const RECENT_LIMIT: usize = 12;
+/// How many places back the list remembers.
+///
+/// Was twelve while this lived in the sidebar, where the limit was really about
+/// how tall a sidebar may get. It has a page of its own now, so the number can
+/// be about memory instead: enough to cover more than one sitting.
+pub const RECENT_LIMIT: usize = 50;
 
 impl Places {
     /// Records a visit, newest first, without repeating one already there.
@@ -468,6 +495,7 @@ mod tests {
             profile: "p1".into(),
             bucket: bucket.into(),
             prefix: prefix.into(),
+            at: 0,
         }
     }
 
@@ -497,6 +525,7 @@ mod tests {
             profile: "p2".into(),
             bucket: "b".into(),
             prefix: String::new(),
+            at: 0,
         });
 
         // The same `bucket/prefix` under two profiles is two different places,
@@ -504,6 +533,26 @@ mod tests {
         // credentials cannot see.
         let mine: Vec<_> = places.for_profile("p1").collect();
         assert_eq!(mine, vec![&place("a", "")]);
+    }
+
+    #[test]
+    fn when_is_not_part_of_where() {
+        // `at` must stay out of equality. A revisit carries a new timestamp,
+        // and if that made it a different place, `visit` would stop replacing
+        // the old entry — the list would fill with one prefix over and over
+        // until nothing older was left in it, which is the one thing it is for.
+        let mut places = Places::default();
+        places.visit(Place { at: 100, ..place("a", "x/") });
+        places.visit(Place { at: 900, ..place("a", "x/") });
+        assert_eq!(places.recent.len(), 1);
+        // And the newer visit is the one kept, so the page shows when you were
+        // last there rather than when you first were.
+        assert_eq!(places.recent[0].at, 900);
+
+        // Pinning looks a place up by identity too, so a pin made at one moment
+        // still matches the same place visited at another.
+        assert!(places.toggle_favorite(Place { at: 100, ..place("a", "x/") }));
+        assert!(places.is_favorite(&Place { at: 5_000, ..place("a", "x/") }));
     }
 
     #[test]

@@ -88,9 +88,6 @@ const CHECK_WIDTH: f32 = 22.;
 const BUCKET_CACHE_TTL: i64 = 30 * 60;
 /// Three small icon buttons.
 const ACTIONS_WIDTH: f32 = 72.;
-/// How many recent places the sidebar lists. The store keeps more; this is what
-/// fits above the bucket list without pushing it off screen.
-const RECENT_SHOWN: usize = 5;
 /// Fixed, so tabs do not resize under the pointer as their titles change.
 const TAB_WIDTH: f32 = 132.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
@@ -317,6 +314,19 @@ pub enum Preview {
     /// trước được" for a ZIP, a corrupt PNG and a file of raw bytes are three
     /// different facts and the user can act on only one of them.
     Handoff(SharedString),
+}
+
+/// Which page the main pane is showing.
+///
+/// Not per-tab. A tab is a *location* — a bucket and a prefix — and the history
+/// is one list across all of them; putting a screen inside a tab would mean
+/// each tab remembering whether it was "on the history page", which is a state
+/// nobody is keeping track of while they work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Screen {
+    #[default]
+    Objects,
+    Recent,
 }
 
 /// An in-flight SSO sign-in. The device flow is two waits with a browser trip
@@ -700,6 +710,7 @@ pub struct Browser {
     next_tab_id: u64,
     /// The preview overlay, when one is open.
     previewing: Option<Previewing>,
+    screen: Screen,
     preview_task: Option<Task<()>>,
     /// Loading the rest of a prefix so the current sort is exact.
     completing: Option<Completing>,
@@ -943,6 +954,7 @@ impl Browser {
             active_tab: 0,
             next_tab_id: 1,
             previewing: None,
+            screen: Screen::default(),
             preview_task: None,
             completing: None,
             bulk: None,
@@ -2070,6 +2082,10 @@ impl Browser {
             profile: profile.id.clone(),
             bucket: self.bucket.clone()?.to_string(),
             prefix: self.prefix.clone(),
+            // Stamped on the way out, so recording a visit is what sets the
+            // time. `at` is not part of a place's identity, so this is free to
+            // be wrong for a pin — a pin is not a visit and never shows one.
+            at: s3core::now_epoch(),
         })
     }
 
@@ -2170,7 +2186,36 @@ impl Browser {
     }
 
     fn open_place(&mut self, place: &Place, cx: &mut Context<Self>) {
+        // Back to the listing: opening a place from the history page and being
+        // left staring at the history page reads as a click that did nothing.
+        self.screen = Screen::Objects;
         self.open(place.bucket.clone().into(), place.prefix.clone(), cx);
+    }
+
+    fn show_recent(&mut self, cx: &mut Context<Self>) {
+        // A toggle, so the same row that opened it closes it. The alternative
+        // is a page with no way back except opening something, which forces a
+        // navigation on someone who only wanted a look.
+        self.screen = if self.screen == Screen::Recent {
+            Screen::Objects
+        } else {
+            Screen::Recent
+        };
+        cx.notify();
+    }
+
+    /// Forgets the history for the profile whose page is open.
+    ///
+    /// Only this profile's: the list on screen is filtered to it, and a button
+    /// that clears more than what it sits above is a button that lies.
+    fn clear_recent(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.places_profile().map(str::to_string) else {
+            return;
+        };
+        self.places.recent.retain(|place| place.profile != profile);
+        self.save_places();
+        self.status = "Đã xoá lịch sử".into();
+        cx.notify();
     }
 
     /// The profile whose places are worth showing. `None` means show none:
@@ -3190,6 +3235,7 @@ impl Browser {
                 }
             }
             Command::ToggleFavorite => self.toggle_favorite(cx),
+            Command::Recent => self.show_recent(cx),
             Command::Settings => {
                 self.settings_open = true;
                 cx.notify();
@@ -5166,6 +5212,15 @@ impl Browser {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
+            // Always here, with or without history behind it — a nav entry that
+            // comes and goes is one nobody learns the position of. The page it
+            // opens says so itself when there is nothing in it.
+            .child(
+                sidebar_nav("nav-recent", "clock", "Gần đây", self.screen == Screen::Recent, theme)
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_recent(cx);
+                    })),
+            )
             .children(self.render_places(cx))
             .child(
                 div()
@@ -5263,48 +5318,29 @@ impl Browser {
             // At the foot of the sidebar, where Brows3 has it and where every
             // app of this shape has it.
             .child(
-                div()
-                    .id("settings-open")
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(theme.text_muted)
-                    .hover(|this| this.bg(theme.hover))
-                    .child(sized_icon("more", 11., theme.text_faint))
-                    .child("Cài đặt")
-                    .on_click(cx.listener(|this, _event, _window, cx| {
+                sidebar_nav("settings-open", "more", "Cài đặt", false, theme).on_click(
+                    cx.listener(|this, _event, _window, cx| {
                         this.settings_open = true;
                         cx.notify();
-                    })),
+                    }),
+                ),
             )
     }
 
-    /// The pinned and recent sections above the bucket list.
+    /// The pinned section above the bucket list.
     ///
-    /// Only when they have something in them. Two permanently empty headings
-    /// above the bucket list would cost the buckets two rows of height to say
-    /// nothing.
+    /// Only when it has something in it. A permanently empty heading above the
+    /// bucket list would cost the buckets a row of height to say nothing.
+    ///
+    /// History used to sit under this, five entries deep. It has its own page
+    /// now: five was never enough to find anything with, and any more than five
+    /// pushed the buckets — the thing the sidebar is actually for — off the
+    /// bottom.
     fn render_places(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let theme = self.theme;
         let profile = self.places_profile()?;
         let favorites: Vec<Place> = self.places.for_profile(profile).cloned().collect();
-        // The place you are already at is not somewhere to go back to, and it
-        // is the top of this list on every single navigation.
-        let here = self.here();
-        let recent: Vec<Place> = self
-            .places
-            .recent_for_profile(profile)
-            .filter(|place| Some(*place) != here.as_ref())
-            .take(RECENT_SHOWN)
-            .cloned()
-            .collect();
-
-        if favorites.is_empty() && recent.is_empty() {
+        if favorites.is_empty() {
             return None;
         }
 
@@ -5349,18 +5385,10 @@ impl Browser {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .when(!favorites.is_empty(), |this| {
-                    this.child(section_label("ĐÃ GHIM", theme))
-                        .children(favorites.iter().enumerate().map(|(ix, place)| {
-                            row(place, SharedString::from(format!("fav-{ix}")), true)
-                        }))
-                })
-                .when(!recent.is_empty(), |this| {
-                    this.child(section_label("GẦN ĐÂY", theme))
-                        .children(recent.iter().enumerate().map(|(ix, place)| {
-                            row(place, SharedString::from(format!("recent-{ix}")), false)
-                        }))
-                }),
+                .child(section_label("ĐÃ GHIM", theme))
+                .children(favorites.iter().enumerate().map(|(ix, place)| {
+                    row(place, SharedString::from(format!("fav-{ix}")), true)
+                })),
         )
     }
 
@@ -5550,6 +5578,153 @@ impl Browser {
                         ),
                 ),
         )
+    }
+
+    /// The history page.
+    ///
+    /// Everywhere this profile has been, newest first, filling the pane the
+    /// listing normally has. It used to be five lines in the sidebar, where
+    /// five was too few to find anything with and six would have pushed the
+    /// bucket list off the bottom.
+    ///
+    /// Built out of the same measurements as the listing it stands in for —
+    /// `TOOLBAR_HEIGHT` header, `ROW_HEIGHT` rows, `px_3`, `text_sm` — because
+    /// a page that swaps in with taller rows and bigger type reads as a
+    /// different application rather than as a different page.
+    fn render_recent_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        // The place you are standing in is not somewhere to go back to, and it
+        // is the newest entry after every single navigation — so it would take
+        // the top row of this page permanently, to say "you are here".
+        let here = self.here();
+        let recent: Vec<Place> = self
+            .places_profile()
+            .map(|profile| {
+                self.places
+                    .recent_for_profile(profile)
+                    .filter(|place| Some(*place) != here.as_ref())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        div()
+            .id("recent-page")
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(TOOLBAR_HEIGHT))
+                    .flex_shrink_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().text_sm().text_color(theme.text).child("Gần đây"))
+                    // Beside the title, not stacked under it: the count is the
+                    // same kind of aside as the "5 mục" under the listing, and
+                    // a second line here would make this header taller than the
+                    // toolbar it stands in for.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(recent_summary(recent.len()))),
+                    )
+                    .when(!recent.is_empty(), |this| {
+                        this.child(
+                            action_button("recent-clear", "Xoá hết", theme).on_click(
+                                cx.listener(|this, _event, _window, cx| this.clear_recent(cx)),
+                            ),
+                        )
+                    })
+                    .child(
+                        icon_button("recent-close", "close", theme).on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.screen = Screen::Objects;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .when(recent.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(sized_icon("clock", 24., theme.text_faint))
+                        .child(div().text_sm().text_color(theme.text_muted).child("Chưa đi đâu cả"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_faint)
+                                .child("Thư mục bạn mở sẽ hiện ở đây"),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("recent-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_scroll()
+                    .children(recent.iter().enumerate().map(|(ix, place)| {
+                        let target = place.clone();
+                        let pinned = self.places.is_favorite(place);
+                        div()
+                            .id(SharedString::from(format!("recent-row-{ix}")))
+                            .h(px(ROW_HEIGHT))
+                            .w_full()
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(theme.hover))
+                            .child(sized_icon(
+                                if pinned { "star" } else { "folder" },
+                                14.,
+                                if pinned { theme.accent } else { theme.text_faint },
+                            ))
+                            // The whole path, not just the last segment: two
+                            // `2026/` under different buckets are one word apart
+                            // and the word is at the front.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(target.label())),
+                            )
+                            .when(target.at > 0, |this| {
+                                this.child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(s3core::format_timestamp(
+                                            target.at,
+                                        ))),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.open_place(&target, cx)
+                            }))
+                    })),
+            )
     }
 
     /// The preview overlay.
@@ -8466,7 +8641,16 @@ impl Render for Browser {
                     .flex()
                     .overflow_hidden()
                     .child(self.render_sidebar(cx))
-                    .child(
+                    // The history page takes the whole pane, and takes the drop
+                    // target with it: a file dropped on a list of *past*
+                    // locations has no obvious destination, and the honest
+                    // answers — the current prefix, or the row under the
+                    // cursor — are both things nobody asked for.
+                    .when(self.screen == Screen::Recent, |this| {
+                        this.child(self.render_recent_page(cx))
+                    })
+                    .when(self.screen == Screen::Objects, |this| {
+                        this.child(
                         div()
                             .id("object-pane")
                             .flex_1()
@@ -8501,7 +8685,10 @@ impl Render for Browser {
                                 this.child(self.render_list_footer())
                             }),
                     )
-                    .children(self.render_inspector(cx)),
+                    })
+                    .when(self.screen == Screen::Objects, |this| {
+                        this.children(self.render_inspector(cx))
+                    }),
             )
                     .children(self.render_drawer(cx))
                     })
@@ -8732,6 +8919,42 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
         .cursor_pointer()
         .bg(theme.danger)
         .text_color(theme.text_on_accent)
+        .child(label)
+}
+
+/// A row in the sidebar that goes somewhere rather than opening a place.
+///
+/// `active` paints the one you are on: without it the sidebar keeps pointing at
+/// the buckets while the pane shows something else entirely, and there is
+/// nothing on screen saying which of the two you are looking at.
+fn sidebar_nav(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    active: bool,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        // The same size and padding as a bucket row, because it is the same
+        // kind of thing: somewhere the sidebar takes you. The pinned list below
+        // is a step smaller on purpose — that one is a sub-list, not nav.
+        .text_sm()
+        .cursor_pointer()
+        .when(active, |this| this.bg(theme.selected))
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .hover(|this| this.bg(theme.hover))
+        .child(sized_icon(
+            icon,
+            13.,
+            if active { theme.accent } else { theme.text_faint },
+        ))
         .child(label)
 }
 
@@ -9858,6 +10081,15 @@ fn type_badge_of(name: &str) -> Option<SharedString> {
     Some(extension.to_uppercase().into())
 }
 
+/// How many places the history page has, in words.
+fn recent_summary(count: usize) -> String {
+    if count == 0 {
+        "Chưa có nơi nào".to_string()
+    } else {
+        format!("{count} nơi đã đi qua")
+    }
+}
+
 /// Which tab a number key selects.
 ///
 /// `9` means the last one rather than the ninth: with three tabs open, ⌘9 has to
@@ -9965,6 +10197,7 @@ pub enum Command {
     CloseTab,
     GoToPath,
     ToggleFavorite,
+    Recent,
     Settings,
     CopyPath,
     CopyKey,
@@ -10009,6 +10242,7 @@ impl Command {
             Command::CloseTab => ("Đóng tab", "⌘W"),
             Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
             Command::ToggleFavorite => ("Ghim nơi này", ""),
+            Command::Recent => ("Gần đây", ""),
             Command::Settings => ("Cài đặt", ""),
             Command::CopyPath => ("Chép đường dẫn s3://", ""),
             Command::CopyKey => ("Chép key", ""),
@@ -10038,7 +10272,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 35] {
+    fn all() -> [Command; 36] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -10068,6 +10302,7 @@ impl Command {
             Command::CloseTab,
             Command::GoToPath,
             Command::ToggleFavorite,
+            Command::Recent,
             Command::Settings,
             Command::CopyPath,
             Command::CopyKey,
@@ -10333,6 +10568,7 @@ mod tests {
             active_tab: 0,
             next_tab_id: 1,
             previewing: None,
+            screen: Screen::default(),
             preview_task: None,
             completing: None,
             bulk: None,
@@ -11053,7 +11289,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 35);
+        assert_eq!(all.len(), 36);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -11500,6 +11736,12 @@ mod tests {
         // And what the app *can* draw still gets drawn.
         assert!(matches!(preview_kind("anh.png", None), PreviewKind::Image));
         assert!(matches!(preview_kind("ghi-chu.txt", None), PreviewKind::Text));
+    }
+
+    #[test]
+    fn the_history_page_counts_what_it_is_showing() {
+        assert_eq!(recent_summary(0), "Chưa có nơi nào");
+        assert_eq!(recent_summary(3), "3 nơi đã đi qua");
     }
 
     #[test]

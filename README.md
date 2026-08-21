@@ -64,6 +64,8 @@ hoá luôn cái kho khoá.
 
 Cài đặt (chủ đề, giới hạn xem trước, băng thông, số luồng truyền) nằm ở
 `settings.json` cạnh `profiles.json`; nơi đã ghim và nơi vừa tới ở `places.json`.
+Nơi đã ghim nằm ở sidebar, còn 50 nơi vừa tới có trang riêng — mở bằng mục
+"Gần đây" ở đầu sidebar.
 
 ```bash
 cargo test    # 132 test; test MinIO tự bỏ qua nếu chưa chạy Docker

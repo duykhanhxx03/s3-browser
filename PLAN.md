@@ -536,7 +536,13 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
    request đi lạc endpoint.
 3. ~~**Favorites và Recent**~~ — xong (21/08/2026). Lưu ở `places.json` cạnh
    profiles, gắn với profile id vì cùng một `bucket/prefix` dưới hai profile là
-   hai nơi khác nhau.
+   hai nơi khác nhau. **Recent ra trang riêng** như Brows3 (21/08/2026): nằm
+   trong sidebar thì trần thật sự là chiều cao sidebar, mà năm dòng thì không đủ
+   để tìm ra cái gì còn dòng thứ sáu đã đẩy danh sách bucket rơi khỏi màn hình.
+   Có trang riêng rồi thì trần thành 50, và mỗi nơi ghi luôn lần cuối ghé —
+   `at` không nằm trong định danh của một nơi, nên ghé lại vẫn là *một* dòng
+   chứ không phải dòng thứ hai. Nơi đã ghim vẫn ở sidebar: nó ít, cố định, và
+   là thứ người ta cố ý để đó.
 4. ~~**Nhãn loại tệp**~~ — xong (21/08/2026), nhưng ở **cột riêng** chứ không phải
    cạnh tên: một nhãn nằm sau tên thì mỗi dòng một vị trí, quét cả danh sách tìm
    "mấy cái CSV" là phải đọc từng dòng.
