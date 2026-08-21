@@ -452,6 +452,67 @@ impl S3Client {
         })
     }
 
+    /// One page of the flat keyspace under `prefix`.
+    ///
+    /// No delimiter, so there are no folders and every object in the subtree
+    /// appears. `name` is the whole key rather than the last segment, because
+    /// the caller is a search: two files called `notes.txt` in different folders
+    /// are different answers, and a list that shows both as "notes.txt" is
+    /// useless.
+    ///
+    /// Distinct from [`Self::list_keys_recursive`], which pages internally and
+    /// only returns when it has everything. A search has to show what it has so
+    /// far and stop when told to, and neither is possible from inside a loop
+    /// that returns once.
+    pub async fn list_flat_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation: Option<String>,
+    ) -> Result<Page> {
+        let mut req = self
+            .inner
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .max_keys(1000);
+
+        if let Some(token) = continuation {
+            req = req.continuation_token(token);
+        }
+
+        let out = req
+            .send()
+            .await
+            .with_context(|| format!("ListObjectsV2 failed for s3://{bucket}/{prefix}"))?;
+
+        let entries = out
+            .contents()
+            .iter()
+            .filter_map(|obj| {
+                let key = obj.key()?;
+                // Folder placeholders are an artefact of how other tools write
+                // "empty directories"; nobody is searching for one.
+                if key.ends_with('/') {
+                    return None;
+                }
+                Some(Entry {
+                    name: key.to_string(),
+                    key: key.to_string(),
+                    is_folder: false,
+                    size: obj.size().unwrap_or(0),
+                    modified_epoch: obj.last_modified().map(|t| t.secs()),
+                    storage_class: obj.storage_class().map(|s| s.as_str().to_string()),
+                })
+            })
+            .collect();
+
+        Ok(Page {
+            entries,
+            continuation: out.next_continuation_token().map(str::to_owned),
+        })
+    }
+
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         self.inner
             .create_bucket()

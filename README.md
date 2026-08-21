@@ -31,6 +31,7 @@ hoá luôn cái kho khoá.
 | Phím | Việc |
 |---|---|
 | `⌘F` | Đưa con trỏ vào ô lọc trên thanh công cụ (Esc để xoá và trả phím về danh sách) |
+| `Enter` trong ô lọc | Quét cả bucket tìm chuỗi đó, dừng được giữa chừng |
 | `⌘N` / `⌘⇧N` | Thư mục mới / bucket mới |
 | `⌘R` | Tải lại prefix hiện tại |
 | `⌘⌫` | Xoá các mục đang chọn |

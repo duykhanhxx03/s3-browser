@@ -404,7 +404,27 @@ trên một bucket" cho mọi lỗi, giờ nó nói đúng cái vừa hỏng và
 Đã xem tận mắt: khoá sai cho ra "Khoá truy cập không đúng" kèm nút Sửa profile,
 bảng nhật ký mở được từ command palette, có nguyên văn cắt gọn và nút chép.
 
-### 7.5 Tìm kiếm file và bucket
-Bộ lọc hiện chỉ lọc trang đang tải. Tìm kiếm thật phải quét theo prefix trên
-toàn bucket, có huỷ giữa chừng, và nói rõ đang quét dở hay đã xong — quét một
-bucket lớn tốn tiền LIST nên không được âm thầm.
+### 7.5 Tìm kiếm file và bucket — xong
+Một ô, hai mức. Gõ thì lọc những gì đã tải, miễn phí và chạy ngay. Enter thì quét
+cả bucket, tốn một yêu cầu LIST mỗi nghìn key — nên nó đợi người ta bấm chứ không
+tự chạy.
+
+Kết quả đổ thẳng vào `entries`, đúng chỗ một listing vẫn đổ vào, nên chọn, tải
+xuống, xem chi tiết và menu chuột phải đều chạy tiếp mà không cần biết có tìm
+kiếm. Tất cả đều thao tác trên `entry.key`, vốn là key thật dù đến từ đâu.
+
+Quét từng trang một chứ không một lệnh chạy tới hết: bucket triệu key là nghìn
+yêu cầu, mà một cuộc quét chỉ hiện gì đó lúc xong là cuộc quét không ai lượng
+được giá, cũng không dừng được. Thanh trên danh sách nói rõ tìm gì, được bao
+nhiêu, quét bao nhiêu mục trong bao nhiêu yêu cầu, và đang quét hay đã dừng hay
+đã xong — vì "không tìm thấy" từ một cuộc quét mới đi được một phần mười bucket
+là câu app không có cơ sở để nói.
+
+Bộ lọc bucket ở sidebar chỉ hiện khi có từ 10 bucket trở lên; dưới đó cả danh
+sách đã nằm trên màn hình rồi.
+
+Cả hai bộ lọc giờ bỏ dấu như command palette, nên lọc lại một tập kết quả bằng
+chính chuỗi đã tìm ra nó không thể giấu mất cái nào.
+
+Đã xem tận mắt trên prefix 1200 key: quét qua ranh giới trang, ra đúng
+`many/file-0999.txt` kèm đường dẫn, và ca không khớp nói rõ đã quét hết bucket.

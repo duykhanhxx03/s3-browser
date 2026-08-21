@@ -75,6 +75,9 @@ const DETAIL_HEIGHT: f32 = 108.;
 /// breadcrumb keeps most of the bar.
 const FILTER_WIDTH: f32 = 196.;
 const FIELD_HEIGHT: f32 = 26.;
+/// How many buckets before the sidebar gets a search box. Under this the list
+/// fits on screen and the box is pure chrome.
+const BUCKET_FILTER_MIN: usize = 10;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
 
@@ -307,6 +310,28 @@ impl Form {
     }
 }
 
+/// A scan of the whole bucket, running or finished.
+///
+/// Kept apart from the filter on purpose. The filter narrows what is already on
+/// screen and costs nothing; this walks the entire keyspace and costs one LIST
+/// request per thousand keys, which is a real charge on a real bill. So it only
+/// starts when someone presses Enter, it says what it has spent, and it can be
+/// stopped.
+pub struct Search {
+    query: String,
+    /// Where the scan is. `None` before the first page and after the last.
+    continuation: Option<String>,
+    /// Keys looked at and requests made. Shown because the second one is what
+    /// the provider charges for.
+    scanned: usize,
+    requests: usize,
+    /// Whether the scan reached the end of the bucket. Until it does, a count
+    /// of results is "so far" and must not be worded as though it were final.
+    complete: bool,
+    /// Whether a request is in flight.
+    running: bool,
+}
+
 /// What ⌘C or ⌘X put aside, waiting for a paste.
 ///
 /// Holds keys rather than a live selection: the user is expected to navigate
@@ -333,6 +358,10 @@ pub struct Browser {
 
     client: Option<S3Client>,
     buckets: Vec<SharedString>,
+    /// Narrows the sidebar. Only exists once there are enough buckets for the
+    /// list to be worth narrowing — see `BUCKET_FILTER_MIN`.
+    bucket_filter: String,
+    bucket_filter_input: Option<Entity<InputState>>,
     bucket: Option<SharedString>,
     prefix: String,
 
@@ -400,6 +429,9 @@ pub struct Browser {
     thumbnails: HashMap<String, Option<std::sync::Arc<gpui::Image>>>,
     /// Whether the profile manager dialog is open.
     profiles_open: bool,
+    /// A whole-bucket scan, when one is running or its results are on screen.
+    /// While this is `Some`, `entries` holds results rather than one prefix.
+    search: Option<Search>,
     /// The command palette: `Some` with the query typed so far.
     palette: Option<String>,
     /// Which row the palette has highlighted.
@@ -437,10 +469,14 @@ pub struct Browser {
     /// they get their own slot rather than sharing `op_task`.
     thumb_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
+    /// The scan's own slot, so stopping a search is dropping one task and not
+    /// cancelling whatever else was in flight.
+    search_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
     /// Kept alive, not read: dropping it would silently stop the filter from
     /// reacting to what is typed into it.
     _filter_events: Option<Subscription>,
+    _bucket_filter_events: Option<Subscription>,
 }
 
 impl Browser {
@@ -472,19 +508,44 @@ impl Browser {
         });
 
         let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Lọc, Enter để tìm cả bucket"));
         // Live rather than on Enter: the list is right there, and making someone
         // commit a filter to find out whether it matched anything is a round
         // trip through their own attention for no reason.
         let filter_events = cx.subscribe(
             &filter_input,
             |this: &mut Self, state, event: &InputEvent, cx| {
+                match event {
+                    InputEvent::Change => {
+                        this.filter = state.read(cx).value().to_string();
+                        this.resort_and_filter();
+                        this.status = this.search_summary();
+                        cx.notify();
+                    }
+                    // Enter is the opt-in. Filtering what is already loaded is
+                    // free and happens as you type; scanning the whole bucket
+                    // costs a LIST request per thousand keys, so it waits to be
+                    // asked for.
+                    InputEvent::PressEnter { .. } => {
+                        let query = state.read(cx).value().to_string();
+                        this.start_search(query, cx);
+                    }
+                    _ => {}
+                }
+            },
+        );
+
+        let bucket_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Tìm bucket"));
+        // No Enter handling here on purpose: every bucket name is already in
+        // memory, so there is nothing to go and fetch and nothing to charge for.
+        let bucket_filter_events = cx.subscribe(
+            &bucket_filter_input,
+            |this: &mut Self, state, event: &InputEvent, cx| {
                 if !matches!(event, InputEvent::Change) {
                     return;
                 }
-                this.filter = state.read(cx).value().to_string();
-                this.resort_and_filter();
-                this.status = this.listing_summary();
+                this.bucket_filter = state.read(cx).value().to_string();
                 cx.notify();
             },
         );
@@ -523,6 +584,8 @@ impl Browser {
             store,
             client: None,
             buckets: Vec::new(),
+            bucket_filter: String::new(),
+            bucket_filter_input: Some(bucket_filter_input),
             bucket: None,
             prefix: String::new(),
             entries: Vec::new(),
@@ -551,6 +614,7 @@ impl Browser {
             thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
+            search: None,
             palette: None,
             palette_selected: 0,
             palette_scroll: UniformListScrollHandle::new(),
@@ -567,8 +631,10 @@ impl Browser {
             caps_task: None,
             thumb_task: None,
             tick_task: None,
+            search_task: None,
             _appearance: Some(appearance),
             _filter_events: Some(filter_events),
+            _bucket_filter_events: Some(bucket_filter_events),
         };
 
         if !this.profiles.is_empty() {
@@ -781,6 +847,11 @@ impl Browser {
 
         self.generation += 1;
         let generation = self.generation;
+        // Opening a prefix means the list is a listing again. The scan is
+        // already abandoned by the generation bump; this is what stops the
+        // strip and the counts from outliving it.
+        self.search = None;
+        self.search_task = None;
 
         // Only when the bucket actually changes: this costs a request, and it is
         // the same answer for every prefix inside one bucket.
@@ -929,6 +1000,159 @@ impl Browser {
         self.open(bucket, parent, cx);
     }
 
+    // ------------------------------------------------------------- searching
+
+    /// Starts a scan of the whole bucket for `query`.
+    ///
+    /// Results land in `entries`, the same place a listing does, so selecting,
+    /// downloading, inspecting and the context menu all keep working without
+    /// knowing a search happened. They act on `entry.key`, which is the real
+    /// key wherever it came from.
+    fn start_search(&mut self, query: String, cx: &mut Context<Self>) {
+        let query = query.trim().to_string();
+        if query.is_empty() || self.bucket.is_none() || self.client.is_none() {
+            return;
+        }
+
+        // Shares the listing's generation counter deliberately: navigating away
+        // must abandon a scan, and a scan must abandon a listing. Two counters
+        // would let one of them write into the other's results.
+        self.generation += 1;
+        self.entries.clear();
+        self.visible.clear();
+        self.selection.clear();
+        self.cursor = None;
+        self.anchor = None;
+        self.continuation = None;
+        self.loading = false;
+        self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+
+        self.search = Some(Search {
+            query,
+            continuation: None,
+            scanned: 0,
+            requests: 0,
+            complete: false,
+            running: true,
+        });
+        self.status = self.search_summary();
+        self.scan_page(cx);
+        cx.notify();
+    }
+
+    /// Fetches one page of the flat keyspace, keeps what matches, and queues the
+    /// next page.
+    ///
+    /// A page at a time rather than one call that returns when finished: a
+    /// bucket with a million keys is a thousand requests, and a scan that only
+    /// shows anything at the end is one nobody can judge the cost of, or stop.
+    fn scan_page(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(search)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.search.as_ref(),
+        ) else {
+            return;
+        };
+        if !search.running {
+            return;
+        }
+
+        let generation = self.generation;
+        let token = search.continuation.clone();
+        let needle = fold(&search.query);
+
+        let listing = Tokio::spawn(cx, async move {
+            client.list_flat_page(&bucket, "", token).await
+        });
+
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = listing.await;
+            _ = this.update(cx, |this, cx| {
+                if this.generation != generation || this.search.is_none() {
+                    return;
+                }
+
+                let failure = match outcome {
+                    Ok(Ok(page)) => {
+                        let matched: Vec<Entry> = page
+                            .entries
+                            .iter()
+                            .filter(|entry| fold(&entry.name).contains(&needle))
+                            .cloned()
+                            .collect();
+
+                        if let Some(search) = this.search.as_mut() {
+                            search.requests += 1;
+                            search.scanned += page.entries.len();
+                            search.continuation = page.continuation;
+                            search.complete = search.continuation.is_none();
+                            if search.complete {
+                                search.running = false;
+                            }
+                        }
+                        this.entries.extend(matched);
+                        this.resort_and_filter();
+                        None
+                    }
+                    Ok(Err(error)) => Some(format!("{error:?}")),
+                    Err(error) => Some(format!("Task lỗi: {error:?}")),
+                };
+
+                if let Some(message) = failure {
+                    if let Some(search) = this.search.as_mut() {
+                        search.running = false;
+                    }
+                    this.report(message);
+                }
+
+                this.status = this.search_summary();
+                // Only after the state above is settled, so a stopped or
+                // finished scan does not queue one more page.
+                this.scan_page(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Leaves the scan where it is. The results already found stay on screen —
+    /// they are real answers, and throwing them away would mean paying for them
+    /// twice.
+    fn stop_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = self.search.as_mut() {
+            search.running = false;
+        }
+        self.search_task = None;
+        self.status = self.search_summary();
+        cx.notify();
+    }
+
+    /// Drops the results and goes back to browsing the prefix.
+    fn exit_search(&mut self, cx: &mut Context<Self>) {
+        self.search = None;
+        self.search_task = None;
+        match (self.bucket.clone(), self.prefix.clone()) {
+            (Some(bucket), prefix) => self.open(bucket, prefix, cx),
+            (None, _) => cx.notify(),
+        }
+    }
+
+    /// What the scan has cost and found, worded so an unfinished scan never
+    /// reads as a final answer.
+    fn search_summary(&self) -> SharedString {
+        let Some(search) = self.search.as_ref() else {
+            return self.listing_summary();
+        };
+        search_summary(
+            self.entries.len(),
+            search.scanned,
+            search.requests,
+            search.complete,
+            search.running,
+        )
+        .into()
+    }
+
     // ------------------------------------------------------ keyboard cursor
 
     /// The cursor's row number, if the key it names is still on screen. `None`
@@ -1056,12 +1280,16 @@ impl Browser {
     fn resort_and_filter(&mut self) {
         sort_entries(&mut self.entries, self.sort);
 
-        let needle = self.filter.to_lowercase();
+        // Folded, like the command palette: Vietnamese file names get typed
+        // without diacritics as often as with them. It also keeps filtering a
+        // set of search results a no-op, because the search matched with the
+        // same rule.
+        let needle = fold(&self.filter);
         self.visible = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .filter(|(_, entry)| needle.is_empty() || fold(&entry.name).contains(&needle))
             .map(|(index, _)| index)
             .collect();
     }
@@ -3012,7 +3240,10 @@ impl Browser {
             match keystroke.key.as_str() {
                 "down" => return self.move_cursor(true, keystroke.modifiers.shift, cx),
                 "up" => return self.move_cursor(false, keystroke.modifiers.shift, cx),
-                "enter" => return self.open_cursor(cx),
+                // Only when the caret is not in the field: there Enter means
+                // "search the bucket", and opening the highlighted row as well
+                // would throw the results away in the same keystroke.
+                "enter" if !self.filter_focused(window, cx) => return self.open_cursor(cx),
                 _ => {}
             }
         }
@@ -3103,10 +3334,27 @@ impl Browser {
                     },
                 )),
             )
+            // Only past a threshold. Under a dozen buckets the whole list is
+            // on screen already, and a search box over four rows is a control
+            // nobody will ever use taking space from the rows they will.
+            .when(
+                self.buckets.len() >= BUCKET_FILTER_MIN,
+                |this| {
+                    this.when_some(self.bucket_filter_input.clone(), |this, input| {
+                        this.child(
+                            div().px_1().child(
+                                Input::new(&input)
+                                    .h(px(FIELD_HEIGHT))
+                                    .prefix(sized_icon("search", 12., theme.text_faint))
+                                    .cleanable(true),
+                            ),
+                        )
+                    })
+                },
+            )
             .children(
-                self.buckets
-                    .iter()
-                    .cloned()
+                self.visible_buckets()
+                    .into_iter()
                     .map(|bucket| {
                         let selected = current_bucket.as_ref() == Some(&bucket);
                         let target = bucket.clone();
@@ -3136,6 +3384,16 @@ impl Browser {
     /// The active profile, pinned to the bottom. It opens the manager rather
     /// than expanding in place: managing profiles is a task of its own, and
     /// growing the sidebar downward pushed the bucket list around.
+    /// The bucket names the sidebar shows, after the filter.
+    fn visible_buckets(&self) -> Vec<SharedString> {
+        let needle = fold(&self.bucket_filter);
+        self.buckets
+            .iter()
+            .filter(|bucket| needle.is_empty() || fold(bucket).contains(&needle))
+            .cloned()
+            .collect()
+    }
+
     fn render_profile_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let active = self
@@ -3755,7 +4013,7 @@ impl Browser {
             return skeleton_rows(theme).into_any_element();
         }
         if self.visible.is_empty() {
-            return self.render_nothing_here(cx).into_any_element();
+            return self.render_nothing_here(cx);
         }
 
         div()
@@ -3775,8 +4033,43 @@ impl Browser {
     /// Why the list is empty. An empty prefix and a filter that matched nothing
     /// look identical on screen and are entirely different situations — one is
     /// a fact about the bucket, the other is undone by pressing Escape.
-    fn render_nothing_here(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_nothing_here(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
+        // A scan that found nothing is its own state, and the wording turns on
+        // whether it finished. "Không tìm thấy" from a scan that covered a
+        // tenth of the bucket is a claim the app cannot make.
+        if let Some(search) = self.search.as_ref() {
+            let complete = search.complete;
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(div().text_color(theme.text_muted).child(if complete {
+                    "Không có object nào khớp"
+                } else if search.running {
+                    "Đang quét…"
+                } else {
+                    "Chưa thấy gì, và đã dừng giữa chừng"
+                }))
+                .child(div().text_xs().text_color(theme.text_faint).child(
+                    SharedString::from(if complete {
+                        format!(
+                            "Đã quét hết bucket: {} mục trong {} yêu cầu.",
+                            search.scanned, search.requests
+                        )
+                    } else {
+                        format!(
+                            "Mới quét {} mục trong {} yêu cầu, chưa hết bucket.",
+                            search.scanned, search.requests
+                        )
+                    }),
+                ))
+                .into_any_element();
+        }
+
         let filtered_out = emptiness(&self.filter, self.entries.len()) == Emptiness::Filtered;
 
         div()
@@ -3812,6 +4105,57 @@ impl Browser {
                     ),
                 )
             })
+            .into_any_element()
+    }
+
+    /// The strip that says a scan is on, what it has cost, and how to leave.
+    ///
+    /// Above the list rather than in the status bar, because while it is up the
+    /// list is not showing the folder the breadcrumb names — and that is a big
+    /// enough lie to need saying where the eye already is.
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let search = self.search.as_ref()?;
+        let theme = self.theme;
+        let running = search.running;
+
+        Some(
+            div()
+                .h(px(CONTROL_BAR_HEIGHT))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .bg(theme.selected)
+                .border_b_1()
+                .border_color(theme.border)
+                .text_xs()
+                .child(sized_icon("search", 13., theme.text_muted))
+                .child(
+                    div()
+                        .text_color(theme.text)
+                        .child(SharedString::from(format!("Tìm “{}”", search.query))),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child(self.search_summary()),
+                )
+                // Only while it is running: a stopped scan has nothing to stop,
+                // and a dead button is one more thing to read past.
+                .when(running, |this| {
+                    this.child(
+                        action_button("search-stop", "Dừng", theme).on_click(
+                            cx.listener(|this, _event, _window, cx| this.stop_search(cx)),
+                        ),
+                    )
+                })
+                .child(
+                    action_button("search-exit", "Thoát", theme).on_click(cx.listener(
+                        |this, _event, _window, cx| this.exit_search(cx),
+                    )),
+                ),
+        )
     }
 
     fn render_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5371,6 +5715,7 @@ impl Render for Browser {
                             // request the sidebar is, and leaving it blank until
                             // a bucket exists reads as a broken window rather
                             // than as a wait.
+                            .children(self.render_search_bar(cx))
                             .when(self.bucket.is_some() || self.connecting, |this| {
                                 this.child(self.render_columns(cx))
                                     .child(self.render_listing(cx))
@@ -6142,6 +6487,27 @@ fn wrap_words(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// A block of text wrapped at word boundaries, one element per line.
+/// What a scan has found and what it cost, in one line.
+///
+/// Pure so the wording can be pinned. The distinction that matters is between
+/// a finished scan and a stopped one: "12 kết quả" and "12 kết quả (đã dừng)"
+/// are different claims about the bucket, and reporting the second as the first
+/// tells someone a file is not there when the scan simply never reached it.
+fn search_summary(
+    found: usize,
+    scanned: usize,
+    requests: usize,
+    complete: bool,
+    running: bool,
+) -> String {
+    let state = match (complete, running) {
+        (true, _) => "xong",
+        (false, true) => "đang quét",
+        (false, false) => "đã dừng",
+    };
+    format!("{found} kết quả, quét {scanned} mục trong {requests} yêu cầu ({state})")
+}
+
 /// Collapses a multi-line error into one paragraph, for display only.
 ///
 /// `anyhow`'s `Debug` output is already broken into indented `Caused by:`
@@ -6516,6 +6882,8 @@ mod tests {
             store: None,
             client: None,
             buckets: Vec::new(),
+            bucket_filter: String::new(),
+            bucket_filter_input: None,
             bucket: Some("demo".into()),
             prefix: String::new(),
             entries,
@@ -6544,6 +6912,7 @@ mod tests {
             thumbnails: HashMap::new(),
             profiles_open: false,
             sso: None,
+            search: None,
             palette: None,
             palette_selected: 0,
             palette_scroll: UniformListScrollHandle::new(),
@@ -6560,8 +6929,10 @@ mod tests {
             caps_task: None,
             thumb_task: None,
             tick_task: None,
+            search_task: None,
             _appearance: None,
             _filter_events: None,
+            _bucket_filter_events: None,
         };
         browser.resort_and_filter();
         browser
@@ -6987,6 +7358,66 @@ mod tests {
         let viet = "khoá-bí-mật-rất-dài-không-nên-xuống-dòng";
         let cut = elide_middle(viet, 12);
         assert_eq!(cut.chars().count(), 12);
+    }
+
+    #[gpui::test]
+    fn the_sidebar_filter_is_accent_blind_like_the_rest(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| offline(Vec::new(), cx));
+
+        entity.update(cx, |browser, _| {
+            browser.buckets = vec!["ảnh-2026".into(), "reports".into(), "logs".into()];
+
+            // Nothing typed shows everything.
+            assert_eq!(browser.visible_buckets().len(), 3);
+
+            // Typed without diacritics, which is how Vietnamese gets typed at a
+            // keyboard more often than not.
+            browser.bucket_filter = "anh".into();
+            assert_eq!(browser.visible_buckets(), vec![SharedString::from("ảnh-2026")]);
+
+            // And with them.
+            browser.bucket_filter = "Ảnh".into();
+            assert_eq!(browser.visible_buckets().len(), 1);
+
+            browser.bucket_filter = "og".into();
+            assert_eq!(browser.visible_buckets(), vec![SharedString::from("logs")]);
+        });
+    }
+
+    #[gpui::test]
+    fn the_list_filter_is_accent_blind_too(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![entry("báo-cáo.txt", false, 1), entry("notes.txt", false, 2)],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, _| {
+            // Same rule as the search that fills this list, so filtering a set
+            // of results by the query that found them cannot hide any of them.
+            browser.filter = "bao".into();
+            browser.resort_and_filter();
+            assert_eq!(row_names(browser), vec!["báo-cáo.txt"]);
+        });
+    }
+
+    #[test]
+    fn a_stopped_scan_never_reads_as_a_finished_one() {
+        // The whole point of saying anything at all. "Không tìm thấy" from a
+        // scan that covered a tenth of the bucket is a claim the app has no
+        // basis for, and it is the claim that sends someone looking for a file
+        // somewhere else entirely.
+        assert!(search_summary(12, 4000, 4, true, false).contains("xong"));
+        assert!(search_summary(12, 4000, 4, false, true).contains("đang quét"));
+        assert!(search_summary(12, 4000, 4, false, false).contains("đã dừng"));
+
+        // The request count is there because that is the line item on the bill,
+        // not the key count.
+        let line = search_summary(0, 9000, 9, false, true);
+        assert!(line.contains("9 yêu cầu"), "{line}");
+        assert!(line.contains("9000 mục"), "{line}");
+        assert!(line.starts_with("0 kết quả"), "{line}");
     }
 
     #[test]
