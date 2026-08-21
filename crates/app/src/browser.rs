@@ -64,6 +64,7 @@ const PROFILE_DIALOG_WIDTH: f32 = 560.;
 /// inspector was to be able to see the thing.
 const PREVIEW_WIDTH: f32 = 760.;
 const PREVIEW_HEIGHT: f32 = 560.;
+const EDITOR_HEIGHT: f32 = 380.;
 /// Right-hand inspector.
 const INSPECTOR_WIDTH: f32 = 320.;
 /// Tall enough for every command without scrolling; it scrolls anyway once a
@@ -290,6 +291,14 @@ pub struct Previewing {
     name: SharedString,
     /// `None` while the bytes are on their way.
     content: Option<Preview>,
+    /// The object's size as the listing reported it. Kept because editing is
+    /// only safe when the preview holds the *whole* object: saving back a
+    /// truncated one would delete everything past the limit.
+    size: i64,
+    /// The editor, once someone has asked for it.
+    editing: Option<Entity<InputState>>,
+    /// True while the edit is being written back.
+    saving: bool,
 }
 
 /// What a preview can show of an object's contents. Only ever holds the first
@@ -3113,7 +3122,14 @@ impl Browser {
         cx.notify();
     }
 
-    fn open_palette(&mut self, cx: &mut Context<Self>) {
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Take the keyboard back first. The root's key handler *observes* keys;
+        // it does not consume them, so a focused text field keeps receiving
+        // everything typed into the palette. Opening it while the caret sat in
+        // the editor typed the query into the file as well — and the Enter that
+        // ran the command put a newline in there too.
+        self.focus.focus(window);
+
         self.palette = Some(String::new());
         self.palette_selected = 0;
         cx.notify();
@@ -3176,6 +3192,12 @@ impl Browser {
             Command::CopyKey => self.copy_location(false, cx),
             Command::AclFolderPrivate => self.set_acl_recursive("private", cx),
             Command::AclFolderPublic => self.set_acl_recursive("public-read", cx),
+            Command::EditText => {
+                if let Some(window) = window {
+                    self.start_editing(window, cx);
+                }
+            }
+            Command::SaveText => self.save_edit(cx),
             Command::Filter => {
                 if let Some(window) = window {
                     self.focus_filter(window, cx);
@@ -3572,6 +3594,9 @@ impl Browser {
             key: key.clone(),
             name: entry_name_of(&key).into(),
             content: None,
+            size,
+            editing: None,
+            saving: false,
         });
 
         // An image has to arrive whole to decode, so an oversized one is refused
@@ -3619,6 +3644,111 @@ impl Browser {
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Whether what is on screen is the whole object, byte for byte.
+    ///
+    /// The one question editing turns on. A preview stops at the limit, and
+    /// saving back what a truncated preview holds would delete the rest of the
+    /// file — quietly, and with no way back on a bucket without versioning.
+    fn preview_is_whole(&self) -> bool {
+        self.previewing.as_ref().is_some_and(|previewing| {
+            preview_holds_whole_object(previewing.size, self.settings.preview_limit_bytes())
+        })
+    }
+
+    /// Opens the text in an editor, seeded with exactly what was fetched.
+    fn start_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preview_is_whole() {
+            return;
+        }
+        let Some(text) = self.previewing.as_ref().and_then(|previewing| {
+            match previewing.content.as_ref() {
+                Some(Preview::Text(text)) => Some(text.to_string()),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+
+        let editor = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(18)
+        });
+        editor.update(cx, |editor, cx| {
+            editor.set_value(text, window, cx);
+            editor.focus(window, cx);
+        });
+        if let Some(previewing) = self.previewing.as_mut() {
+            previewing.editing = Some(editor);
+        }
+        cx.notify();
+    }
+
+    /// Writes the edited text back over the object.
+    fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let Some((key, editor)) = self
+            .previewing
+            .as_ref()
+            .and_then(|p| p.editing.clone().map(|editor| (p.key.clone(), editor)))
+        else {
+            return;
+        };
+        // Checked again here, not only when the editor opened: the setting can
+        // change while it is open, and overwriting an object with a truncated
+        // copy is not a mistake anyone recovers from without versioning.
+        if !self.preview_is_whole() {
+            return;
+        }
+
+        let text = editor.read(cx).value().to_string();
+        if let Some(previewing) = self.previewing.as_mut() {
+            previewing.saving = true;
+        }
+        self.status = format!("Đang lưu {}…", entry_name_of(&key)).into();
+
+        let target = key.clone();
+        let writing = Tokio::spawn(cx, async move {
+            // `PutObject` writes a new object over the old one, and a new object
+            // has no tags. Reading them first and putting them back is two extra
+            // requests on a save; silently dropping someone's cost-allocation
+            // tags because they fixed a typo is not a trade.
+            let tags = client.object_tags(&bucket, &target).await.unwrap_or_default();
+            client.put_object(&bucket, &target, text.into_bytes()).await?;
+            if !tags.is_empty() {
+                client.set_object_tags(&bucket, &target, &tags).await?;
+            }
+            anyhow::Ok(())
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = writing.await;
+            _ = this.update(cx, |this, cx| {
+                if let Some(previewing) = this.previewing.as_mut() {
+                    previewing.saving = false;
+                }
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.status = format!("Đã lưu {}", entry_name_of(&key)).into();
+                        this.previewing = None;
+                        // The size and date on the row are now the old ones.
+                        if let (Some(bucket), prefix) =
+                            (this.bucket.clone(), this.prefix.clone())
+                        {
+                            this.open(bucket, prefix, cx);
+                        }
+                    }
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
+                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
                 }
                 cx.notify();
             });
@@ -4519,6 +4649,13 @@ impl Browser {
 
     // ------------------------------------------------------------------ input
 
+    fn editor_focused(&self, window: &Window, cx: &App) -> bool {
+        self.previewing
+            .as_ref()
+            .and_then(|previewing| previewing.editing.as_ref())
+            .is_some_and(|editor| editor.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     fn path_focused(&self, window: &Window, cx: &App) -> bool {
         self.path_input
             .as_ref()
@@ -4664,7 +4801,7 @@ impl Browser {
                 "a" => return self.select_all(cx),
                 "enter" => return self.start_rename(window, cx),
                 "i" => return self.toggle_inspector(cx),
-                "k" => return self.open_palette(cx),
+                "k" => return self.open_palette(window, cx),
                 "t" => return self.new_tab(window, cx),
                 "l" => return self.edit_path(window, cx),
                 // ⌘1 to ⌘9, like every browser. ⌘9 is the last tab rather than
@@ -4705,6 +4842,17 @@ impl Browser {
                 "enter" if !self.filter_focused(window, cx) => return self.open_cursor(cx),
                 _ => {}
             }
+        }
+
+        // The text editor takes everything: Enter is a newline there, and the
+        // arrow keys move a caret. Without this they reached the list
+        // underneath — Enter opening whatever row the cursor was on, in the
+        // middle of typing.
+        if self.editor_focused(window, cx) {
+            if keystroke.key == "escape" {
+                self.close_preview(cx);
+            }
+            return;
         }
 
         if self.previewing.is_some() && keystroke.key == "escape" {
@@ -5409,6 +5557,36 @@ impl Browser {
                                         .text_color(theme.text)
                                         .child(previewing.name.clone()),
                                 )
+                                // Only for text, and only when the whole object
+                                // is here. Editing a preview that stopped at the
+                                // limit and saving it back would delete the rest
+                                // of the file.
+                                .when(
+                                    previewing.editing.is_none()
+                                        && matches!(
+                                            previewing.content,
+                                            Some(Preview::Text(_))
+                                        )
+                                        && self.preview_is_whole(),
+                                    |this| {
+                                        this.child(
+                                            action_button("preview-edit", "Sửa", theme).on_click(
+                                                cx.listener(|this, _event, window, cx| {
+                                                    this.start_editing(window, cx)
+                                                }),
+                                            ),
+                                        )
+                                    },
+                                )
+                                .when(previewing.editing.is_some(), |this| {
+                                    this.child(
+                                        action_button("preview-save", "Lưu", theme).on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.save_edit(cx)
+                                            }),
+                                        ),
+                                    )
+                                })
                                 .child(
                                     icon_button("preview-close", "close", theme).on_click(
                                         cx.listener(|this, _event, _window, cx| {
@@ -5424,7 +5602,32 @@ impl Browser {
                                 .min_h(px(0.))
                                 .overflow_scroll()
                                 .p_3()
-                                .child(match previewing.content.as_ref() {
+                                .when_some(previewing.editing.clone(), |this, editor| {
+                                    this.child(
+                                        div()
+                                            .font_family(self.mono_font.clone())
+                                            .text_xs()
+                                            // Height on the element, not rows
+                                            // on the state: `rows` did nothing
+                                            // here and the box came out one
+                                            // line tall with the rest of the
+                                            // file hidden behind it.
+                                            .child(Input::new(&editor).h(px(EDITOR_HEIGHT))),
+                                    )
+                                })
+                                .when(previewing.editing.is_some(), |this| {
+                                    this.when(previewing.saving, |this| {
+                                        this.child(
+                                            div()
+                                                .pt_2()
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child("Đang lưu…"),
+                                        )
+                                    })
+                                })
+                                .when(previewing.editing.is_none(), |this| {
+                                this.child(match previewing.content.as_ref() {
                                     None => div()
                                         .text_xs()
                                         .text_color(theme.text_faint)
@@ -5448,6 +5651,7 @@ impl Browser {
                                         .text_color(theme.text_faint)
                                         .child("Không xem trước được kiểu này")
                                         .into_any_element(),
+                                })
                                 }),
                         ),
                 ),
@@ -5871,7 +6075,7 @@ impl Browser {
             // anyone who does not already know it is there.
             .child(
                 icon_button("commands", "more", theme)
-                    .on_click(cx.listener(|this, _event, _window, cx| this.open_palette(cx))),
+                    .on_click(cx.listener(|this, _event, window, cx| this.open_palette(window, cx))),
             )
     }
 
@@ -9365,6 +9569,16 @@ fn choice_chip(
         .child(label)
 }
 
+/// Whether a preview of an object that size holds all of it.
+///
+/// The gate on editing. A preview fetches at most the limit, so anything larger
+/// arrives cut short — and saving a cut-short copy back over the object deletes
+/// everything past the cut, silently, with no way back on a bucket that does not
+/// keep versions.
+fn preview_holds_whole_object(size: i64, limit: u64) -> bool {
+    size >= 0 && (size as u64) <= limit
+}
+
 /// What lands on the clipboard when a selection is copied as text.
 ///
 /// Newline-separated because the two things anyone does with several keys —
@@ -9539,6 +9753,8 @@ pub enum Command {
     CopyKey,
     AclFolderPrivate,
     AclFolderPublic,
+    EditText,
+    SaveText,
     GoUp,
     Filter,
     NewFolder,
@@ -9581,6 +9797,8 @@ impl Command {
             Command::CopyKey => ("Chép key", ""),
             Command::AclFolderPrivate => ("Thư mục: đặt riêng tư", ""),
             Command::AclFolderPublic => ("Thư mục: ai cũng đọc được", ""),
+            Command::EditText => ("Sửa nội dung", ""),
+            Command::SaveText => ("Lưu nội dung", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -9603,7 +9821,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 33] {
+    fn all() -> [Command; 35] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -9638,6 +9856,8 @@ impl Command {
             Command::CopyKey,
             Command::AclFolderPrivate,
             Command::AclFolderPublic,
+            Command::EditText,
+            Command::SaveText,
         ]
     }
 }
@@ -10616,7 +10836,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 33);
+        assert_eq!(all.len(), 35);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
@@ -10796,6 +11016,27 @@ mod tests {
         // send someone to a bucket they did not name.
         assert_eq!(path("s3://demo-bucket@/x"), None);
         assert_eq!(path("s3://@eu-west-1/x"), None);
+    }
+
+    #[test]
+    fn editing_is_refused_for_anything_the_preview_cut_short() {
+        let limit = 8 * 1024 * 1024;
+
+        // All of it is here: safe to edit and write back.
+        assert!(preview_holds_whole_object(0, limit));
+        assert!(preview_holds_whole_object(1024, limit));
+        // Exactly the limit is still all of it.
+        assert!(preview_holds_whole_object(limit as i64, limit));
+
+        // One byte over and the preview stopped short. Saving that back deletes
+        // everything past the cut, quietly, with no way back on a bucket that
+        // keeps no versions. This is the one assertion in this file that stands
+        // between a text editor and data loss.
+        assert!(!preview_holds_whole_object(limit as i64 + 1, limit));
+        assert!(!preview_holds_whole_object(2 * 1024 * 1024 * 1024, limit));
+
+        // A size the listing could not report is not a size worth trusting.
+        assert!(!preview_holds_whole_object(-1, limit));
     }
 
     #[test]

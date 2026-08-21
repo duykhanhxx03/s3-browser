@@ -551,9 +551,8 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
 
 ### Tính năng
 
-9. **Sửa tệp tại chỗ.** Brows3 nhúng Monaco. Với GPUI thì không có sẵn editor,
-   nhưng `Input` nhiều dòng đủ cho JSON và text nhỏ — đó cũng là phần lớn ca dùng.
-   Cần khoá theo kích thước và cảnh báo ghi đè.
+9. ~~**Sửa tệp tại chỗ**~~ — xong (21/08/2026). `Input` nhiều dòng trong modal
+   xem trước, chỉ mở khi preview giữ *trọn* object, và giữ lại thẻ khi lưu.
 10. **Preview audio, video, PDF.** Hiện chỉ ảnh, text và bảng — nhưng đã ra
     modal riêng (21/08/2026) nên chỗ để hiển thị đã có sẵn.
 11. ~~**Trần cho tìm kiếm sâu**~~ — xong (21/08/2026). 100 yêu cầu / 100.000 mục
