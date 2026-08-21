@@ -100,6 +100,8 @@ const CRUMBS_SHOWN: usize = 3;
 const PATH_SUGGESTIONS: usize = 8;
 /// Wide enough for `bucket/prefix/deeper/` without being as wide as the window.
 const PATH_SUGGEST_WIDTH: f32 = 460.;
+/// Wide enough for `21 thg 8 16:44`, which is the longest this-year form.
+const BUCKET_CREATED_WIDTH: f32 = 130.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
 /// the log without bound otherwise, and nobody reads the fiftieth copy.
 const FAILURE_LIMIT: usize = 50;
@@ -337,6 +339,7 @@ pub enum Screen {
     #[default]
     Objects,
     Recent,
+    Buckets,
 }
 
 /// An in-flight SSO sign-in. The device flow is two waits with a browser trip
@@ -626,6 +629,13 @@ pub struct Browser {
     /// list after a restart is a list nobody asked for, and the first request of
     /// a session has to happen anyway.
     bucket_cache: HashMap<String, (Vec<SharedString>, i64)>,
+    /// When each bucket was created, as `ListBuckets` reported it.
+    ///
+    /// Keyed by name rather than held as rows, so the page always lists exactly
+    /// what the sidebar lists: creating or deleting a bucket updates the name
+    /// list from several places, and a second list of rows would drift out of
+    /// step with it. A missing entry is a dash, not a gap in the table.
+    bucket_created: HashMap<String, i64>,
     /// Whether what the sidebar shows came from that cache. Said out loud,
     /// because a bucket someone just made in the console not appearing is
     /// otherwise indistinguishable from the app being broken.
@@ -961,6 +971,7 @@ impl Browser {
             client: None,
             buckets: Vec::new(),
             bucket_cache: HashMap::new(),
+            bucket_created: HashMap::new(),
             buckets_cached: false,
             bucket_cache_bypass: false,
             bucket_filter: String::new(),
@@ -1145,11 +1156,20 @@ impl Browser {
             let buckets = match cached {
                 Some(cached) => {
                     debug_log!("buckets from cache: {}", cached.len());
-                    Ok(cached.iter().map(|b| b.to_string()).collect())
+                    Ok(cached
+                        .iter()
+                        .map(|name| s3core::BucketInfo {
+                            name: name.to_string(),
+                            // The cache holds names only. The date is filled in
+                            // again on the next real fetch; a page showing dashes
+                            // for a few minutes beats a request nobody asked for.
+                            created: None,
+                        })
+                        .collect())
                 }
                 None => {
                     debug_log!("buckets: asking the provider");
-                    client.list_buckets().await
+                    client.list_buckets_detailed().await
                 }
             };
             anyhow::Ok((client, buckets))
@@ -1167,7 +1187,12 @@ impl Browser {
                                 this.bucket_cache.insert(
                                     profile_id.clone(),
                                     (
-                                        buckets.iter().cloned().map(SharedString::from).collect(),
+                                        buckets
+                                            .iter()
+                                            .map(|bucket| {
+                                                SharedString::from(bucket.name.clone())
+                                            })
+                                            .collect(),
                                         // Not refreshed on a cache hit: the age
                                         // shown has to be the age of the answer,
                                         // not of the last time it was reused.
@@ -1200,8 +1225,12 @@ impl Browser {
                                 Vec::new()
                             }
                         };
-                        debug_log!("connected: {} buckets {:?}", buckets.len(), buckets);
-                        this.buckets = buckets.into_iter().map(SharedString::from).collect();
+                        debug_log!("connected: {} buckets", buckets.len());
+                        this.remember_bucket_dates(&buckets);
+                        this.buckets = buckets
+                            .into_iter()
+                            .map(|bucket| SharedString::from(bucket.name))
+                            .collect();
                         this.client = Some(client);
                         // `--open bucket/prefix/` jumps straight to a location,
                         // which keeps deep prefixes reachable from a script.
@@ -2227,14 +2256,17 @@ impl Browser {
             return;
         };
 
-        let listing = Tokio::spawn(cx, async move { client.list_buckets().await });
+        let listing = Tokio::spawn(cx, async move { client.list_buckets_detailed().await });
         self.op_task = Some(cx.spawn(async move |this, cx| {
             let outcome = listing.await;
             _ = this.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok(buckets)) => {
-                        let buckets: Vec<SharedString> =
-                            buckets.into_iter().map(SharedString::from).collect();
+                    Ok(Ok(listed)) => {
+                        this.remember_bucket_dates(&listed);
+                        let buckets: Vec<SharedString> = listed
+                            .into_iter()
+                            .map(|bucket| SharedString::from(bucket.name))
+                            .collect();
                         this.bucket_cache
                             .insert(profile, (buckets.clone(), s3core::now_epoch()));
                         this.buckets = buckets;
@@ -2293,14 +2325,16 @@ impl Browser {
         self.open(place.bucket.clone().into(), place.prefix.clone(), cx);
     }
 
-    fn show_recent(&mut self, cx: &mut Context<Self>) {
-        // A toggle, so the same row that opened it closes it. The alternative
-        // is a page with no way back except opening something, which forces a
-        // navigation on someone who only wanted a look.
-        self.screen = if self.screen == Screen::Recent {
+    /// Shows a page, or goes back to the listing if it is already showing.
+    ///
+    /// A toggle, so the same row that opened it closes it. The alternative is a
+    /// page with no way back except opening something, which forces a
+    /// navigation on someone who only wanted a look.
+    fn show_screen(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        self.screen = if self.screen == screen {
             Screen::Objects
         } else {
-            Screen::Recent
+            screen
         };
         cx.notify();
     }
@@ -2518,6 +2552,18 @@ impl Browser {
     }
 
     /// Creating a bucket makes any remembered list wrong, so the entry goes.
+    /// Keeps the dates a listing reported, dropping nothing already known.
+    ///
+    /// Merged rather than replaced because a cached restore carries no dates:
+    /// overwriting with `None` would blank a column that was already filled.
+    fn remember_bucket_dates(&mut self, listed: &[s3core::BucketInfo]) {
+        for bucket in listed {
+            if let Some(created) = bucket.created {
+                self.bucket_created.insert(bucket.name.clone(), created);
+            }
+        }
+    }
+
     fn forget_bucket_cache(&mut self) {
         if let Some(profile) = self
             .active_profile
@@ -3336,7 +3382,8 @@ impl Browser {
                 }
             }
             Command::ToggleFavorite => self.toggle_favorite(cx),
-            Command::Recent => self.show_recent(cx),
+            Command::Recent => self.show_screen(Screen::Recent, cx),
+            Command::Buckets => self.show_screen(Screen::Buckets, cx),
             Command::Settings => {
                 self.settings_open = true;
                 cx.notify();
@@ -5335,9 +5382,21 @@ impl Browser {
             // comes and goes is one nobody learns the position of. The page it
             // opens says so itself when there is nothing in it.
             .child(
+                sidebar_nav(
+                    "nav-buckets",
+                    "folder",
+                    "Tất cả bucket",
+                    self.screen == Screen::Buckets,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.show_screen(Screen::Buckets, cx);
+                })),
+            )
+            .child(
                 sidebar_nav("nav-recent", "clock", "Gần đây", self.screen == Screen::Recent, theme)
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.show_recent(cx);
+                        this.show_screen(Screen::Recent, cx);
                     })),
             )
             .children(self.render_places(cx))
@@ -5770,6 +5829,146 @@ impl Browser {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// Every bucket, with what the listing already knew about it.
+    ///
+    /// The sidebar has the same names in a column one word wide; this is where
+    /// the rest of `ListBuckets` goes. There is no size column: the number does
+    /// not come back with the listing and working it out means walking every
+    /// object in every bucket. Brows3 has that column and its backend never
+    /// fills it in — a column that reads `—` forever is furniture, not data.
+    fn render_buckets_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let buckets = self.visible_buckets();
+        let current = self.bucket.clone();
+
+        div()
+            .id("buckets-page")
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(TOOLBAR_HEIGHT))
+                    .flex_shrink_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_sm()
+                            .text_color(theme.text)
+                            .child("Tất cả bucket"),
+                    )
+                    .child(
+                        action_button("buckets-refresh", "Làm mới", theme).on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.bucket_cache_bypass = true;
+                                this.refresh_buckets(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        icon_button("buckets-close", "close", theme).on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.screen = Screen::Objects;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            // The same column header the listing uses, so the two pages read as
+            // two views of one app rather than two apps.
+            .child(
+                div()
+                    .h(px(HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child(div().flex_1().min_w(px(0.)).child("Tên"))
+                    .child(div().w(px(BUCKET_CREATED_WIDTH)).child("Ngày tạo")),
+            )
+            .when(buckets.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(sized_icon("folder", 24., theme.text_faint))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.text_muted)
+                                .child("Chưa thấy bucket nào"),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("buckets-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_scroll()
+                    .children(buckets.into_iter().enumerate().map(|(index, name)| {
+                        let target = name.clone();
+                        let selected = current.as_ref() == Some(&name);
+                        let created = self
+                            .bucket_created
+                            .get(name.as_ref())
+                            .map(|at| s3core::format_timestamp(*at))
+                            .unwrap_or_else(|| "—".to_string());
+                        div()
+                            .id(SharedString::from(format!("bucket-row-{index}")))
+                            .h(px(ROW_HEIGHT))
+                            .w_full()
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(selected, |this| this.bg(theme.selected))
+                            .hover(|this| this.bg(theme.hover))
+                            .child(sized_icon("folder", 14., theme.text_faint))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_color(theme.text)
+                                    .child(name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(BUCKET_CREATED_WIDTH))
+                                    .whitespace_nowrap()
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(created)),
+                            )
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.screen = Screen::Objects;
+                                this.open(target.clone(), String::new(), cx);
+                            }))
+                    })),
+            )
     }
 
     /// The history page.
@@ -8853,6 +9052,9 @@ impl Render for Browser {
                     .when(self.screen == Screen::Recent, |this| {
                         this.child(self.render_recent_page(cx))
                     })
+                    .when(self.screen == Screen::Buckets, |this| {
+                        this.child(self.render_buckets_page(cx))
+                    })
                     .when(self.screen == Screen::Objects, |this| {
                         this.child(
                         div()
@@ -10446,6 +10648,7 @@ pub enum Command {
     GoToPath,
     ToggleFavorite,
     Recent,
+    Buckets,
     Settings,
     CopyPath,
     CopyKey,
@@ -10491,6 +10694,7 @@ impl Command {
             Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
             Command::ToggleFavorite => ("Ghim nơi này", ""),
             Command::Recent => ("Gần đây", ""),
+            Command::Buckets => ("Tất cả bucket", ""),
             Command::Settings => ("Cài đặt", ""),
             Command::CopyPath => ("Chép đường dẫn s3://", ""),
             Command::CopyKey => ("Chép key", ""),
@@ -10520,7 +10724,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 36] {
+    fn all() -> [Command; 37] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -10551,6 +10755,7 @@ impl Command {
             Command::GoToPath,
             Command::ToggleFavorite,
             Command::Recent,
+            Command::Buckets,
             Command::Settings,
             Command::CopyPath,
             Command::CopyKey,
@@ -10775,6 +10980,7 @@ mod tests {
             client: None,
             buckets: Vec::new(),
             bucket_cache: HashMap::new(),
+            bucket_created: HashMap::new(),
             buckets_cached: false,
             bucket_cache_bypass: false,
             bucket_filter: String::new(),
@@ -11547,7 +11753,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 36);
+        assert_eq!(all.len(), 37);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");

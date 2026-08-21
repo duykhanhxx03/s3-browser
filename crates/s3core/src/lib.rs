@@ -392,6 +392,21 @@ impl S3Client {
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_buckets_detailed()
+            .await?
+            .into_iter()
+            .map(|bucket| bucket.name)
+            .collect())
+    }
+
+    /// The same call, keeping what it already told us.
+    ///
+    /// `ListBuckets` returns a creation date alongside every name and this app
+    /// used to throw it away. One implementation with two shapes rather than
+    /// two calls: asking twice for what one response carries is the sort of
+    /// waste that shows up on someone's bill.
+    pub async fn list_buckets_detailed(&self) -> Result<Vec<BucketInfo>> {
         let out = self
             .inner
             .list_buckets()
@@ -402,7 +417,12 @@ impl S3Client {
         Ok(out
             .buckets()
             .iter()
-            .filter_map(|b| b.name().map(str::to_owned))
+            .filter_map(|bucket| {
+                Some(BucketInfo {
+                    name: bucket.name()?.to_owned(),
+                    created: bucket.creation_date().map(|date| date.secs()),
+                })
+            })
             .collect())
     }
 
@@ -1993,6 +2013,19 @@ pub struct ObjectHeaders {
 ///
 /// `None` for a name with no extension or one nobody has registered — claiming
 /// a type there would be worse than the provider's own default.
+/// A bucket, with what `ListBuckets` says about it.
+///
+/// No region here even though the SDK's `Bucket` has the field: S3 only fills
+/// it in when the request carried a parameter, so on a plain `ListBuckets` it
+/// is `None` everywhere and a column fed from it would read `—` forever. Region
+/// per bucket is a thing this app discovers by other means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BucketInfo {
+    pub name: String,
+    /// Epoch seconds, absent on providers that do not report one.
+    pub created: Option<i64>,
+}
+
 /// Puts a scheme on an endpoint that was typed without one.
 ///
 /// `s3.example.com` is what people type, and what the AWS SDK answers with is

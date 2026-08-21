@@ -735,11 +735,21 @@ của toolbar**. Tệ hơn: cắt thì cắt phần **đuôi**, tức là đúng
 vẫn gõ chay. Placeholder của họ còn dạy luôn cú pháp:
 `s3://bucket@region/folder/`.
 
-**c. Danh sách bucket đáng có một *trang*, không chỉ một cột sidebar.** Home của
-họ là bảng: Bucket | Region | Created | Total Size. Region và Created có sẵn
-trong `ListBuckets`, không tốn thêm request nào. Mình chỉ có tên trong sidebar.
-**Học ngược một chỗ:** `total_size` phía Rust của họ **luôn là `None`** — một cột
-vĩnh viễn hiện `—`. Cột không bao giờ có dữ liệu là đồ đạc chết, đừng chép.
+**c. ~~Danh sách bucket đáng có một *trang*~~** — xong (21/08/2026). Home của họ là
+bảng: Bucket | Region | Created | Total Size. Mình làm **Tên | Ngày tạo**, và
+thiếu hai cột kia là có lý do:
+
+- **Total Size**: `total_size` phía Rust của họ **luôn là `None`** — một cột vĩnh
+  viễn hiện `—`. Cột không bao giờ có dữ liệu là đồ đạc chết. Con số đó không về
+  cùng `ListBuckets`, tính nó là đi hết mọi object trong mọi bucket.
+- **Region**: SDK *có* trường `bucket_region`, nhưng tài liệu ghi rõ nó chỉ được
+  điền "if the request contains at least one valid parameter" — `ListBuckets`
+  trần thì `None`, và MinIO cũng không trả. Thành ra đúng cái bẫy vừa nói. Region
+  theo từng bucket sẽ có nguồn thật khi làm §10.3, lúc đó thêm cột mới có nghĩa.
+
+Ngày tạo thì `ListBuckets` trả sẵn và app đang vứt đi. Một cài đặt, hai hình
+dạng (`list_buckets` gọi `list_buckets_detailed` rồi bỏ bớt) — hỏi hai lần cho
+thứ một câu trả lời đã mang theo là loại lãng phí hiện lên hoá đơn.
 
 **d. Hàng đợi gom theo thư mục.** Tải lên một thư mục 200 tệp là **một dòng mở
 được**, không phải 200 dòng. Ngăn kéo của mình đang phẳng.
