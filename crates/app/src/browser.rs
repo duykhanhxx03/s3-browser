@@ -244,6 +244,8 @@ pub struct Inspection {
 pub enum Preview {
     Image(std::sync::Arc<gpui::Image>),
     Text(SharedString),
+    /// Delimited text, laid out in columns.
+    Table(Table),
     /// Fetched, but not something worth rendering as either.
     Unsupported,
 }
@@ -5050,6 +5052,87 @@ impl Browser {
                             .text_color(theme.text_muted)
                             .child(text.clone())
                             .into_any_element(),
+                        Preview::Table(table) => {
+                            let widths = table_column_widths(table);
+                            let cell = move |text: &String, width: f32, color: gpui::Hsla| {
+                                div()
+                                    .w(px(width))
+                                    .flex_shrink_0()
+                                    .pr_2()
+                                    .overflow_hidden()
+                                    // Without this a cell whose text is a few
+                                    // pixels wider than its computed box wraps
+                                    // onto a second line and every column after
+                                    // it stops lining up. The width is derived
+                                    // from a character count, and a character
+                                    // count is never exactly a pixel count.
+                                    .whitespace_nowrap()
+                                    .text_color(color)
+                                    .child(SharedString::from(elide_middle(
+                                        text,
+                                        TABLE_CELL_CHARS,
+                                    )))
+                            };
+                            div()
+                                .id("preview-table")
+                                .max_h(px(220.))
+                                // Both axes: a table is wide as often as it is
+                                // long, and clipping a column is losing data
+                                // with no way to ask for it back.
+                                .overflow_scroll()
+                                .p_2()
+                                .rounded_md()
+                                .bg(theme.hover)
+                                .font_family(self.mono_font.clone())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .pb_1()
+                                                .mb_1()
+                                                .border_b_1()
+                                                .border_color(theme.border)
+                                                .children(
+                                                    table.headers.iter().enumerate().map(
+                                                        |(ix, text)| {
+                                                            cell(
+                                                                text,
+                                                                widths[ix],
+                                                                theme.text,
+                                                            )
+                                                        },
+                                                    ),
+                                                ),
+                                        )
+                                        .children(table.rows.iter().map(|row| {
+                                            div().flex().children(
+                                                row.iter().enumerate().map(|(ix, text)| {
+                                                    cell(text, widths[ix], theme.text_muted)
+                                                }),
+                                            )
+                                        }))
+                                        // Said out loud, because a preview that
+                                        // silently stops looks like a file that
+                                        // ends there.
+                                        .when(
+                                            table.hidden_rows > 0 || table.hidden_columns > 0,
+                                            |this| {
+                                                this.child(
+                                                    div()
+                                                        .pt_1()
+                                                        .text_color(theme.text_faint)
+                                                        .child(SharedString::from(
+                                                            hidden_note(table),
+                                                        )),
+                                                )
+                                            },
+                                        ),
+                                )
+                                .into_any_element()
+                        }
                         Preview::Unsupported => div()
                             .text_color(theme.text_faint)
                             .child("Không xem trước được kiểu này")
@@ -6692,6 +6775,129 @@ const PRESIGN_PRESETS: [(&str, Duration); 4] = [
 /// Turns fetched bytes into something renderable. Text that is not valid UTF-8
 /// is treated as unsupported rather than shown as replacement characters —
 /// mojibake looks like corruption of the object itself.
+/// How much of a delimited file the preview keeps. A preview is for deciding
+/// whether this is the right file, not for reading it.
+const TABLE_ROWS: usize = 200;
+const TABLE_COLUMNS: usize = 24;
+/// Where a cell gets elided. Wide enough for a date, a name or an id; a column
+/// of essays would otherwise push every other column off the panel.
+const TABLE_CELL_CHARS: usize = 28;
+
+/// Splits delimited text into rows, following RFC 4180.
+///
+/// Hand-rolled rather than pulled in: the rules are four lines long and the
+/// naive `split(',')` that everyone writes instead is wrong on the first file
+/// with a comma inside a quoted field — which, for a CSV, is most of them.
+fn parse_rows(text: &str, delimiter: char) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                // Doubled quotes are one literal quote; a single one ends the
+                // quoting.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if c == '"' && field.is_empty() {
+            quoted = true;
+        } else if c == delimiter {
+            row.push(std::mem::take(&mut field));
+        } else if c == '\n' {
+            row.push(std::mem::take(&mut field));
+            rows.push(std::mem::take(&mut row));
+        } else if c != '\r' {
+            // A bare `\r` is the other half of a CRLF; the `\n` ends the row.
+            field.push(c);
+        }
+    }
+
+    // A file that does not end in a newline still has a last row. One that does
+    // must not gain an empty one.
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+fn parse_table(text: &str, delimiter: char) -> Table {
+    let mut rows = parse_rows(text, delimiter);
+    if rows.is_empty() {
+        return Table {
+            headers: Vec::new(),
+            rows: Vec::new(),
+            hidden_rows: 0,
+            hidden_columns: 0,
+        };
+    }
+
+    let widest = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let hidden_columns = widest.saturating_sub(TABLE_COLUMNS);
+    for row in &mut rows {
+        row.truncate(TABLE_COLUMNS);
+        // Short rows are padded so the columns stay aligned. A ragged file is
+        // common and is not a reason to refuse to show it.
+        row.resize(widest.min(TABLE_COLUMNS), String::new());
+    }
+
+    let headers = rows.remove(0);
+    let hidden_rows = rows.len().saturating_sub(TABLE_ROWS);
+    rows.truncate(TABLE_ROWS);
+
+    Table {
+        headers,
+        rows,
+        hidden_rows,
+        hidden_columns,
+    }
+}
+
+/// Column widths in pixels, from the longest cell in each column.
+///
+/// Equal-width columns would waste the panel on a table of short ids and elide
+/// the one column that has anything in it.
+fn table_column_widths(table: &Table) -> Vec<f32> {
+    // Menlo at this size, measured a little generously. Approximate on purpose:
+    // a monospace face makes it close enough for the columns to line up, and
+    // rounding up costs a few pixels while rounding down clips text.
+    const CHAR_WIDTH: f32 = 7.6;
+    const PADDING: f32 = 12.0;
+
+    let columns = table.headers.len();
+    (0..columns)
+        .map(|ix| {
+            let longest = std::iter::once(&table.headers[ix])
+                .chain(table.rows.iter().filter_map(|row| row.get(ix)))
+                .map(|text| text.chars().count())
+                .max()
+                .unwrap_or(0)
+                .clamp(3, TABLE_CELL_CHARS);
+            longest as f32 * CHAR_WIDTH + PADDING
+        })
+        .collect()
+}
+
+/// What a truncated preview leaves out, in words.
+fn hidden_note(table: &Table) -> String {
+    match (table.hidden_rows, table.hidden_columns) {
+        (0, 0) => String::new(),
+        (rows, 0) => format!("còn {rows} dòng nữa"),
+        (0, columns) => format!("còn {columns} cột nữa"),
+        (rows, columns) => format!("còn {rows} dòng và {columns} cột nữa"),
+    }
+}
+
 fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
     match kind {
         PreviewKind::Image => match image_format_for_key(key) {
@@ -6702,6 +6908,10 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
         },
         PreviewKind::Text => match String::from_utf8(bytes) {
             Ok(text) => Preview::Text(text.into()),
+            Err(_) => Preview::Unsupported,
+        },
+        PreviewKind::Table(delimiter) => match String::from_utf8(bytes) {
+            Ok(text) => Preview::Table(parse_table(&text, delimiter)),
             Err(_) => Preview::Unsupported,
         },
         PreviewKind::None => Preview::Unsupported,
@@ -6742,7 +6952,26 @@ const PREVIEW_LIMIT: u64 = 8 * 1024 * 1024;
 enum PreviewKind {
     Image,
     Text,
+    /// Comma- or tab-delimited text. Worth its own kind because a CSV shown as
+    /// raw text is readable and not usable — the whole point of the file is the
+    /// columns, and they only line up by accident.
+    Table(char),
     None,
+}
+
+/// A delimited file, parsed into rows for display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Table {
+    /// The first row. CSV has no way to declare whether it has a header, so
+    /// every tool guesses, and guessing yes is right far more often than not.
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    /// Rows that exist in the file beyond the ones kept. Reported rather than
+    /// dropped in silence: a preview that stops at two hundred rows and says
+    /// nothing looks like a file with two hundred rows in it.
+    pub hidden_rows: usize,
+    /// Columns beyond those kept, for the same reason.
+    pub hidden_columns: usize,
 }
 
 /// Decides from the content type first and the extension second. The type is
@@ -6755,6 +6984,9 @@ fn preview_kind(key: &str, content_type: Option<&str>) -> PreviewKind {
             return PreviewKind::Image;
         }
         // Structured text is still text: JSON and XML are worth reading inline.
+        if mime == "text/csv" || mime == "text/tab-separated-values" {
+            return PreviewKind::Table(if mime.ends_with("csv") { ',' } else { '\t' });
+        }
         if mime.starts_with("text/")
             || matches!(mime, "application/json" | "application/xml" | "application/yaml")
         {
@@ -6770,8 +7002,10 @@ fn preview_kind(key: &str, content_type: Option<&str>) -> PreviewKind {
     let extension = key.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => PreviewKind::Image,
-        "txt" | "md" | "json" | "xml" | "yaml" | "yml" | "toml" | "csv" | "log" | "rs" | "py"
-        | "js" | "ts" | "html" | "css" | "sh" | "sql" => PreviewKind::Text,
+        "csv" => PreviewKind::Table(','),
+        "tsv" => PreviewKind::Table('\t'),
+        "txt" | "md" | "json" | "xml" | "yaml" | "yml" | "toml" | "log" | "rs" | "py" | "js"
+        | "ts" | "html" | "css" | "sh" | "sql" => PreviewKind::Text,
         _ => PreviewKind::None,
     }
 }
@@ -8055,6 +8289,105 @@ mod tests {
             next_encryption(&Encryption::Kms("k".into())),
             Some(Encryption::BucketDefault)
         );
+    }
+
+    #[test]
+    fn a_quoted_field_keeps_its_commas_and_newlines() {
+        // The reason this parser exists rather than a `split(',')`. Every one of
+        // these is ordinary in a CSV exported from a spreadsheet, and every one
+        // of them breaks the naive version.
+        let rows = parse_rows("a,\"b,c\",d\n", ',');
+        assert_eq!(rows, vec![vec!["a", "b,c", "d"]]);
+
+        // Doubled quotes are one literal quote.
+        let rows = parse_rows("\"she said \"\"hi\"\"\",x\n", ',');
+        assert_eq!(rows, vec![vec!["she said \"hi\"", "x"]]);
+
+        // A newline inside quotes is part of the field, not the end of the row.
+        let rows = parse_rows("\"line one\nline two\",x\n", ',');
+        assert_eq!(rows, vec![vec!["line one\nline two", "x"]]);
+    }
+
+    #[test]
+    fn row_endings_and_the_last_line_are_both_handled() {
+        // CRLF is what a Windows export produces, and a stray `\r` at the end of
+        // every field would show up in every cell.
+        assert_eq!(parse_rows("a,b\r\nc,d\r\n", ','), vec![vec!["a", "b"], vec!["c", "d"]]);
+
+        // A file that ends without a newline still has a last row...
+        assert_eq!(parse_rows("a,b\nc,d", ','), vec![vec!["a", "b"], vec!["c", "d"]]);
+        // ...and one that ends with a newline does not gain an empty one.
+        assert_eq!(parse_rows("a,b\n", ','), vec![vec!["a", "b"]]);
+
+        // An empty field is a field.
+        assert_eq!(parse_rows("a,,c\n", ','), vec![vec!["a", "", "c"]]);
+    }
+
+    #[test]
+    fn a_ragged_file_still_lines_up() {
+        // Short rows are common and are not a reason to refuse to show the file.
+        // Without padding, the columns after the gap slide left by one and the
+        // table reads as though the data were in different columns.
+        let table = parse_table("a,b,c\n1,2\n", ',');
+        assert_eq!(table.headers, vec!["a", "b", "c"]);
+        assert_eq!(table.rows, vec![vec!["1", "2", ""]]);
+    }
+
+    #[test]
+    fn what_is_left_out_is_counted_not_dropped() {
+        // A preview that stops at two hundred rows and says nothing looks like a
+        // file with two hundred rows in it.
+        let mut text = String::from("h\n");
+        for i in 0..TABLE_ROWS + 5 {
+            text.push_str(&format!("{i}\n"));
+        }
+        let table = parse_table(&text, ',');
+        assert_eq!(table.rows.len(), TABLE_ROWS);
+        assert_eq!(table.hidden_rows, 5);
+        assert_eq!(hidden_note(&table), "còn 5 dòng nữa");
+
+        let wide: String = (0..TABLE_COLUMNS + 3)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let table = parse_table(&wide, ',');
+        assert_eq!(table.headers.len(), TABLE_COLUMNS);
+        assert_eq!(table.hidden_columns, 3);
+        assert_eq!(hidden_note(&table), "còn 3 cột nữa");
+    }
+
+    #[test]
+    fn a_column_is_as_wide_as_its_widest_cell() {
+        // Equal-width columns waste the panel on a table of short ids and elide
+        // the one column that has anything in it.
+        let table = parse_table("id,ghi chú\n1,một dòng ghi chú dài\n", ',');
+        let widths = table_column_widths(&table);
+        assert!(widths[1] > widths[0], "{widths:?}");
+        // And nothing runs away: one essay in a cell must not push the rest off
+        // the panel.
+        let table = parse_table(&format!("a,b\n{},x\n", "y".repeat(500)), ',');
+        let widths = table_column_widths(&table);
+        assert!(widths[0] < 250., "{widths:?}");
+    }
+
+    #[test]
+    fn csv_and_tsv_preview_as_tables_not_as_text() {
+        // Shown as raw text a CSV is readable and not usable: the columns only
+        // line up by accident.
+        assert!(matches!(
+            preview_kind("data.csv", None),
+            PreviewKind::Table(',')
+        ));
+        assert!(matches!(
+            preview_kind("data.tsv", None),
+            PreviewKind::Table('\t')
+        ));
+        assert!(matches!(
+            preview_kind("data.bin", Some("text/csv")),
+            PreviewKind::Table(',')
+        ));
+        // Still text, and must stay text.
+        assert!(matches!(preview_kind("a.json", None), PreviewKind::Text));
     }
 
     #[test]

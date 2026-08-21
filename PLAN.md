@@ -459,8 +459,9 @@ tính năng sau.
    `MetadataDirective=REPLACE`. Ô để trống nghĩa là xoá header đó. ACL riêng của
    object không sống sót qua một lần copy — chỉ ảnh hưởng bucket còn bật ACL,
    nhưng là mất thật.
-3. **Xem CSV dạng bảng.** Preview hiện chỉ có ảnh và text; CSV hiện ra dạng thô
-   thì đọc được nhưng không dùng được. Parquet thì cần thêm thư viện, tính sau.
+3. ~~**Xem CSV dạng bảng**~~ — xong (21/08/2026). Cả `.csv` lẫn `.tsv`. Parser
+   viết tay theo RFC 4180; cột rộng theo ô dài nhất; cắt ở 200 dòng và 24 cột,
+   và nói ra phần bị cắt. Parquet vẫn cần thêm thư viện, tính sau.
 4. **Áp hàng loạt**: ACL và header cho nhiều object một lúc. Cả hai đã có đường
    đơn lẻ; cái thiếu là vòng lặp có tiến trình và báo lỗi theo từng key — đúng
    mô hình `delete_prefix` đang dùng.
