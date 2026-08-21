@@ -456,6 +456,28 @@ pub enum BulkOp {
     Acl(&'static str),
 }
 
+/// Fetching the rest of a prefix so that a sort can be exact.
+///
+/// **Why a sort needs this at all.** `ListObjectsV2` returns keys in
+/// lexicographic order and offers no other. So sorting by name ascending is
+/// free — it is the order the pages already arrive in — and every other sort is
+/// a claim about keys that have not been fetched. Sorting by size over the
+/// first thousand of twelve hundred keys answers "the largest of the first
+/// thousand", which is not the question anyone asked, and nothing on screen
+/// said so.
+pub struct Completing {
+    continuation: Option<String>,
+    /// Pages land here rather than in `entries`, so the list on screen does not
+    /// reshuffle under the pointer on every page. It is swapped in once, at the
+    /// end, when the order is finally the right one.
+    buffer: Vec<Entry>,
+    requests: usize,
+    running: bool,
+    /// A cap stopped it before the end, so the sort is over a prefix of the
+    /// prefix and has to say so.
+    truncated: bool,
+}
+
 /// A scan of the whole bucket, running or finished.
 ///
 /// Kept apart from the filter on purpose. The filter narrows what is already on
@@ -581,6 +603,8 @@ pub struct Browser {
     /// Which tab's state is the live one.
     active_tab: usize,
     next_tab_id: u64,
+    /// Loading the rest of a prefix so the current sort is exact.
+    completing: Option<Completing>,
     /// An operation running over a selection.
     bulk: Option<Bulk>,
     /// A whole-bucket scan, when one is running or its results are on screen.
@@ -628,6 +652,7 @@ pub struct Browser {
     search_task: Option<Task<()>>,
     /// Likewise for a bulk edit, which outlives several other operations.
     bulk_task: Option<Task<()>>,
+    complete_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
     /// Kept alive, not read: dropping it would silently stop the filter from
     /// reacting to what is typed into it.
@@ -776,6 +801,7 @@ impl Browser {
             }],
             active_tab: 0,
             next_tab_id: 1,
+            completing: None,
             bulk: None,
             search: None,
             palette: None,
@@ -796,6 +822,7 @@ impl Browser {
             tick_task: None,
             search_task: None,
             bulk_task: None,
+            complete_task: None,
             _appearance: Some(appearance),
             _filter_events: Some(filter_events),
             _bucket_filter_events: Some(bucket_filter_events),
@@ -1016,6 +1043,8 @@ impl Browser {
         // strip and the counts from outliving it.
         self.search = None;
         self.search_task = None;
+        self.completing = None;
+        self.complete_task = None;
 
         // Only when the bucket actually changes: this costs a request, and it is
         // the same answer for every prefix inside one bucket.
@@ -1130,14 +1159,31 @@ impl Browser {
     }
 
     fn listing_summary(&self) -> SharedString {
+        if let Some(completing) = self.completing.as_ref() {
+            return format!(
+                "Đang tải nốt để sắp xếp: {} mục, {} yêu cầu",
+                self.entries.len() + completing.buffer.len(),
+                completing.requests
+            )
+            .into();
+        }
+
         let total = self.entries.len();
         let shown = self.visible.len();
         let more = if self.continuation.is_some() { "+" } else { "" };
-        if shown == total {
-            format!("{total}{more} mục").into()
+        let counted = if shown == total {
+            format!("{total}{more} mục")
         } else {
-            format!("{shown}/{total}{more} mục").into()
+            format!("{shown}/{total}{more} mục")
+        };
+
+        // The whole point of the completing machinery: when the prefix is not
+        // all here, a sort by size or date is an answer about the part that is,
+        // and staying quiet about that is the bug.
+        if needs_complete_listing(self.sort) && self.continuation.is_some() {
+            return format!("{counted}, sắp xếp trên phần đã tải").into();
         }
+        counted.into()
     }
 
     fn enter(&mut self, entry_index: usize, cx: &mut Context<Self>) {
@@ -1221,6 +1267,8 @@ impl Browser {
         self.loading_more = false;
         self.listing_task = None;
         self.paging_task = None;
+        self.completing = None;
+        self.complete_task = None;
 
         // A tab that has a place but nothing in it has never been loaded, or was
         // switched away from mid-load. Either way it needs the request now; a
@@ -1794,8 +1842,133 @@ impl Browser {
     fn toggle_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.sort = self.sort.toggled(key);
         self.resort_and_filter();
+        // A sort S3 cannot answer by itself needs the whole prefix in hand
+        // before the order means anything.
+        if needs_complete_listing(self.sort) && self.continuation.is_some() {
+            self.start_completing(cx);
+        }
         self.status = self.listing_summary();
         cx.notify();
+    }
+
+    /// Fetches the rest of the prefix, one page at a time, into a side buffer.
+    fn start_completing(&mut self, cx: &mut Context<Self>) {
+        if self.completing.is_some() {
+            return;
+        }
+        self.completing = Some(Completing {
+            continuation: self.continuation.clone(),
+            buffer: Vec::new(),
+            requests: 0,
+            running: true,
+            truncated: false,
+        });
+        self.complete_step(cx);
+    }
+
+    fn complete_step(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket), Some(completing)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.completing.as_ref(),
+        ) else {
+            return;
+        };
+        // One test for every way of being done — stopped by hand, stopped by a
+        // cap, or out of pages. Treating "not running" as a plain early return
+        // meant the last page set the flag and nothing ever swapped the buffer
+        // in: the rows never updated and the status line said "loading" for
+        // ever.
+        let finished = !completing.running
+            || completing.truncated
+            || completing.continuation.is_none();
+        if finished {
+            return self.finish_completing(cx);
+        }
+        let token = completing
+            .continuation
+            .clone()
+            .expect("a missing token is `finished` above");
+
+        let generation = self.generation;
+        let prefix = self.prefix.clone();
+        let listing = Tokio::spawn(cx, async move {
+            client.list_page(&bucket, &prefix, Some(token)).await
+        });
+
+        self.complete_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = listing.await;
+            _ = this.update(cx, |this, cx| {
+                if this.generation != generation || this.completing.is_none() {
+                    return;
+                }
+                let held = this.entries.len();
+                let Some(completing) = this.completing.as_mut() else {
+                    return;
+                };
+
+                match outcome {
+                    Ok(Ok(page)) => {
+                        completing.requests += 1;
+                        completing.continuation = page.continuation;
+                        completing.buffer.extend(page.entries);
+
+                        // Caps, because "load everything" on a bucket with a
+                        // million keys is a thousand requests nobody agreed to.
+                        // Hitting one is not a failure; it is a smaller answer,
+                        // and the summary has to say which.
+                        if completing.requests >= COMPLETE_MAX_REQUESTS
+                            || held + completing.buffer.len() >= COMPLETE_MAX_KEYS
+                        {
+                            completing.truncated = true;
+                        }
+                        if completing.continuation.is_none() {
+                            completing.running = false;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        completing.running = false;
+                        completing.truncated = true;
+                        this.report(format!("{error:?}"));
+                    }
+                    Err(error) => {
+                        completing.running = false;
+                        completing.truncated = true;
+                        this.report(format!("Task lỗi: {error:?}"));
+                    }
+                }
+
+                this.status = this.listing_summary();
+                this.complete_step(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Swaps the buffered pages in and sorts once.
+    fn finish_completing(&mut self, cx: &mut Context<Self>) {
+        let Some(completing) = self.completing.take() else {
+            return;
+        };
+        self.complete_task = None;
+
+        self.entries.extend(completing.buffer);
+        // Only when the whole prefix arrived. Keeping the token where a cap cut
+        // it short leaves the normal paging able to carry on, and leaves
+        // `listing_summary` able to say the list is still partial.
+        self.continuation = completing.continuation.filter(|_| completing.truncated);
+        self.resort_and_filter();
+        self.status = self.listing_summary();
+        cx.notify();
+    }
+
+    fn stop_completing(&mut self, cx: &mut Context<Self>) {
+        if let Some(completing) = self.completing.as_mut() {
+            completing.running = false;
+            completing.truncated = true;
+        }
+        self.complete_task = None;
+        self.finish_completing(cx);
     }
 
     // ------------------------------------------------------------- operations
@@ -5144,7 +5317,10 @@ impl Browser {
             range,
             self.visible.len(),
             self.continuation.is_some(),
-            self.loading_more,
+            // Also blocked while the rest is being fetched for a sort: two
+            // readers of the same continuation token would each take a page and
+            // neither would see the other's.
+            self.loading_more || self.completing.is_some(),
         ) {
             self.load_more(cx);
         }
@@ -5220,6 +5396,20 @@ impl Browser {
                     this.child(
                         action_button("bulk-stop", "Dừng", theme).on_click(cx.listener(
                             |this, _event, _window, cx| this.stop_bulk(cx),
+                        )),
+                    )
+                },
+            )
+            // Same for reading a hundred pages to make a sort exact: stopping
+            // leaves what arrived and says the sort is over part of the prefix,
+            // which is a worse answer than the whole one and a better answer
+            // than a bill nobody expected.
+            .when_some(
+                self.completing.as_ref().filter(|c| c.running).map(|_| ()),
+                |this, ()| {
+                    this.child(
+                        action_button("complete-stop", "Dừng", theme).on_click(cx.listener(
+                            |this, _event, _window, cx| this.stop_completing(cx),
                         )),
                     )
                 },
@@ -7740,6 +7930,19 @@ fn form_label_width(kind: &FormKind) -> f32 {
     (longest as f32 * CHAR_WIDTH + 8.0).max(84.)
 }
 
+/// Whether a sort can be answered by the order S3 already returns.
+///
+/// `ListObjectsV2` gives lexicographic order and nothing else, so name-ascending
+/// is free and every other sort is a claim about keys not yet fetched.
+fn needs_complete_listing(sort: Sort) -> bool {
+    !(sort.key == SortKey::Name && sort.ascending)
+}
+
+/// Caps on completing a listing. A bucket with a million keys is a thousand
+/// requests, and nobody agreed to that by clicking a column header.
+const COMPLETE_MAX_REQUESTS: usize = 100;
+const COMPLETE_MAX_KEYS: usize = 100_000;
+
 /// Which tab a number key selects.
 ///
 /// `9` means the last one rather than the ninth: with three tabs open, ⌘9 has to
@@ -8176,6 +8379,7 @@ mod tests {
             }],
             active_tab: 0,
             next_tab_id: 1,
+            completing: None,
             bulk: None,
             search: None,
             palette: None,
@@ -8196,6 +8400,7 @@ mod tests {
             tick_task: None,
             search_task: None,
             bulk_task: None,
+            complete_task: None,
             _appearance: None,
             _filter_events: None,
             _bucket_filter_events: None,
@@ -8991,6 +9196,60 @@ mod tests {
             assert_eq!(browser.cursor.as_deref(), Some("b.txt"));
             assert_eq!(browser.filter, "b");
             assert_eq!(browser.sort.key, SortKey::Size);
+        });
+    }
+
+    #[test]
+    fn only_the_order_s3_already_returns_is_free() {
+        // `ListObjectsV2` gives lexicographic order and nothing else, so this is
+        // the one sort that a half-loaded prefix answers correctly.
+        assert!(!needs_complete_listing(Sort {
+            key: SortKey::Name,
+            ascending: true
+        }));
+
+        // Everything else is a claim about keys that have not been fetched.
+        // Name *descending* included: the last key lexicographically is the one
+        // furthest from what has arrived.
+        assert!(needs_complete_listing(Sort {
+            key: SortKey::Name,
+            ascending: false
+        }));
+        assert!(needs_complete_listing(Sort {
+            key: SortKey::Size,
+            ascending: true
+        }));
+        assert!(needs_complete_listing(Sort {
+            key: SortKey::Modified,
+            ascending: false
+        }));
+    }
+
+    #[gpui::test]
+    fn a_sort_over_part_of_a_prefix_says_so(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(vec![entry("a.txt", false, 1), entry("b.txt", false, 2)], cx)
+        });
+
+        entity.update(cx, |browser, _| {
+            // Everything here: any sort is exact and the line stays quiet.
+            browser.sort = Sort { key: SortKey::Size, ascending: true };
+            assert_eq!(browser.listing_summary(), "2 mục");
+
+            // More pages outstanding. Sorting by size now answers "the largest
+            // of the ones that happen to have arrived", and the old code said
+            // nothing at all about that.
+            browser.continuation = Some("token".into());
+            assert!(
+                browser.listing_summary().contains("sắp xếp trên phần đã tải"),
+                "{}",
+                browser.listing_summary()
+            );
+
+            // Back to the order S3 returns, and there is nothing to warn about:
+            // the pages arrive already in this order.
+            browser.sort = Sort { key: SortKey::Name, ascending: true };
+            assert_eq!(browser.listing_summary(), "2+ mục");
         });
     }
 

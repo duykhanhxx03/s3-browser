@@ -510,7 +510,7 @@ khi in con số đó lên trang bán hàng.
 
 ### Một lỗi lộ ra khi đối chiếu
 
-**Sắp xếp chỉ đúng trên phần đã tải.** `resort_and_filter` sắp `entries`, mà
+**Sắp xếp chỉ đúng trên phần đã tải** — đã sửa (21/08/2026). `resort_and_filter` sắp `entries`, mà
 `entries` chỉ là những trang đã về. Sắp theo kích thước trên một prefix 1200 key
 cho ra *cái lớn nhất trong 1000 key đầu*, không phải cái lớn nhất trong prefix —
 và không có gì trên màn hình nói rằng đó là câu trả lời một phần.
@@ -522,6 +522,10 @@ theo phiên.
 
 Đây là lỗi trước, tính năng sau — và cùng loại với lỗi Content-Type: app không sai
 một cách ồn ào, nó trả lời một câu hỏi khác với câu được hỏi.
+
+Cách sửa: chọn một cách sắp xếp mà S3 không tự trả lời được thì nạp nốt prefix vào
+một bộ đệm riêng rồi mới tráo vào và sắp một lần. Trần 100 yêu cầu / 100.000 mục,
+dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp trên phần đã tải".
 
 ### UI
 
