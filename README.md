@@ -16,6 +16,10 @@ S3BROWSER_DEV_SECRET=minioadmin cargo run -p s3browser
 Lần đầu chạy mà chưa có profile nào, màn hình chào mở ba lối vào: **Nhập thủ công**,
 **MinIO trên máy** và **Đăng nhập AWS SSO**.
 
+Form nhập credential có preset sẵn cho AWS, Cloudflare R2, Backblaze B2, Wasabi,
+DigitalOcean Spaces và MinIO — chọn một cái là điền sẵn endpoint và region. Có nút
+**Thử kết nối** để kiểm tra trước khi lưu, và nút hiện/ẩn secret key.
+
 `S3BROWSER_DEV_SECRET` là để khỏi phải gõ mật khẩu chuỗi khoá mỗi lần build lại.
 Keychain của macOS cấp quyền theo chữ ký mã, mà bản debug chưa ký thì mỗi lần
 `cargo build` lại là một chữ ký khác, nên lần chạy nào cũng bị hỏi mật khẩu — đủ

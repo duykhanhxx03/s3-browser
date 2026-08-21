@@ -64,6 +64,84 @@ impl StoredProfile {
     }
 }
 
+/// A provider preset: the endpoint shape and region a service expects.
+///
+/// Only a starting point for the two fields nobody can be expected to remember.
+/// The quirks — path-style addressing, checksum mode — are still derived from
+/// the finished endpoint by [`StoredProfile::with_provider_defaults`], because a
+/// second place that knows which provider needs what would drift from the first
+/// and the drift would look like a credentials problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    Aws,
+    R2,
+    B2,
+    Wasabi,
+    Spaces,
+    MinIO,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 6] = [
+        Provider::Aws,
+        Provider::R2,
+        Provider::B2,
+        Provider::Wasabi,
+        Provider::Spaces,
+        Provider::MinIO,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Aws => "AWS",
+            Provider::R2 => "Cloudflare R2",
+            Provider::B2 => "Backblaze B2",
+            Provider::Wasabi => "Wasabi",
+            Provider::Spaces => "DO Spaces",
+            Provider::MinIO => "MinIO",
+        }
+    }
+
+    /// What to put in the endpoint field. Empty for AWS, which addresses its
+    /// regions by name and needs no endpoint at all.
+    ///
+    /// The templates carry a visibly fake segment where the account or region
+    /// goes, so a half-filled endpoint fails loudly at connect time instead of
+    /// quietly pointing somewhere real.
+    pub fn endpoint_template(self) -> &'static str {
+        match self {
+            Provider::Aws => "",
+            Provider::R2 => "https://ACCOUNT_ID.r2.cloudflarestorage.com",
+            Provider::B2 => "https://s3.us-west-004.backblazeb2.com",
+            Provider::Wasabi => "https://s3.wasabisys.com",
+            Provider::Spaces => "https://sgp1.digitaloceanspaces.com",
+            Provider::MinIO => "http://127.0.0.1:9000",
+        }
+    }
+
+    pub fn region_template(self) -> &'static str {
+        match self {
+            // R2 has one namespace and rejects a real region name.
+            Provider::R2 => "auto",
+            Provider::B2 => "us-west-004",
+            Provider::Spaces => "sgp1",
+            _ => "us-east-1",
+        }
+    }
+
+    /// The one thing about this provider worth saying in the dialog.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Provider::Aws => "Để trống endpoint; chọn region của bucket.",
+            Provider::R2 => "Thay ACCOUNT_ID bằng account id ở dashboard R2.",
+            Provider::B2 => "Endpoint có số region, xem ở trang Buckets của B2.",
+            Provider::Wasabi => "Region khác us-east-1 thì endpoint đổi theo.",
+            Provider::Spaces => "sgp1 là datacenter; đổi theo Space của bạn.",
+            Provider::MinIO => "Mặc định là MinIO chạy ở máy.",
+        }
+    }
+}
+
 /// Reads and writes the profile list plus its secrets.
 pub struct ProfileStore {
     path: PathBuf,
@@ -277,6 +355,55 @@ mod tests {
         assert_eq!(store.load().unwrap(), profiles);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn every_preset_endpoint_produces_that_providers_quirks() {
+        // The presets and `with_provider_defaults` are two halves of the same
+        // knowledge, and this is what stops them drifting: a template that no
+        // longer matches its own matcher would leave someone with a profile
+        // that looks right and cannot connect.
+        for provider in Provider::ALL {
+            let endpoint = provider.endpoint_template();
+            let stored = StoredProfile {
+                endpoint: (!endpoint.is_empty()).then(|| endpoint.to_string()),
+                region: provider.region_template().into(),
+                ..profile("p", None)
+            }
+            .with_provider_defaults();
+
+            match provider {
+                // No endpoint, so virtual-host addressing and real checksums.
+                Provider::Aws => {
+                    assert!(!stored.path_style);
+                    assert!(!stored.relaxed_checksums);
+                }
+                // R2 answers on a virtual-host style host and insists on `auto`.
+                Provider::R2 => {
+                    assert!(!stored.path_style, "R2 is not path-style");
+                    assert_eq!(stored.region, "auto");
+                    assert!(stored.relaxed_checksums);
+                }
+                Provider::B2 | Provider::Wasabi | Provider::Spaces => {
+                    assert!(!stored.path_style, "{provider:?} is not path-style");
+                    assert!(stored.relaxed_checksums);
+                }
+                // Self-hosted: path-style, because there is no wildcard DNS.
+                Provider::MinIO => {
+                    assert!(stored.path_style, "MinIO needs path-style");
+                    assert!(stored.relaxed_checksums);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_half_filled_template_is_visibly_unfinished() {
+        // The account id has to be replaced by hand. A template that looked
+        // like a working hostname would connect somewhere real and fail with a
+        // permissions error, which sends people to check the wrong thing.
+        assert!(Provider::R2.endpoint_template().contains("ACCOUNT_ID"));
+        assert!(Provider::Aws.endpoint_template().is_empty());
     }
 
     #[test]

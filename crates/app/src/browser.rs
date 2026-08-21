@@ -21,7 +21,7 @@ use s3core::{
     Encryption, ObjectAcl, ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
-use vault::{ProfileStore, StoredProfile};
+use vault::{ProfileStore, Provider, StoredProfile};
 
 use crate::failure::{Failure, Fix};
 use crate::platform::{self, Chrome};
@@ -54,6 +54,10 @@ const JOB_ROW_HEIGHT: f32 = 38.;
 /// The drawer and the orphan list.
 const PANEL_HEIGHT: f32 = 200.;
 const DIALOG_WIDTH: f32 = 460.;
+/// The profile dialog is wider: an endpoint URL and a 64-character secret both
+/// need room, and eliding either of them in the field where it is being typed
+/// is the one place eliding is unacceptable.
+const PROFILE_DIALOG_WIDTH: f32 = 560.;
 /// Right-hand inspector.
 const INSPECTOR_WIDTH: f32 = 320.;
 /// Tall enough for every command without scrolling; it scrolls anyway once a
@@ -252,6 +256,8 @@ pub struct SsoFlow {
 pub struct Field {
     label: &'static str,
     state: Entity<InputState>,
+    /// Whether it holds a secret, so the dialog can offer to reveal it.
+    masked: bool,
 }
 
 /// The add-profile form.
@@ -265,6 +271,22 @@ pub struct Form {
     kind: FormKind,
     fields: Vec<Field>,
     error: Option<SharedString>,
+    /// Which preset filled the endpoint and region, for the profile dialog.
+    provider: Option<Provider>,
+    /// What a connection test said. Separate from `error`, which is about the
+    /// form being wrong: a test that fails leaves the form perfectly valid and
+    /// still worth saving, because the endpoint may just be down.
+    probe: Option<Probe>,
+}
+
+/// The outcome of a "test connection".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Running,
+    /// Reached the endpoint and the signature was accepted.
+    Ok(SharedString),
+    /// Did not. The message is already classified.
+    Failed(SharedString),
 }
 
 impl Form {
@@ -283,14 +305,30 @@ impl Form {
                     state
                 }
             });
-            fields.push(Field { label, state });
+            fields.push(Field {
+                label,
+                state,
+                masked,
+            });
         }
 
         Self {
             kind,
             fields,
             error: None,
+            provider: None,
+            probe: None,
         }
+    }
+
+    /// Writes a value into one of the fields, for the preset buttons.
+    fn set(&self, label: &str, value: &'static str, window: &mut Window, cx: &mut App) {
+        let Some(field) = self.fields.iter().find(|field| field.label == label) else {
+            return;
+        };
+        field
+            .state
+            .update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
     fn value(&self, label: &str, cx: &App) -> String {
@@ -1793,6 +1831,123 @@ impl Browser {
 
     /// Removes a profile and the secret behind it. Asking first because the
     /// secret cannot be recovered from the app once the keychain entry is gone.
+    /// Applies a provider preset to the open profile form.
+    fn pick_provider(&mut self, provider: Provider, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        form.provider = Some(provider);
+        // A new preset invalidates whatever the last test concluded, because it
+        // just changed the endpoint the test was about.
+        form.probe = None;
+
+        let form = self.form.as_ref().expect("just checked");
+        form.set("Endpoint", provider.endpoint_template(), window, cx);
+        form.set("Region", provider.region_template(), window, cx);
+        cx.notify();
+    }
+
+    /// Connects with what is in the form, without saving anything.
+    ///
+    /// The alternative is what this app did before: save the profile, watch it
+    /// fail, and be unable to tell a typo in the secret from a typo in the
+    /// endpoint from a provider that is simply down. A test that says which is
+    /// the difference between fixing it in ten seconds and giving up.
+    fn test_profile_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        let endpoint = form.value("Endpoint", cx);
+        let (endpoint, _) = if endpoint.is_empty() {
+            (String::new(), None)
+        } else {
+            split_endpoint(&endpoint)
+        };
+        let region = form.value("Region", cx);
+        let access_key = form.value("Access key", cx);
+        let secret_key = form.value("Secret key", cx);
+
+        if access_key.is_empty() || secret_key.is_empty() {
+            if let Some(form) = self.form.as_mut() {
+                form.error = Some("Cần access key và secret key để thử".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        // Through the same quirk logic a saved profile goes through, or the
+        // test would be answering a question nobody asked.
+        let stored = StoredProfile {
+            id: "probe".into(),
+            name: "probe".into(),
+            endpoint: (!endpoint.is_empty()).then_some(endpoint),
+            region: if region.is_empty() {
+                "us-east-1".into()
+            } else {
+                region
+            },
+            path_style: false,
+            relaxed_checksums: false,
+            access_key: access_key.clone(),
+        }
+        .with_provider_defaults();
+
+        let profile = Profile {
+            name: stored.name.clone(),
+            endpoint: stored.endpoint.clone(),
+            region: stored.region.clone(),
+            path_style: stored.path_style,
+            access_key: stored.access_key.clone(),
+            secret_key,
+            session_token: None,
+            relaxed_checksums: stored.relaxed_checksums,
+        };
+
+        if let Some(form) = self.form.as_mut() {
+            form.error = None;
+            form.probe = Some(Probe::Running);
+        }
+        cx.notify();
+
+        let probing = Tokio::spawn(cx, async move {
+            let client = S3Client::connect(&profile).await?;
+            anyhow::Ok(client.list_buckets().await)
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = probing.await;
+            _ = this.update(cx, |this, cx| {
+                let Some(form) = this.form.as_mut() else {
+                    return;
+                };
+                form.probe = Some(match outcome {
+                    Ok(Ok(Ok(buckets))) => {
+                        Probe::Ok(format!("Kết nối được, thấy {} bucket", buckets.len()).into())
+                    }
+                    // Listing denied is not a failed credential. A token scoped
+                    // to one bucket signs perfectly well and is what R2's own
+                    // documentation recommends; reporting it as a bad key sends
+                    // people to regenerate a key that was never wrong.
+                    Ok(Ok(Err(error))) => {
+                        let failure = Failure::new(format!("ListBuckets: {error:?}"));
+                        if failure.fix == Some(Fix::EditProfile) {
+                            Probe::Failed(failure.summary)
+                        } else {
+                            Probe::Ok(
+                                "Khoá đúng, nhưng token không liệt kê được bucket".into(),
+                            )
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        Probe::Failed(Failure::new(format!("{error:?}")).summary)
+                    }
+                    Err(error) => Probe::Failed(format!("Task lỗi: {error}").into()),
+                });
+                cx.notify();
+            });
+        }));
+    }
+
     fn ask_remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(profile) = self.profiles.get(index) else {
             return;
@@ -5122,6 +5277,7 @@ impl Browser {
     fn render_form(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let form = self.form.as_ref()?;
         let theme = self.theme;
+        let is_profile = form.kind == FormKind::NewProfile;
 
         Some(
             div()
@@ -5139,7 +5295,11 @@ impl Browser {
                 .child(
                     div()
                         .id("form")
-                        .w(px(DIALOG_WIDTH))
+                        .w(px(if is_profile {
+                            PROFILE_DIALOG_WIDTH
+                        } else {
+                            DIALOG_WIDTH
+                        }))
                         .p_4()
                         .flex()
                         .flex_col()
@@ -5150,6 +5310,55 @@ impl Browser {
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(div().text_color(theme.text).child(form.kind.title()))
+                        // Presets first, because they decide what two of the
+                        // fields below should say. Nobody remembers that R2
+                        // wants region `auto` and a hostname built from an
+                        // account id, and getting it wrong looks exactly like a
+                        // wrong secret key.
+                        .when(is_profile, |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(Provider::ALL.into_iter().map(|provider| {
+                                        let selected = form.provider == Some(provider);
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "provider-{}",
+                                                provider.label()
+                                            )))
+                                            .h(px(BUTTON_HEIGHT))
+                                            .px_2()
+                                            .flex()
+                                            .items_center()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .bg(if selected { theme.selected } else { theme.hover })
+                                            .text_color(if selected {
+                                                theme.text
+                                            } else {
+                                                theme.text_muted
+                                            })
+                                            .hover(|this| this.bg(theme.selected))
+                                            .child(provider.label())
+                                            .on_click(cx.listener(
+                                                move |this, _event, window, cx| {
+                                                    this.pick_provider(provider, window, cx)
+                                                },
+                                            ))
+                                    })),
+                            )
+                            .when_some(form.provider, |this, provider| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.text_faint)
+                                        .child(provider.hint()),
+                                )
+                            })
+                        })
                         .children(form.fields.iter().map(|field| {
                             div()
                                 .flex()
@@ -5168,17 +5377,45 @@ impl Browser {
                                     div()
                                         .flex_1()
                                         .min_w(px(0.))
-                                        .child(Input::new(&field.state)),
+                                        .child(Input::new(&field.state).when(
+                                            field.masked,
+                                            // A secret typed blind cannot be
+                                            // checked for a typo, and a wrong
+                                            // secret fails identically to a
+                                            // wrong endpoint. The eye is how
+                                            // that gets ruled out.
+                                            |input| input.mask_toggle(),
+                                        )),
                                 )
                         }))
                         .when_some(form.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
+                        })
+                        .when_some(form.probe.clone(), |this, probe| {
+                            let (colour, text) = match probe {
+                                Probe::Running => (theme.text_muted, "Đang thử kết nối…".into()),
+                                Probe::Ok(message) => (theme.accent, message),
+                                Probe::Failed(message) => (theme.danger, message),
+                            };
+                            this.child(div().text_xs().text_color(colour).child(text))
                         })
                         .child(
                             div()
                                 .flex()
                                 .gap_2()
                                 .justify_end()
+                                // Testing before saving, because a saved profile
+                                // that cannot connect is three separate things
+                                // to check and no way to tell them apart.
+                                .when(is_profile, |this| {
+                                    this.child(
+                                        action_button("form-test", "Thử kết nối", theme).on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.test_profile_connection(cx)
+                                            }),
+                                        ),
+                                    )
+                                })
                                 .child(action_button("form-cancel", "Huỷ", theme).on_click(
                                     cx.listener(|this, _event, _window, cx| {
                                         this.form = None;
