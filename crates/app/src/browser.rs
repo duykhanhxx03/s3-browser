@@ -130,6 +130,9 @@ pub enum FormKind {
     /// `Rename`.
     Duplicate(String),
     OpenBucket,
+    /// Rewriting an object's HTTP headers. Carries the key for the same reason
+    /// `Rename` does.
+    EditHeaders(String),
     AddTag,
     KmsKey,
     AssumeRole,
@@ -145,6 +148,7 @@ impl FormKind {
             FormKind::Rename(_) => "Đổi tên",
             FormKind::Duplicate(_) => "Sao chép",
             FormKind::OpenBucket => "Mở bucket",
+            FormKind::EditHeaders(_) => "Sửa header",
             FormKind::AddTag => "Thẻ mới",
             FormKind::KmsKey => "Mã hoá KMS",
             FormKind::AssumeRole => "Nhận role",
@@ -168,6 +172,11 @@ impl FormKind {
             FormKind::Rename(_) => vec![("Tên mới", "", false)],
             FormKind::Duplicate(_) => vec![("Tên bản sao", "", false)],
             FormKind::OpenBucket => vec![("Bucket", "", false)],
+            FormKind::EditHeaders(_) => vec![
+                ("Content-Type", "image/png", false),
+                ("Cache-Control", "public, max-age=3600", false),
+                ("Content-Disposition", "inline", false),
+            ],
             FormKind::AddTag => vec![("Khoá", "", false), ("Giá trị", "", false)],
             FormKind::KmsKey => vec![("Key id", "", false)],
             FormKind::AssumeRole => vec![
@@ -326,6 +335,16 @@ impl Form {
     }
 
     /// Writes a value into one of the fields, for the preset buttons.
+    /// Same as [`Self::set`] for a value that is not a literal.
+    fn set_owned(&self, label: &str, value: String, window: &mut Window, cx: &mut App) {
+        let Some(field) = self.fields.iter().find(|field| field.label == label) else {
+            return;
+        };
+        field
+            .state
+            .update(cx, |state, cx| state.set_value(value, window, cx));
+    }
+
     fn set(&self, label: &str, value: &'static str, window: &mut Window, cx: &mut App) {
         let Some(field) = self.fields.iter().find(|field| field.label == label) else {
             return;
@@ -1743,7 +1762,10 @@ impl Browser {
 
         // Every single-field dialog rejects an empty value the same way, so the
         // button never silently does nothing.
-        if first.is_empty() && kind != FormKind::NewProfile {
+        // `EditHeaders` is exempt: clearing a header *is* the edit, not a
+        // half-filled form. So is the profile dialog, which validates per field.
+        let optional = matches!(kind, FormKind::NewProfile | FormKind::EditHeaders(_));
+        if first.is_empty() && !optional {
             if let Some(form) = self.form.as_mut() {
                 form.error = Some("Chưa nhập gì".into());
             }
@@ -1773,6 +1795,15 @@ impl Browser {
                 self.form = None;
                 let bucket = SharedString::from(first);
                 self.open(bucket, String::new(), cx);
+            }
+            FormKind::EditHeaders(key) => {
+                let headers = s3core::ObjectHeaders {
+                    content_type: some_if_filled(first),
+                    cache_control: some_if_filled(form.value("Cache-Control", cx)),
+                    content_disposition: some_if_filled(form.value("Content-Disposition", cx)),
+                };
+                self.form = None;
+                self.apply_headers(key, headers, cx);
             }
             FormKind::AddTag => {
                 let value = form.value("Giá trị", cx);
@@ -1978,6 +2009,70 @@ impl Browser {
                     }
                     Err(error) => Probe::Failed(format!("Task lỗi: {error}").into()),
                 });
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Opens the header editor on the inspected object, prefilled with what it
+    /// already has.
+    ///
+    /// Prefilled rather than blank, because a blank field means "remove this
+    /// header" once submitted — an empty editor would quietly strip everything
+    /// the user did not retype.
+    fn start_edit_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(inspector) = self.inspector.as_ref() else {
+            return;
+        };
+        let key = inspector.key.clone();
+        let head = inspector.head.clone();
+
+        self.open_form(FormKind::EditHeaders(key), window, cx);
+
+        let Some((form, head)) = self.form.as_ref().zip(head) else {
+            return;
+        };
+        for (label, value) in [
+            ("Content-Type", head.content_type),
+            ("Cache-Control", head.cache_control),
+            ("Content-Disposition", head.content_disposition),
+        ] {
+            if let Some(value) = value {
+                form.set_owned(label, value, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_headers(
+        &mut self,
+        key: String,
+        headers: s3core::ObjectHeaders,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        self.status = format!("Đang sửa header {}…", entry_name_of(&key)).into();
+
+        let target = key.clone();
+        let writing = Tokio::spawn(cx, async move {
+            client.set_object_headers(&bucket, &target, &headers).await
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = writing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.status = format!("Đã sửa header {}", entry_name_of(&key)).into();
+                        // The object is a new version of itself now, so the
+                        // panel is showing the old headers until it reloads.
+                        this.load_inspection(key, cx);
+                    }
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
+                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
+                }
                 cx.notify();
             });
         }));
@@ -4755,6 +4850,15 @@ impl Browser {
                                 head.content_type.clone().unwrap_or_default(),
                                 theme,
                             ))
+                            // Shown only when set, because on most objects they
+                            // are not, and two permanently blank rows push the
+                            // ones that say something out of the panel.
+                            .when_some(head.cache_control.clone(), |this, value| {
+                                this.child(detail_row("Cache", value, theme))
+                            })
+                            .when_some(head.content_disposition.clone(), |this, value| {
+                                this.child(detail_row("Trả về", value, theme))
+                            })
                             .child(detail_row("Lớp lưu trữ", class.to_string(), theme))
                             .child(detail_row(
                                 "Mã hoá",
@@ -4772,6 +4876,14 @@ impl Browser {
                                 elide_middle(&head.etag.clone().unwrap_or_default().replace('"', ""), 28),
                                 theme,
                             )),
+                    )
+                    // Next to the headers it edits. These three decide whether a
+                    // shared link renders in a tab or lands in the downloads
+                    // folder, which is not something to go hunting for.
+                    .child(
+                        action_button("edit-headers", "Sửa header", theme).on_click(cx.listener(
+                            |this, _event, window, cx| this.start_edit_headers(window, cx),
+                        )),
                     )
                     // Only archived objects get the restore control, and its
                     // label says which of the three states it is in.
@@ -6805,6 +6917,11 @@ fn search_summary(
 /// lines. Re-wrapping that at a column produces a line of prose followed by a
 /// stub of three words, over and over, which looks like a rendering fault. What
 /// gets copied to the clipboard stays exactly as the provider wrote it.
+/// An empty field means "send no header", which is how a header gets removed.
+fn some_if_filled(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
 fn flatten(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }

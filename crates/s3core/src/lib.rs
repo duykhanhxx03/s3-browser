@@ -149,6 +149,11 @@ pub struct ObjectHead {
     /// `None` means STANDARD; S3 omits the header for it.
     pub storage_class: Option<String>,
     pub content_type: Option<String>,
+    /// How long a cache may keep it. Editable, and the reason a public object
+    /// is fetched once or fetched every time.
+    pub cache_control: Option<String>,
+    /// `attachment` turns a link that displays into a link that downloads.
+    pub content_disposition: Option<String>,
     /// `AES256` or `aws:kms`, absent when the object is not encrypted.
     pub encryption: Option<String>,
     pub kms_key_id: Option<String>,
@@ -616,6 +621,8 @@ impl S3Client {
             etag: out.e_tag().map(str::to_owned),
             storage_class: out.storage_class().map(|class| class.as_str().to_owned()),
             content_type: out.content_type().map(str::to_owned),
+            cache_control: out.cache_control().map(str::to_owned),
+            content_disposition: out.content_disposition().map(str::to_owned),
             encryption: out
                 .server_side_encryption()
                 .map(|sse| sse.as_str().to_owned()),
@@ -1398,6 +1405,77 @@ impl S3Client {
     /// with a part size you choose. `copy_object` reaches for this on its own
     /// past `COPY_OBJECT_LIMIT`; calling it directly lets a test exercise the
     /// multipart path without moving five gigabytes.
+    /// Rewrites an object's HTTP headers in place.
+    ///
+    /// S3 has no "edit headers" call. The way to change them is to copy the
+    /// object onto itself with `MetadataDirective=REPLACE`, which is what the
+    /// AWS console does behind its own metadata editor.
+    ///
+    /// **What a self-copy carries and what it drops.** Storage class and user
+    /// metadata are re-sent here because `REPLACE` means exactly that: anything
+    /// not named is gone. Tags survive on their own — the tagging directive
+    /// defaults to COPY. Encryption is re-stated so an object stored under a
+    /// specific KMS key does not quietly fall back to the bucket default.
+    ///
+    /// The one thing that does not survive is a per-object ACL: a copy is a new
+    /// object as far as ACLs are concerned and gets the bucket's default. That
+    /// only matters on buckets that still have ACLs enabled, which AWS has
+    /// turned off by default since 2023, but it is a real loss and the caller
+    /// should say so rather than discover it.
+    ///
+    /// Only for objects under the 5 GiB single-copy ceiling. Above that S3
+    /// requires the multipart path, and rewriting a header is not worth
+    /// rewriting five gigabytes.
+    pub async fn set_object_headers(
+        &self,
+        bucket: &str,
+        key: &str,
+        headers: &ObjectHeaders,
+    ) -> Result<()> {
+        let head = self.head_object(bucket, key).await?;
+        let size = head.size.max(0) as u64;
+        if size > COPY_OBJECT_LIMIT {
+            anyhow::bail!(
+                "Object {} lớn hơn 5 GiB, không sửa header tại chỗ được",
+                key
+            );
+        }
+
+        let mut req = self
+            .inner
+            .copy_object()
+            .bucket(bucket)
+            .key(key)
+            .copy_source(encode_copy_source(bucket, key))
+            .metadata_directive(MetadataDirective::Replace)
+            .set_content_type(headers.content_type.clone())
+            .set_cache_control(headers.cache_control.clone())
+            .set_content_disposition(headers.content_disposition.clone());
+
+        // Re-sent because REPLACE drops everything not named.
+        for (name, value) in &head.metadata {
+            req = req.metadata(name, value);
+        }
+        if let Some(class) = &head.storage_class {
+            req = req.set_storage_class(Some(StorageClass::from(class.as_str())));
+        }
+        match head.encryption.as_deref() {
+            Some("aws:kms") => {
+                req = req.server_side_encryption(ServerSideEncryption::AwsKms);
+                if let Some(key_id) = &head.kms_key_id {
+                    req = req.ssekms_key_id(key_id);
+                }
+            }
+            Some("AES256") => req = req.server_side_encryption(ServerSideEncryption::Aes256),
+            _ => {}
+        }
+
+        req.send()
+            .await
+            .with_context(|| format!("CopyObject (sửa header) failed for s3://{bucket}/{key}"))?;
+        Ok(())
+    }
+
     pub async fn copy_object_multipart(
         &self,
         src_bucket: &str,
@@ -1839,6 +1917,17 @@ pub fn detect_local_offset() -> i32 {
     time::UtcOffset::current_local_offset()
         .map(|offset| offset.whole_seconds())
         .unwrap_or(0)
+}
+
+/// The three headers that decide how a browser treats a link to an object.
+///
+/// Not user metadata: these are real HTTP headers S3 replays on every GET, and
+/// they are why one public object renders in a tab and another downloads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectHeaders {
+    pub content_type: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
 }
 
 /// The Content-Type an object should be stored under, guessed from its name.

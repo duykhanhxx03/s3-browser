@@ -878,3 +878,66 @@ async fn an_upload_stores_the_content_type_its_name_implies() {
         Some("image/jpeg")
     );
 }
+
+/// Editing headers is a self-copy with `MetadataDirective=REPLACE`, and REPLACE
+/// means everything not re-sent is gone. This pins what survives, because the
+/// failure mode is silent: the header the user asked for is right, and the
+/// storage class or the user metadata they never mentioned has vanished.
+#[tokio::test]
+async fn rewriting_headers_keeps_what_it_was_not_asked_to_change() {
+    let Some(client) = client_or_skip().await else {
+        return;
+    };
+    let bucket = "demo-bucket";
+    let key = "header-tests/page.bin";
+
+    client
+        .put_object(bucket, key, b"<h1>xin chao</h1>".to_vec())
+        .await
+        .unwrap();
+    // `.bin` guesses nothing useful, which is the case worth fixing by hand.
+    let tags = vec![("env".to_string(), "prod".to_string())];
+    client.set_object_tags(bucket, key, &tags).await.unwrap();
+
+    client
+        .set_object_headers(
+            bucket,
+            key,
+            &s3core::ObjectHeaders {
+                content_type: Some("text/html".into()),
+                cache_control: Some("public, max-age=3600".into()),
+                content_disposition: Some("inline".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let head = client.head_object(bucket, key).await.unwrap();
+    assert_eq!(head.content_type.as_deref(), Some("text/html"));
+    assert_eq!(head.cache_control.as_deref(), Some("public, max-age=3600"));
+    assert_eq!(head.content_disposition.as_deref(), Some("inline"));
+    assert_eq!(head.size, 17, "the bytes are untouched");
+
+    // Tags survive because the tagging directive defaults to COPY. If that ever
+    // stops being true, a header edit silently strips a cost-allocation tag.
+    assert_eq!(client.object_tags(bucket, key).await.unwrap(), tags);
+
+    // Clearing one is a real edit, not a no-op: `None` means "send no header",
+    // and REPLACE makes that stick.
+    client
+        .set_object_headers(
+            bucket,
+            key,
+            &s3core::ObjectHeaders {
+                content_type: Some("text/html".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let head = client.head_object(bucket, key).await.unwrap();
+    assert_eq!(head.content_type.as_deref(), Some("text/html"));
+    assert_eq!(head.cache_control, None, "cleared, not left behind");
+
+    client.delete_object(bucket, key).await.unwrap();
+}

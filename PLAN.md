@@ -454,10 +454,11 @@ tính năng sau.
 1. ~~**Content-Type khi upload**~~ — xong (21/08/2026). Đoán từ đuôi file bằng
    `mime_guess`, đặt ở cả `PutObject` lẫn `CreateMultipartUpload`. Không có đuôi
    thì không đặt gì, vì bịa một kiểu còn tệ hơn mặc định của provider.
-2. **Sửa header của object đã có**: Content-Type, Cache-Control,
-   Content-Disposition. S3 sửa metadata bằng cách copy đè lên chính nó với
-   `MetadataDirective=REPLACE` — `copy_object` đã có sẵn, chỉ thiếu đường trong
-   giao diện.
+2. ~~**Sửa header của object đã có**~~ — xong (21/08/2026). Content-Type,
+   Cache-Control, Content-Disposition, sửa bằng cách copy đè lên chính nó với
+   `MetadataDirective=REPLACE`. Ô để trống nghĩa là xoá header đó. ACL riêng của
+   object không sống sót qua một lần copy — chỉ ảnh hưởng bucket còn bật ACL,
+   nhưng là mất thật.
 3. **Xem CSV dạng bảng.** Preview hiện chỉ có ảnh và text; CSV hiện ra dạng thô
    thì đọc được nhưng không dùng được. Parquet thì cần thêm thư viện, tính sau.
 4. **Áp hàng loạt**: ACL và header cho nhiều object một lúc. Cả hai đã có đường
