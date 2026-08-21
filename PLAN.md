@@ -606,3 +606,97 @@ request nào.
 
 Trùng chỗ thì nhảy tới tab đang mở chứ không mở thêm — Brows3 gọi đây là "smart
 tab management" và nó đúng.
+
+## 10. Kỹ thuật Brows3 có mà mình chưa có (21/08/2026)
+
+§9 đối chiếu **tính năng**. Đây là đối chiếu **cách làm** — đọc `src-tauri/`,
+`.github/workflows/release.yml`, `docs/RELEASE_SIGNING.md` và `update.json` của
+họ. Xếp theo giá trị, không theo công sức.
+
+### 10.1 Auto-update không cần chỗ host, cũng không cần tài khoản Apple
+
+Đây là thứ đáng giá nhất, và nó **gỡ một cái chặn mình tự dựng lên**. M9 đang ghi
+"auto-update cần nơi host và một cặp khoá ký"; Brows3 cho thấy cả hai đều không
+phải rào:
+
+- `update.json` **commit thẳng vào repo**, app đọc qua
+  `raw.githubusercontent.com/<user>/<repo>/main/update.json`. Không có server nào
+  cả.
+- Bản dựng là **asset của GitHub Release**. Cũng không có server nào.
+- Chữ ký cập nhật là một cặp khoá **minisign tự sinh tại máy**, khoá riêng nằm
+  trong GitHub Secret, khoá công khai nằm trong file cấu hình đã commit. Nó
+  **không liên quan gì tới Apple** — chỉ để app biết gói tải về đúng là của mình.
+- macOS ký **ad-hoc** (`signingIdentity: "-"`), và có `docs/MACOS_TROUBLESHOOTING.md`
+  hướng dẫn `xattr -rd com.apple.quarantine`. Ký Developer ID + notarize là
+  **nhánh tuỳ chọn**, tự bật khi CI có đủ secret.
+
+Nói cách khác: notarize chỉ cần cho việc *mở lần đầu êm ru*, không cần cho việc
+*ship được bản cập nhật*. Mình đang chờ tài khoản Apple để làm cả hai, mà đúng ra
+chỉ một cái cần chờ.
+
+Phía mình không dùng Tauri nên không có `tauri-plugin-updater`; thứ tương đương là
+`cargo-packager-updater` (đã nêu ở M9) hoặc Velopack. Hình dạng thì y hệt: một
+manifest tĩnh + release asset + một cặp khoá tự sinh.
+
+### 10.2 Không có CI nào cả
+
+Repo mình chưa có `.github/`. Của họ: kiểm tra → tạo release → dựng ma trận 5 nền
+(macOS arm64/x64, Linux x64/arm64, Windows) → ký → sinh `update.json` và cả
+manifest winget → **kiểm lại asset** bằng script có unit test riêng
+(`.github/scripts/*.test.js`). Kiểm asset sau khi dựng là chỗ đáng học nhất: một
+release thiếu một nền là thứ chỉ người dùng nền đó phát hiện ra.
+
+### 10.3 Nhớ region của từng bucket
+
+`S3ClientManager` giữ `bucket_regions: HashMap<String, String>` và một hàm ghi
+hàng loạt. Mình **dò** được region từ thông báo lỗi (§9.16) nhưng **không nhớ**:
+lần sau vào lại bucket đó là lại một vòng lỗi-rồi-dò. Rẻ, và sửa đúng chỗ đang
+tốn một request thừa mỗi lần.
+
+### 10.4 Cache listing có trần thật
+
+Họ cache kết quả một thư mục theo khoá `(profile, bucket, prefix, cột sắp, chiều
+sắp)`, chặn **cả hai đầu**: tối đa 32 mục cache *và* tối đa 100.000 phần tử cộng
+lại, đuổi cũ nhất trước, và thư mục nào một mình đã vượt trần thì không cache.
+Mình mới cache danh sách bucket (TTL 30 phút). Đây cũng đúng chỗ §9 đang ghi là
+"chưa đo": sắp xếp và lọc chạy trên toàn bộ `entries` trong RAM.
+
+### 10.5 `[profile.release]` chưa đụng tới
+
+Của họ: `panic = "abort"`, `lto = true`, `codegen-units = 1`, `opt-level = "s"`,
+`strip = true`. `Cargo.toml` của mình chỉ chỉnh `[profile.dev]`. Lưu ý một chỗ
+vướng: `panic = "abort"` không giết panic hook (`crash.rs` vẫn chạy) nhưng giết
+`catch_unwind`, mà test của `crash.rs` đang dùng — test chạy ở profile test nên
+không sao, chỉ là phải biết trước.
+
+### 10.6 Endpoint gõ thiếu `https://`
+
+`normalize_endpoint_url` của họ thêm `https://` khi người dùng gõ trơ
+`s3.example.com`. Mình không, và AWS SDK trả về "dispatch failure" — mà
+`failure.rs` lại dịch thành "Không kết nối được tới endpoint" kèm nút **Thử lại**,
+tức là mời người ta bấm mãi một nút không bao giờ chạy được, cho một lỗi gõ thiếu
+tám ký tự. Nhỏ, thật, và rẻ.
+
+### 10.7 Đọc credential từ biến môi trường
+
+Họ có `CredentialType::Environment` và `check_aws_environment` (đọc
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_REGION`).
+Mình nhập được `~/.aws/*` nhưng bỏ qua biến môi trường — trong khi mọi công cụ AWS
+khác đều đọc, và người dùng CLI mặc định là đã có sẵn ở đó.
+
+### 10.8 Chỉ cho người dùng chỗ tìm log
+
+Họ có lệnh `get_log_file_info` trả về đường dẫn log và `panic.log` để UI hiện lên.
+Báo cáo crash của mình **tốt hơn** của họ (có backtrace, tách theo pid) nhưng
+không có chỗ nào trong app nói nó nằm đâu — một file không ai tìm thấy thì cũng
+như không viết.
+
+### 10.9 Upload lỗi thì thử lại một lần ở region vừa dò
+
+Họ: upload hỏng → dò region thật của bucket → nếu khác thì thử lại đúng một lần →
+vẫn hỏng mới báo. Mình báo region đúng rồi để người dùng tự sửa. Hai cách đều
+đúng; cách của họ đỡ một vòng thao tác cho trường hợp thường gặp nhất.
+
+### Không học
+
+Monaco (là WebView, GPUI không có — xem "Đề nghị không làm" ở §9), MUI, Next.js.
