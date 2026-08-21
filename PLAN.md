@@ -818,3 +818,29 @@ Giờ tự dựng nút, đi qua `clear_filter` để focus quay về danh sách,
 ĐÃ HUỶ, mục rỗng không vẽ gì. **Không** tách Uploads và Downloads thành hai trang
 — một ngăn kéo có tiêu đề nhóm nói được cùng chừng ấy mà không bắt ai đổi trang
 để biết một lần truyền đã xong chưa.
+
+### 10.12 Cửa sổ hẹp và thanh trạng thái (21/08/2026)
+
+Hai lỗi UI do người dùng chỉ ra, không phải từ đối chiếu Brows3.
+
+**a. Inspector bị đẩy ra khỏi cửa sổ.** Khung object pane là `flex_1` nhưng
+không có `min_w(0)` — mà sàn của một flex child là *nội dung* của nó, và nội dung
+đây là một toolbar đầy nút cố định. Nên pane không chịu hẹp dưới khoảng 700px và
+đẩy inspector ra khỏi mép phải: nhãn còn trên màn hình, **mọi giá trị biến mất**.
+Thêm `min_w(0)` + `overflow_hidden` cho pane, `flex_shrink_0` cho inspector và
+sidebar.
+
+Sửa xong lộ ra lỗi thứ hai cùng họ: giờ pane hẹp được thì flexbox lấy chỗ từ
+đúng ô **tên** — dòng đọc thành `6 ☐ 📄 BIN 2.9 MB`. Ô tên có `NAME_MIN_WIDTH`
+làm sàn; cái gì phải mất ở bề rộng hẹp thì không phải là tên của thứ đang xem.
+
+**b. Thanh trạng thái xếp lại.** Bốn gợi ý phím tắt (`⌘F ⌘N ⌘D ⌘J`) chiếm phần
+lớn thanh, vừa cố định vừa **không đầy đủ**, và nhắc `⌘J` ngay cạnh chính cái nút
+hàng đợi mà nó gọi tên. Palette đã in phím tắt của từng lệnh bên cạnh lệnh đó,
+nên một đường vào là đủ: `⌘K lệnh`, bấm được.
+
+Thêm vạch ngăn giữa các nhóm — trước đó profile, region, gợi ý, nút hàng đợi và
+số phiên bản chạy liền thành một dải chữ mờ cùng cỡ. Tên profile đậm hơn region
+một bậc: một cái là tài khoản nào, cái kia là chi tiết của nó. Và thứ duy nhất
+được phép cắt ở giữa là **câu trạng thái** — nó là một câu, nửa câu vẫn nói được
+điều gì đó; mọi thứ bên phải là control hoặc dữ kiện, nửa cái đó thì vô giá trị.

@@ -113,6 +113,9 @@ const DETAIL_HEIGHT: f32 = 108.;
 /// The filter field. Wide enough for a real file name, narrow enough that the
 /// breadcrumb keeps most of the bar.
 const FILTER_WIDTH: f32 = 196.;
+/// The narrowest the name column may get. Below this a row stops saying which
+/// object it is about, which is the one thing every other column depends on.
+const NAME_MIN_WIDTH: f32 = 140.;
 const FIELD_HEIGHT: f32 = 26.;
 /// How many buckets before the sidebar gets a search box. Under this the list
 /// fits on screen and the box is pure chrome.
@@ -5412,6 +5415,9 @@ impl Browser {
 
         div()
             .w(px(SIDEBAR_WIDTH))
+            // Fixed too, for the same reason as the inspector: a bucket list
+            // squeezed to nothing is not a smaller bucket list.
+            .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
@@ -6970,7 +6976,11 @@ impl Browser {
             })
             .when_some(self.filter_input.clone(), |this, input| {
                 this.child(
-                    div().w(px(FILTER_WIDTH)).flex_shrink_0().child(
+                    // Shrinks before anything else in the toolbar. A filter
+                    // box narrow enough to show six characters is still a
+                    // filter box; a delete button that is not on screen is not
+                    // a delete button.
+                    div().w(px(FILTER_WIDTH)).min_w(px(80.)).child(
                         Input::new(&input)
                             .h(px(FIELD_HEIGHT))
                             .prefix(sized_icon("search", 13., theme.text_faint))
@@ -7231,7 +7241,7 @@ impl Browser {
             )
             .child(div().w(px(22.)))
             .child(
-                div().flex_1().child(header(SortKey::Name, "Tên").on_click(
+                div().flex_1().min_w(px(NAME_MIN_WIDTH)).child(header(SortKey::Name, "Tên").on_click(
                     cx.listener(|this, _event, _window, cx| this.toggle_sort(SortKey::Name, cx)),
                 )),
             )
@@ -7760,14 +7770,24 @@ impl Browser {
                     .and_then(|ix| self.profiles.get(ix));
                 this.child(
                     div()
+                        .flex_shrink_0()
                         .flex()
+                        .items_center()
                         .gap_2()
-                        .text_color(theme.text_faint)
+                        // The name reads a step stronger than the region: one
+                        // is which account, the other is a detail of it, and
+                        // two runs of identical faint text side by side read as
+                        // one thing with a space in it.
                         .children(profile.map(|profile| {
-                            SharedString::from(profile.name.clone())
+                            div()
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(profile.name.clone()))
                         }))
+                        .children(profile.map(|_| status_divider(theme)))
                         .children(profile.map(|profile| {
-                            SharedString::from(profile.region.clone())
+                            div()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(profile.region.clone()))
                         })),
                 )
             })
@@ -7797,7 +7817,11 @@ impl Browser {
                     .child(self.status.clone())
                     .into_any_element(),
             })
-            .child(div().flex_1())
+            // The message is the one thing here that may be cut: it is a
+            // sentence, and half a sentence still says something. Everything to
+            // the right is a control or a fact, and half of one of those is
+            // worth nothing.
+            .child(div().flex_1().min_w(px(0.)))
             // A batch of four hundred copies takes long enough that "no way to
             // stop it" is not an acceptable answer.
             .when_some(
@@ -7824,14 +7848,31 @@ impl Browser {
                     )
                 },
             )
+            // One pointer instead of four hints. The old strip listed ⌘F, ⌘N,
+            // ⌘D and ⌘J — a cheat sheet that was both permanent and
+            // incomplete, taking more of this bar than everything that changes
+            // on it put together, and repeating ⌘J directly beside the queue
+            // button it names. The palette already prints every command's own
+            // shortcut beside it, so one way in covers the lot.
             .child(
                 div()
+                    .id("status-palette")
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
                     .text_color(theme.text_faint)
+                    .hover(|this| this.bg(theme.hover).text_color(theme.text_muted))
                     .child(SharedString::from(format!(
-                        "{m}F lọc   {m}N thư mục   {m}D tải xuống   {m}J hàng đợi",
-                        m = platform::primary_modifier()
-                    ))),
+                        "{}K lệnh",
+                        platform::primary_modifier()
+                    )))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.open_palette(window, cx)
+                    })),
             )
+            .child(status_divider(theme))
             // Always, not only while something is transferring. Hiding it when
             // the queue is idle meant the finished and failed jobs — the ones
             // worth going back to look at — were behind ⌘J and nothing else.
@@ -7844,6 +7885,7 @@ impl Browser {
                 };
                 div()
                     .id("queue-toggle")
+                    .flex_shrink_0()
                     .px_2()
                     .py_0p5()
                     .rounded_md()
@@ -7864,8 +7906,10 @@ impl Browser {
             // not say which build it is about costs a round trip, and this is
             // the one place a user can read the answer off without hunting for
             // an About box the app does not have.
+            .child(status_divider(theme))
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_color(theme.text_faint)
                     .child(concat!("v", env!("CARGO_PKG_VERSION"))),
             )
@@ -8348,6 +8392,10 @@ impl Browser {
         Some(
             div()
                 .w(px(INSPECTOR_WIDTH))
+                // Never squeezed. It is a panel someone opened on purpose, and
+                // half of one is worse than none: the labels survive a squeeze
+                // and the values are what they opened it for.
+                .flex_shrink_0()
                 .h_full()
                 .flex()
                 .flex_col()
@@ -9566,6 +9614,15 @@ impl Render for Browser {
                         div()
                             .id("object-pane")
                             .flex_1()
+                            // A flex child's floor is its content unless it is
+                            // told otherwise, and this one's content is a
+                            // toolbar full of fixed-width buttons. Without
+                            // these two the pane refused to go below about
+                            // 700px and shoved the inspector off the right edge
+                            // of the window — labels still on screen, every
+                            // value gone.
+                            .min_w(px(0.))
+                            .overflow_hidden()
                             .h_full()
                             .flex()
                             .flex_col()
@@ -9989,6 +10046,19 @@ fn sidebar_item(
         )
 }
 
+/// A hairline between two groups on the status bar.
+///
+/// The bar had none, so profile, region, shortcut hints, the queue button and
+/// the version ran together as one undifferentiated strip of faint text at one
+/// size. A rule costs a pixel and says which of those belong together.
+fn status_divider(theme: Theme) -> impl IntoElement {
+    div()
+        .w(px(1.))
+        .h(px(11.))
+        .flex_shrink_0()
+        .bg(theme.border_strong)
+}
+
 /// A bare glyph you can click, with no button chrome around it.
 ///
 /// For the small controls that live *inside* something else — the × on a tab,
@@ -10184,7 +10254,13 @@ fn object_row(
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.))
+                // A floor, not zero. Letting the pane shrink fixed the
+                // inspector being shoved off the window, and then this cell —
+                // the one holding the *name* — was the first thing flexbox
+                // took the space from, leaving rows that read
+                // "6 ☐ 📄 BIN 2.9 MB". Whatever else has to go at a narrow
+                // width, it is not the name of the thing.
+                .min_w(px(NAME_MIN_WIDTH))
                 .flex()
                 .items_center()
                 .gap_1p5()
