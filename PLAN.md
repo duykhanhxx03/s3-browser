@@ -563,7 +563,8 @@ dừng được, và nếu bị cắt thì dòng trạng thái nói "sắp xếp
     theo profile; sidebar nói rõ "từ bộ nhớ tạm" và có nút làm mới.
 13. ~~**Chép đường dẫn `s3://`** và key~~ — xong (21/08/2026). Cả vùng chọn, mỗi
     key một dòng, thư mục cũng chép.
-14. **ACL đệ quy cho cả prefix**, không chỉ cho vùng đang chọn.
+14. ~~**ACL đệ quy cho cả prefix**~~ — xong (21/08/2026). Đi hết prefix rồi chạy
+    qua bộ chạy hàng loạt, có trần như tìm kiếm sâu. Chưa nhìn thấy chạy thật.
 15. **Xoá lùi về từng object** khi provider từ chối `DeleteObjects`. Đây là ca
     tương thích thật, Brows3 gặp đủ nhiều để viết hẳn vào README.
 16. **Tự dò region** từ cấu hình hệ thống.

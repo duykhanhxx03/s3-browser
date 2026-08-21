@@ -136,6 +136,8 @@ gpui::actions!(
         ActionOpenInTab,
         ActionCopyPath,
         ActionCopyKey,
+        ActionAclPrivate,
+        ActionAclPublic,
     ]
 );
 
@@ -3165,6 +3167,8 @@ impl Browser {
             }
             Command::CopyPath => self.copy_location(true, cx),
             Command::CopyKey => self.copy_location(false, cx),
+            Command::AclFolderPrivate => self.set_acl_recursive("private", cx),
+            Command::AclFolderPublic => self.set_acl_recursive("public-read", cx),
             Command::Filter => {
                 if let Some(window) = window {
                     self.focus_filter(window, cx);
@@ -3838,6 +3842,78 @@ impl Browser {
                 cx.notify();
             });
         }));
+    }
+
+    /// Applies a canned ACL to every object under the cursor's folder.
+    ///
+    /// The prefix has to be walked first: ACLs live on objects, and a folder is
+    /// a common prefix with no ACL of its own. Bounded by the same caps as a
+    /// deep search, because walking a prefix is the same LIST requests under a
+    /// different name.
+    fn set_acl_recursive(&mut self, canned: &'static str, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
+        let target = self
+            .cursor_position()
+            .and_then(|position| self.visible.get(position).copied())
+            .and_then(|index| self.entries.get(index))
+            .filter(|entry| entry.is_folder)
+            .map(|entry| entry.key.clone());
+        let Some(prefix) = target else {
+            return;
+        };
+
+        self.status = format!("Đang liệt kê {prefix}…").into();
+        let listing_bucket = bucket.clone();
+        let listing_prefix = prefix.clone();
+        let listing = Tokio::spawn(cx, async move {
+            let mut keys = Vec::new();
+            let mut token = None;
+            let mut requests = 0usize;
+            loop {
+                let page = client
+                    .list_flat_page(&listing_bucket, &listing_prefix, token)
+                    .await?;
+                keys.extend(page.entries.into_iter().map(|entry| entry.key));
+                requests += 1;
+                token = page.continuation;
+                // The same ceiling a deep search has, and for the same reason:
+                // nobody agreed to a thousand requests by picking a menu item.
+                if token.is_none()
+                    || requests >= SEARCH_MAX_REQUESTS
+                    || keys.len() >= SEARCH_MAX_KEYS
+                {
+                    break;
+                }
+            }
+            anyhow::Ok((keys, token.is_some()))
+        });
+
+        self.op_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = listing.await;
+            _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok((keys, truncated))) => {
+                        if truncated {
+                            // Said before anything is written, not after: a
+                            // partial pass over permissions is the kind of
+                            // half-done nobody should find out about later.
+                            this.fail(Failure::known(
+                                "Thư mục quá lớn, chỉ đổi quyền phần đã liệt kê",
+                                format!("{prefix}: {} object đầu tiên", keys.len()),
+                                None,
+                            ));
+                        }
+                        this.start_bulk("Đổi quyền", keys, BulkOp::Acl(canned), cx);
+                    }
+                    Ok(Err(error)) => this.report(format!("{error:?}")),
+                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// Sets a canned ACL on everything selected, or on the inspected object when
@@ -6222,6 +6298,7 @@ impl Browser {
                         // clipboard, so it is decided per row rather than once.
                         let single = this.selection.len() <= 1;
                         let can_paste = this.clipboard.is_some();
+                        let acl_supported = this.supports(|caps| caps.acl);
                         let checkbox = div()
                             .id(("check", position))
                             .w(px(CHECK_WIDTH))
@@ -6352,11 +6429,28 @@ impl Browser {
                             // A folder has no metadata of its own and cannot be
                             // shared as a link, so those never appear on one.
                             let menu = if is_folder {
-                                menu.menu_with_icon(
+                                let menu = menu.menu_with_icon(
                                     "Mở trong tab mới",
                                     menu_icon("external"),
                                     Box::new(ActionOpenInTab),
-                                )
+                                );
+                                // Only where the provider has ACLs at all. On a
+                                // bucket with them switched off — the default
+                                // since 2023 — these two can only ever fail.
+                                if acl_supported {
+                                    menu.menu_with_icon(
+                                        "Đặt riêng tư cho cả thư mục",
+                                        menu_icon("eye"),
+                                        Box::new(ActionAclPrivate),
+                                    )
+                                    .menu_with_icon(
+                                        "Đặt ai cũng đọc được cho cả thư mục",
+                                        menu_icon("eye"),
+                                        Box::new(ActionAclPublic),
+                                    )
+                                } else {
+                                    menu
+                                }
                             } else {
                                 menu.menu_with_icon(
                                     "Xem trước",
@@ -7960,6 +8054,12 @@ impl Render for Browser {
             .on_action(cx.listener(|this, _: &ActionCopyKey, _window, cx| {
                 this.copy_location(false, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActionAclPrivate, _window, cx| {
+                this.set_acl_recursive("private", cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActionAclPublic, _window, cx| {
+                this.set_acl_recursive("public-read", cx)
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -9430,6 +9530,8 @@ pub enum Command {
     Settings,
     CopyPath,
     CopyKey,
+    AclFolderPrivate,
+    AclFolderPublic,
     GoUp,
     Filter,
     NewFolder,
@@ -9470,6 +9572,8 @@ impl Command {
             Command::Settings => ("Cài đặt", ""),
             Command::CopyPath => ("Chép đường dẫn s3://", ""),
             Command::CopyKey => ("Chép key", ""),
+            Command::AclFolderPrivate => ("Thư mục: đặt riêng tư", ""),
+            Command::AclFolderPublic => ("Thư mục: ai cũng đọc được", ""),
             Command::NewFolder => ("Thư mục mới", "⌘N"),
             Command::NewBucket => ("Bucket mới", "⌘⇧N"),
             Command::Rename => ("Đổi tên", "⌘⏎"),
@@ -9492,7 +9596,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 31] {
+    fn all() -> [Command; 33] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -9525,6 +9629,8 @@ impl Command {
             Command::Settings,
             Command::CopyPath,
             Command::CopyKey,
+            Command::AclFolderPrivate,
+            Command::AclFolderPublic,
         ]
     }
 }
@@ -10503,7 +10609,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 31);
+        assert_eq!(all.len(), 33);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
