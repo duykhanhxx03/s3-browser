@@ -255,6 +255,45 @@ Kiểm nhanh xem manifest có vào exe không:
 strings -a target/x86_64-pc-windows-msvc/release/s3browser.exe | grep PerMonitorV2
 ```
 
+## Bộ cài Windows (.exe)
+
+`cargo-packager` dựng được bộ cài NSIS **từ máy macOS**, không cần Windows:
+
+```bash
+brew install makensis
+cargo packager --release -p s3browser --target x86_64-pc-windows-msvc --formats nsis
+```
+
+Ra `target/x86_64-pc-windows-msvc/release/s3browser_0.1.0_x64-setup.exe`,
+khoảng 12 MB — NSIS nén cái binary 42 MB lại.
+
+`cargo packager` **không tự build**, đúng như phần macOS đã nêu: phải có sẵn
+`.exe` ở `target/x86_64-pc-windows-msvc/release/` trước.
+
+Kiểm nhanh xem có đúng là bộ cài không:
+
+```bash
+file target/x86_64-pc-windows-msvc/release/s3browser_0.1.0_x64-setup.exe
+# PE32 executable (GUI) Intel 80386, for MS Windows, Nullsoft Installer self-extracting archive
+```
+
+### Chưa ký, và người dùng sẽ thấy điều đó
+
+Lệnh trên in ra hai cảnh báo, cả hai đều đúng:
+
+```
+WARN Codesigning is by default is only supported on Windows hosts...
+     skipping signing the main binary
+     skipping signing the installer
+```
+
+Windows SmartScreen chặn bộ cài không ký bằng màn hình xanh "Windows
+protected your PC", và nút chạy tiếp nằm sau chữ "More info" — cùng một loại
+rào với Gatekeeper trên macOS, và phần lớn người dùng sẽ dừng ở đó. Gỡ được
+bằng chứng chỉ Authenticode (mua từ CA, không tự ký được), rồi đặt
+`config.windows.sign_command`. Cũng là quyết định của chủ dự án chứ không
+phải thứ viết thêm vào repo được, giống hệt Developer ID ở phần macOS.
+
 ## Chưa kiểm chứng
 
 Exe này **chưa từng chạy trên Windows**. Những gì kiểm được từ macOS chỉ là cấu
@@ -262,6 +301,9 @@ trúc file: đúng `PE32+ (GUI)`, đúng bảng import, manifest và HLSL nằm 
 binary, không còn đường dẫn của máy build. Việc renderer DirectX có dựng nổi
 device thật, glass Acrylic có bật, Credential Manager có nhận khoá hay không —
 tất cả đều phải chạy thật trên Windows mới biết.
+
+Bộ cài cũng vậy: mới chỉ xác nhận đúng định dạng NSIS, chưa ai chạy nó để
+xem nó cài vào đâu, tạo shortcut gì, và gỡ ra có sạch không.
 
 # Dựng bản Linux từ máy macOS
 

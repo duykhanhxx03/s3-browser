@@ -44,7 +44,7 @@ objc2-foundation = "0.3"
 [package.metadata.packager]
 product-name = "s3browser"
 identifier = "dev.s3browser.app"
-description = "Trình duyệt S3 cho macOS"
+description = "Trình duyệt S3 cho máy tính"
 authors = ["s3browser"]
 formats = ["app", "dmg"]
 
