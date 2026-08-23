@@ -35,6 +35,33 @@ impl ThemeChoice {
     }
 }
 
+/// How much motion the interface should use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MotionChoice {
+    /// Follow the operating system accessibility setting.
+    #[default]
+    System,
+    Full,
+    Reduced,
+}
+
+impl MotionChoice {
+    pub const ALL: [MotionChoice; 3] = [
+        MotionChoice::System,
+        MotionChoice::Full,
+        MotionChoice::Reduced,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MotionChoice::System => "Theo hệ thống",
+            MotionChoice::Full => "Mượt",
+            MotionChoice::Reduced => "Giảm",
+        }
+    }
+}
+
 /// How many megabytes of an object a preview may pull down.
 ///
 /// A cap rather than a promise: the point of a preview is deciding whether this
@@ -50,6 +77,7 @@ pub const JOB_CONCURRENCY_CHOICES: [usize; 4] = [1, 2, 4, 8];
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    pub motion: MotionChoice,
     pub preview_limit_mb: u32,
     /// Bytes per second, zero for unlimited.
     pub bandwidth_limit: u64,
@@ -60,6 +88,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::System,
+            motion: MotionChoice::System,
             preview_limit_mb: 8,
             bandwidth_limit: 0,
             job_concurrency: 2,
@@ -112,8 +141,7 @@ impl SettingsStore {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(settings)?;
-        std::fs::write(&self.path, text)
-            .with_context(|| format!("writing {}", self.path.display()))
+        std::fs::write(&self.path, text).with_context(|| format!("writing {}", self.path.display()))
     }
 }
 
@@ -170,6 +198,7 @@ mod tests {
 
         let settings = Settings {
             theme: ThemeChoice::Dark,
+            motion: MotionChoice::Reduced,
             preview_limit_mb: 32,
             bandwidth_limit: 5_000_000,
             job_concurrency: 4,
@@ -183,7 +212,11 @@ mod tests {
         std::fs::write(store.path(), r#"{"theme":"dark"}"#).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.theme, ThemeChoice::Dark);
-        assert_eq!(loaded.preview_limit_mb, Settings::default().preview_limit_mb);
+        assert_eq!(loaded.motion, Settings::default().motion);
+        assert_eq!(
+            loaded.preview_limit_mb,
+            Settings::default().preview_limit_mb
+        );
 
         _ = std::fs::remove_dir_all(&dir);
     }

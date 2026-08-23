@@ -125,18 +125,17 @@ impl Job {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.key.clone()),
-            Direction::Download => self
-                .key
-                .rsplit('/')
-                .next()
-                .unwrap_or(&self.key)
-                .to_string(),
+            Direction::Download => self.key.rsplit('/').next().unwrap_or(&self.key).to_string(),
         }
     }
 
     pub fn fraction(&self) -> f32 {
         if self.size == 0 {
-            return if self.state == JobState::Done { 1.0 } else { 0.0 };
+            return if self.state == JobState::Done {
+                1.0
+            } else {
+                0.0
+            };
         }
         (self.transferred as f32 / self.size as f32).clamp(0.0, 1.0)
     }
@@ -618,8 +617,8 @@ pub fn part_size_for(total: u64) -> u64 {
 /// Expands one dropped path into the files to upload, each with the key suffix
 /// it should get. A dropped directory keeps its own name as the top folder.
 fn walk_upload_source(path: &Path) -> Result<Vec<(PathBuf, String)>> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
 
     if metadata.is_file() {
         let name = path
@@ -704,7 +703,10 @@ mod tests {
             safe_join(base, "trip/day-1/photo.jpg").unwrap(),
             Path::new("/tmp/dl/trip/day-1/photo.jpg")
         );
-        assert_eq!(safe_join(base, "a.txt").unwrap(), Path::new("/tmp/dl/a.txt"));
+        assert_eq!(
+            safe_join(base, "a.txt").unwrap(),
+            Path::new("/tmp/dl/a.txt")
+        );
 
         // An S3 key is an arbitrary string. These are all legal keys, and every
         // one of them would write outside the chosen directory.
@@ -737,7 +739,11 @@ mod tests {
         // 10 TiB at 16 MiB parts would need 655,360 parts, far past the limit.
         let huge = 10 * 1024 * 1024 * 1024 * 1024_u64;
         let size = part_size_for(huge);
-        assert!(huge.div_ceil(size) <= MAX_PARTS, "{} parts", huge.div_ceil(size));
+        assert!(
+            huge.div_ceil(size) <= MAX_PARTS,
+            "{} parts",
+            huge.div_ceil(size)
+        );
 
         // Never below what S3 accepts.
         assert!(part_size_for(1) >= MIN_PART_SIZE);

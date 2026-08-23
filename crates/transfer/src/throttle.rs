@@ -147,7 +147,10 @@ mod tests {
         // An hour idle must not buy an hour's worth of credit.
         let much_later = start + Duration::from_secs(3600);
         assert_eq!(throttle.charge(1_000_000, much_later), Duration::ZERO);
-        assert_eq!(throttle.charge(1_000_000, much_later), Duration::from_secs(1));
+        assert_eq!(
+            throttle.charge(1_000_000, much_later),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

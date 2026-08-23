@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/app", "crates/s3core", "crates/transfer", "crates/vault", "crates/gpui_tokio"]
+exclude = ["vendor/gpui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,4 +35,5 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
-
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

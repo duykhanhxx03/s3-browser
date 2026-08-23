@@ -31,10 +31,37 @@ macro_rules! icons {
 }
 
 icons![
-    "arrow-up", "bucket", "check", "chevron-down", "chevron-up", "clock", "close", "copy", "cut",
+    "arrow-up",
+    "bucket",
+    "check",
+    "chevron-down",
+    "chevron-up",
+    "clock",
+    "close",
+    "copy",
+    "cut",
     "download",
-    "duplicate", "external", "eye", "file", "folder", "info", "link", "pause", "play",
-    "more", "paste", "path", "plus", "refresh", "rename", "search", "star", "transfer", "trash",
+    "duplicate",
+    "external",
+    "eye",
+    "file",
+    "folder",
+    "grid",
+    "info",
+    "link",
+    "list",
+    "pause",
+    "play",
+    "more",
+    "paste",
+    "path",
+    "plus",
+    "refresh",
+    "rename",
+    "search",
+    "star",
+    "transfer",
+    "trash",
     "upload",
 ];
 
@@ -91,11 +118,20 @@ mod tests {
             );
             // One grid for all of them; a stray viewBox makes an icon render at
             // a different visual size beside its neighbours.
-            assert!(text.contains(r#"viewBox="0 0 24 24""#), "{path} is off-grid");
+            assert!(
+                text.contains(r#"viewBox="0 0 24 24""#),
+                "{path} is off-grid"
+            );
             // Solid, not outlined. One outlined icon among filled ones is the
             // single most visible way for a set to look mismatched.
-            assert!(text.contains(r#"fill="currentColor""#), "{path} is not filled");
-            assert!(!text.contains("stroke-width"), "{path} is outlined, not filled");
+            assert!(
+                text.contains(r#"fill="currentColor""#),
+                "{path} is not filled"
+            );
+            assert!(
+                !text.contains("stroke-width"),
+                "{path} is outlined, not filled"
+            );
         }
     }
 

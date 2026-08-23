@@ -33,9 +33,7 @@ async fn client_or_skip() -> Option<S3Client> {
     };
 
     if !buckets.iter().any(|bucket| bucket == "demo-bucket") {
-        eprintln!(
-            "skipping: MinIO has no fixture data; run scripts/minio-dev.sh reset --large"
-        );
+        eprintln!("skipping: MinIO has no fixture data; run scripts/minio-dev.sh reset --large");
         return None;
     }
     Some(client)
@@ -225,7 +223,10 @@ async fn copies_moves_and_preserves_the_key_exactly() {
 
     // Move: the destination appears and the source is gone.
     let moved = "copy-tests/moved.txt";
-    client.move_object(bucket, dst, bucket, moved).await.unwrap();
+    client
+        .move_object(bucket, dst, bucket, moved)
+        .await
+        .unwrap();
     assert!(client.head_object(bucket, moved).await.is_ok());
     assert!(
         client.head_object(bucket, dst).await.is_err(),
@@ -315,17 +316,26 @@ async fn moves_a_whole_prefix_keeping_its_structure() {
     // Nesting is preserved and the source is gone.
     for key in ["readme.txt", "day-1/photo.bin", "day-1/notes/a.txt"] {
         assert!(
-            client.head_object(bucket, &format!("{dst}{key}")).await.is_ok(),
+            client
+                .head_object(bucket, &format!("{dst}{key}"))
+                .await
+                .is_ok(),
             "{key} should have landed under the new prefix"
         );
         assert!(
-            client.head_object(bucket, &format!("{src}{key}")).await.is_err(),
+            client
+                .head_object(bucket, &format!("{src}{key}"))
+                .await
+                .is_err(),
             "{key} should be gone from the old prefix"
         );
     }
 
     for key in ["readme.txt", "day-1/photo.bin", "day-1/notes/a.txt"] {
-        client.delete_object(bucket, &format!("{dst}{key}")).await.unwrap();
+        client
+            .delete_object(bucket, &format!("{dst}{key}"))
+            .await
+            .unwrap();
     }
 }
 
@@ -347,7 +357,9 @@ async fn refuses_to_move_a_prefix_into_itself() {
 fn http_get(url: &str) -> (u16, Vec<u8>) {
     use std::io::{Read, Write};
 
-    let rest = url.strip_prefix("http://").expect("presigned URL over http");
+    let rest = url
+        .strip_prefix("http://")
+        .expect("presigned URL over http");
     let (authority, path) = rest.split_once('/').expect("URL has a path");
     let path = format!("/{path}");
 
@@ -486,15 +498,25 @@ async fn versions_restore_and_delete_individually() {
     // key, so this would show up as a phantom version without filtering.
     let sibling = "versions/notes.txt.bak";
 
-    client.put_object(bucket, key, b"v1".to_vec()).await.unwrap();
-    client.put_object(bucket, key, b"v2".to_vec()).await.unwrap();
+    client
+        .put_object(bucket, key, b"v1".to_vec())
+        .await
+        .unwrap();
+    client
+        .put_object(bucket, key, b"v2".to_vec())
+        .await
+        .unwrap();
     client
         .put_object(bucket, sibling, b"unrelated".to_vec())
         .await
         .unwrap();
 
     let versions = client.list_versions(bucket, key).await.unwrap();
-    assert_eq!(versions.len(), 2, "two puts make two versions: {versions:?}");
+    assert_eq!(
+        versions.len(),
+        2,
+        "two puts make two versions: {versions:?}"
+    );
     assert!(
         versions.iter().all(|v| v.key == key),
         "a sibling key leaked in: {versions:?}"
@@ -561,10 +583,16 @@ async fn emptying_a_versioned_bucket_clears_hidden_versions_too() {
 
     for i in 0..3 {
         let key = format!("doc-{i}.txt");
-        client.put_object(bucket, &key, b"a".to_vec()).await.unwrap();
+        client
+            .put_object(bucket, &key, b"a".to_vec())
+            .await
+            .unwrap();
         // A second put makes a second version if the bucket is versioned, and
         // simply overwrites if it is not — either way the flow must cope.
-        client.put_object(bucket, &key, b"bb".to_vec()).await.unwrap();
+        client
+            .put_object(bucket, &key, b"bb".to_vec())
+            .await
+            .unwrap();
     }
     // Delete one the ordinary way: in a versioned bucket that leaves a delete
     // marker, which is exactly what makes DeleteBucket fail later.
@@ -610,7 +638,10 @@ async fn sse_headers_reach_the_server_on_both_upload_paths() {
 
     // Baseline: no encryption asked for, none reported.
     let plain = "sse-tests/plain.txt";
-    client.put_object(bucket, plain, b"x".to_vec()).await.unwrap();
+    client
+        .put_object(bucket, plain, b"x".to_vec())
+        .await
+        .unwrap();
     let head = client.head_object(bucket, plain).await.unwrap();
     assert_eq!(head.encryption, None, "baseline should be unencrypted");
     client.delete_object(bucket, plain).await.unwrap();
@@ -708,7 +739,10 @@ async fn assume_role_yields_working_temporary_credentials() {
         }
     };
 
-    assert!(!credentials.session_token.is_empty(), "a session needs a token");
+    assert!(
+        !credentials.session_token.is_empty(),
+        "a session needs a token"
+    );
     assert!(
         !credentials.expires_within(Duration::from_secs(60)),
         "a 15-minute session should not already be inside a 1-minute margin"
@@ -749,7 +783,10 @@ async fn acl_reads_grants_and_flags_public_ones() {
     };
     let bucket = "demo-bucket";
     let key = "acl-tests/doc.txt";
-    client.put_object(bucket, key, b"acl".to_vec()).await.unwrap();
+    client
+        .put_object(bucket, key, b"acl".to_vec())
+        .await
+        .unwrap();
 
     let caps = client.detect_capabilities(bucket).await;
     if !caps.acl.is_usable() {
@@ -817,7 +854,12 @@ async fn an_upload_stores_the_content_type_its_name_implies() {
     let key = "content-type-tests/pixel.png";
     client.put_object(bucket, key, png).await.unwrap();
     assert_eq!(
-        client.head_object(bucket, key).await.unwrap().content_type.as_deref(),
+        client
+            .head_object(bucket, key)
+            .await
+            .unwrap()
+            .content_type
+            .as_deref(),
         Some("image/png")
     );
 
@@ -827,7 +869,12 @@ async fn an_upload_stores_the_content_type_its_name_implies() {
         .await
         .unwrap();
     assert_eq!(
-        client.head_object(bucket, key).await.unwrap().content_type.as_deref(),
+        client
+            .head_object(bucket, key)
+            .await
+            .unwrap()
+            .content_type
+            .as_deref(),
         Some("text/html")
     );
 
@@ -850,10 +897,7 @@ async fn an_upload_stores_the_content_type_its_name_implies() {
     // uploads are exactly the ones that go this way, so a fix that only covered
     // `PutObject` would leave every large image untyped.
     let key = "content-type-tests/big.jpg";
-    let upload_id = client
-        .create_multipart_upload(bucket, key)
-        .await
-        .unwrap();
+    let upload_id = client.create_multipart_upload(bucket, key).await.unwrap();
     // 5 MiB is S3's minimum for any part but the last.
     let part = client
         .upload_part(bucket, key, &upload_id, 1, vec![7u8; 5 * 1024 * 1024])
@@ -874,7 +918,12 @@ async fn an_upload_stores_the_content_type_its_name_implies() {
         .await
         .unwrap();
     assert_eq!(
-        client.head_object(bucket, key).await.unwrap().content_type.as_deref(),
+        client
+            .head_object(bucket, key)
+            .await
+            .unwrap()
+            .content_type
+            .as_deref(),
         Some("image/jpeg")
     );
 }

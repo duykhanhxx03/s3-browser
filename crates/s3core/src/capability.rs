@@ -118,14 +118,26 @@ impl S3Client {
     }
 
     async fn probe_versioning(&self, bucket: &str) -> Support {
-        match self.inner().get_bucket_versioning().bucket(bucket).send().await {
+        match self
+            .inner()
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .await
+        {
             Ok(_) => Support::Yes,
             Err(error) => classify(&format!("{error:?}")),
         }
     }
 
     async fn probe_tagging(&self, bucket: &str) -> Support {
-        match self.inner().get_bucket_tagging().bucket(bucket).send().await {
+        match self
+            .inner()
+            .get_bucket_tagging()
+            .bucket(bucket)
+            .send()
+            .await
+        {
             Ok(_) => Support::Yes,
             Err(error) => classify(&format!("{error:?}")),
         }
@@ -175,7 +187,10 @@ mod tests {
         // back as an error, and reading that as "no lifecycle support" would
         // grey out a feature that works perfectly.
         assert_eq!(classify("NoSuchLifecycleConfiguration"), Support::Yes);
-        assert_eq!(classify("ObjectLockConfigurationNotFoundError"), Support::Yes);
+        assert_eq!(
+            classify("ObjectLockConfigurationNotFoundError"),
+            Support::Yes
+        );
     }
 
     #[test]

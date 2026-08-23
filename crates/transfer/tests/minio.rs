@@ -134,7 +134,12 @@ async fn uploads_a_large_file_in_parts_and_downloads_it_back_identically() {
     // Now pull it back through the ranged download path and compare bytes.
     let download_dir = tempfile::tempdir().unwrap();
     let id = engine
-        .enqueue_download(client.clone(), BUCKET, "large/large.bin", download_dir.path())
+        .enqueue_download(
+            client.clone(),
+            BUCKET,
+            "large/large.bin",
+            download_dir.path(),
+        )
         .await
         .unwrap();
 
@@ -265,7 +270,11 @@ async fn a_partial_multipart_upload_can_be_completed_later() {
         .unwrap();
 
     let listed = client.list_parts(BUCKET, key, &upload_id).await.unwrap();
-    assert_eq!(listed.len(), 1, "the server should report the accepted part");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the server should report the accepted part"
+    );
     assert_eq!(listed[0].part_number, 1);
     assert_eq!(listed[0].size, part_size as u64);
 

@@ -49,7 +49,10 @@ impl SsoRole {
     /// What to show in a picker. The account name alone is ambiguous when the
     /// same person can reach several roles in it.
     pub fn label(&self) -> String {
-        format!("{} / {} ({})", self.account_name, self.role_name, self.account_id)
+        format!(
+            "{} / {} ({})",
+            self.account_name, self.role_name, self.account_id
+        )
     }
 }
 
@@ -117,7 +120,8 @@ pub async fn begin(start_url: &str, region: &str) -> Result<DeviceAuthorization>
         client_id,
         client_secret,
         interval: poll_interval(authorization.interval()),
-        expires_at: SystemTime::now() + Duration::from_secs(authorization.expires_in().max(0) as u64),
+        expires_at: SystemTime::now()
+            + Duration::from_secs(authorization.expires_in().max(0) as u64),
     })
 }
 

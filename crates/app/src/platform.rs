@@ -48,6 +48,18 @@ pub fn reduce_transparency() -> bool {
     false
 }
 
+/// Whether the OS asks apps to avoid large or repeated motion.
+#[cfg(target_os = "macos")]
+pub fn reduce_motion() -> bool {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn reduce_motion() -> bool {
+    false
+}
+
 /// How the window is painted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chrome {
@@ -142,6 +154,7 @@ pub const BUNDLED_UI_FONT: &str = "Inter";
 
 /// Kept for the case where the bundled font fails to register: these are what
 /// the platform is likely to have.
+#[cfg(test)]
 pub fn ui_font_candidates() -> &'static [&'static str] {
     // Inter first everywhere: it is designed for screen UI at small sizes, has
     // the tall x-height that keeps a dense file list readable, and its SIL Open
@@ -239,9 +252,9 @@ mod tests {
     /// on, which is a legitimate way to run.
     #[test]
     fn reading_the_accessibility_setting_does_not_crash() {
-        let reduced = reduce_transparency();
         // Both answers are valid; what matters is getting one at all.
-        assert!(reduced == true || reduced == false);
+        let _reduced: bool = reduce_transparency();
+        let _reduced_motion: bool = reduce_motion();
     }
 
     #[test]

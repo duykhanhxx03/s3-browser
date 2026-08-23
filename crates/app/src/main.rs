@@ -4,7 +4,10 @@
 //! isolated in [`platform`].
 
 // Hide the console window that Windows would otherwise open alongside the GUI.
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod assets;
 mod browser;
@@ -34,49 +37,49 @@ fn main() {
     Application::new()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
-        gpui_tokio::init(cx);
-        // Brings the component library's key bindings and theme with it. The
-        // Input widget's editing keys (word-wise delete, select-all, paste) are
-        // bindings rather than hardcoded handling, so skipping this leaves an
-        // input that looks right and does nothing.
-        gpui_component::init(cx);
+            gpui_tokio::init(cx);
+            // Brings the component library's key bindings and theme with it. The
+            // Input widget's editing keys (word-wise delete, select-all, paste) are
+            // bindings rather than hardcoded handling, so skipping this leaves an
+            // input that looks right and does nothing.
+            gpui_component::init(cx);
 
-        // Before any window: a view built while the font is still unregistered
-        // measures its text in the fallback and lays out to the wrong widths.
-        if let Err(error) = cx
-            .text_system()
-            .add_fonts(vec![std::borrow::Cow::Borrowed(assets::UI_FONT)])
-        {
-            eprintln!("không nạp được font đi kèm: {error}");
-        }
+            // Before any window: a view built while the font is still unregistered
+            // measures its text in the fallback and lays out to the wrong widths.
+            if let Err(error) = cx
+                .text_system()
+                .add_fonts(vec![std::borrow::Cow::Borrowed(assets::UI_FONT)])
+            {
+                eprintln!("không nạp được font đi kèm: {error}");
+            }
 
-        let chrome = Chrome::detect();
-        let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
+            let chrome = Chrome::detect();
+            let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                titlebar: platform::titlebar_options(),
-                window_background: chrome.window_background(),
-                window_min_size: Some(size(px(720.), px(420.))),
-                ..Default::default()
-            },
-            |window, cx| {
-                // Dialogs, sheets and notifications from the component library
-                // render into layers that only exist inside a Root, so the app's
-                // own view has to sit under one.
-                let browser = cx.new(|cx| Browser::new(window, cx));
-                cx.new(|cx| gpui_component::Root::new(gpui::AnyView::from(browser), window, cx))
-            },
-        )
-        .expect("failed to open window");
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    titlebar: platform::titlebar_options(),
+                    window_background: chrome.window_background(),
+                    window_min_size: Some(size(px(720.), px(420.))),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    // Dialogs, sheets and notifications from the component library
+                    // render into layers that only exist inside a Root, so the app's
+                    // own view has to sit under one.
+                    let browser = cx.new(|cx| Browser::new(window, cx));
+                    cx.new(|cx| gpui_component::Root::new(gpui::AnyView::from(browser), window, cx))
+                },
+            )
+            .expect("failed to open window");
 
-        cx.activate(true);
+            cx.activate(true);
 
-        if std::env::args().any(|arg| arg == "--verify-glass") {
-            schedule_glass_check(cx);
-        }
-    });
+            if std::env::args().any(|arg| arg == "--verify-glass") {
+                schedule_glass_check(cx);
+            }
+        });
 }
 
 /// Waits for the first frames to land, prints what the window manager actually

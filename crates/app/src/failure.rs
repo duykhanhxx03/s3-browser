@@ -57,7 +57,9 @@ impl Failure {
         let raw = raw.into();
         let (summary, fix) = classify(&raw);
         Self {
-            summary: summary.unwrap_or_else(|| first_line(&raw).to_string()).into(),
+            summary: summary
+                .unwrap_or_else(|| first_line(&raw).to_string())
+                .into(),
             detail: raw.into(),
             fix,
             at: s3core::now_epoch(),
@@ -223,7 +225,10 @@ mod tests {
         // to one bucket is what R2's own docs recommend, so being unable to
         // list buckets is the normal path for a lot of people.
         let (summary, fix) = classify("AccessDenied when calling ListBuckets");
-        assert_eq!(summary.as_deref(), Some("Token không có quyền liệt kê bucket"));
+        assert_eq!(
+            summary.as_deref(),
+            Some("Token không có quyền liệt kê bucket")
+        );
         assert_eq!(fix, Some(Fix::OpenBucketByName));
     }
 
@@ -284,8 +289,8 @@ mod tests {
         // networks, and "sửa profile" beats a workaround that will fail the
         // same way. Claiming a permission problem here would send someone to
         // read an IAM policy that is perfectly correct.
-        let bad_key = Failure::new("ListBuckets: SignatureDoesNotMatch")
-            .or_fix(Fix::OpenBucketByName);
+        let bad_key =
+            Failure::new("ListBuckets: SignatureDoesNotMatch").or_fix(Fix::OpenBucketByName);
         assert_eq!(bad_key.fix, Some(Fix::EditProfile));
         assert_eq!(bad_key.summary, "Khoá truy cập không đúng");
 
@@ -306,6 +311,9 @@ mod tests {
 
         let unknown = Failure::new("Weird\n  source: also weird");
         assert_eq!(unknown.summary, "Weird", "one line in the bar");
-        assert!(unknown.detail.contains("also weird"), "all of it in the panel");
+        assert!(
+            unknown.detail.contains("also weird"),
+            "all of it in the panel"
+        );
     }
 }

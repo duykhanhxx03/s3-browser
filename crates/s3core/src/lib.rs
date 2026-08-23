@@ -7,6 +7,7 @@ pub mod capability;
 pub mod sso;
 pub mod sts;
 
+use std::cmp::Reverse;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,8 +17,9 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
-    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, ObjectCannedAcl, Delete, GlacierJobParameters, MetadataDirective,
-    ObjectIdentifier, RestoreRequest, ServerSideEncryption, StorageClass, Tag, Tagging, Tier,
+    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, Delete, GlacierJobParameters,
+    MetadataDirective, ObjectCannedAcl, ObjectIdentifier, RestoreRequest, ServerSideEncryption,
+    StorageClass, Tag, Tagging, Tier,
 };
 use aws_sdk_s3::Client;
 
@@ -204,6 +206,16 @@ pub struct CompletedPart {
     /// travels with the part rather than being recomputed — the bytes are long
     /// gone by then, and on a resumed upload they were never in this process.
     pub checksum_crc32: Option<String>,
+}
+
+struct MultipartCopy<'a> {
+    src_bucket: &'a str,
+    src_key: &'a str,
+    dst_bucket: &'a str,
+    dst_key: &'a str,
+    size: u64,
+    part_size: u64,
+    head: &'a ObjectHead,
 }
 
 /// A multipart upload left behind by a crash or a cancel. S3 keeps billing for
@@ -634,8 +646,7 @@ impl S3Client {
                     continue;
                 }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("DeleteObjects failed for {bucket}"))
+                    return Err(error).with_context(|| format!("DeleteObjects failed for {bucket}"))
                 }
             };
 
@@ -698,10 +709,8 @@ impl S3Client {
             metadata: out
                 .metadata()
                 .map(|map| {
-                    let mut pairs: Vec<(String, String)> = map
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    let mut pairs: Vec<(String, String)> =
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     // S3 returns metadata unordered; a stable order keeps the
                     // inspector from reshuffling itself on every refresh.
                     pairs.sort();
@@ -768,7 +777,11 @@ impl S3Client {
             .bucket(bucket)
             .key(key)
             // HTTP ranges are inclusive at both ends.
-            .range(format!("bytes={}-{}", range.start, range.end.saturating_sub(1)));
+            .range(format!(
+                "bytes={}-{}",
+                range.start,
+                range.end.saturating_sub(1)
+            ));
 
         if let Some(etag) = if_match {
             req = req.if_match(etag);
@@ -1158,7 +1171,7 @@ impl S3Client {
 
         // Newest first. S3 returns them in key order, and within a key roughly
         // newest-first, but sorting on the timestamp makes that a guarantee.
-        versions.sort_by(|a, b| b.modified_epoch.cmp(&a.modified_epoch));
+        versions.sort_by_key(|version| Reverse(version.modified_epoch));
         Ok(versions)
     }
 
@@ -1194,7 +1207,9 @@ impl S3Client {
             .version_id(version_id)
             .send()
             .await
-            .with_context(|| format!("Xoá version {version_id} của s3://{bucket}/{key} thất bại"))?;
+            .with_context(|| {
+                format!("Xoá version {version_id} của s3://{bucket}/{key} thất bại")
+            })?;
         Ok(())
     }
 
@@ -1213,9 +1228,7 @@ impl S3Client {
         // panel showed nothing at all.
         let owner = out
             .owner()
-            .and_then(|owner| {
-                non_empty(owner.display_name()).or_else(|| non_empty(owner.id()))
-            })
+            .and_then(|owner| non_empty(owner.display_name()).or_else(|| non_empty(owner.id())))
             .unwrap_or(UNKNOWN)
             .to_string();
 
@@ -1367,9 +1380,8 @@ impl S3Client {
                 if message.contains("RestoreAlreadyInProgress") {
                     Ok(())
                 } else {
-                    Err(error).with_context(|| {
-                        format!("RestoreObject failed for s3://{bucket}/{key}")
-                    })
+                    Err(error)
+                        .with_context(|| format!("RestoreObject failed for s3://{bucket}/{key}"))
                 }
             }
         }
@@ -1383,8 +1395,8 @@ impl S3Client {
     /// ceiling; this method clamps to it rather than handing back a URL that
     /// claims a week and dies in an hour.
     pub async fn presign_get(&self, bucket: &str, key: &str, expires: Duration) -> Result<String> {
-        let config = PresigningConfig::expires_in(expires)
-            .context("thời hạn presigned URL không hợp lệ")?;
+        let config =
+            PresigningConfig::expires_in(expires).context("thời hạn presigned URL không hợp lệ")?;
 
         let request = self
             .inner
@@ -1407,7 +1419,13 @@ impl S3Client {
     /// not stop a delete. The cost of guessing wrong here is a warning that is
     /// absent, never one that is falsely reassuring.
     pub async fn bucket_is_versioned(&self, bucket: &str) -> bool {
-        let Ok(out) = self.inner.get_bucket_versioning().bucket(bucket).send().await else {
+        let Ok(out) = self
+            .inner
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .await
+        else {
             return false;
         };
         out.status()
@@ -1432,8 +1450,16 @@ impl S3Client {
 
         if size > COPY_OBJECT_LIMIT {
             let part_size = copy_part_size_for(size);
-            self.copy_multipart(src_bucket, src_key, dst_bucket, dst_key, size, part_size, &head)
-                .await
+            self.copy_multipart(MultipartCopy {
+                src_bucket,
+                src_key,
+                dst_bucket,
+                dst_key,
+                size,
+                part_size,
+                head: &head,
+            })
+            .await
         } else {
             self.copy_single(src_bucket, src_key, dst_bucket, dst_key, &head)
                 .await
@@ -1463,7 +1489,9 @@ impl S3Client {
         }
 
         req.send().await.with_context(|| {
-            format!("CopyObject failed for s3://{src_bucket}/{src_key} → s3://{dst_bucket}/{dst_key}")
+            format!(
+                "CopyObject failed for s3://{src_bucket}/{src_key} → s3://{dst_bucket}/{dst_key}"
+            )
         })?;
         Ok(())
     }
@@ -1553,9 +1581,15 @@ impl S3Client {
     ) -> Result<()> {
         let head = self.head_object(src_bucket, src_key).await?;
         let size = head.size.max(0) as u64;
-        self.copy_multipart(
-            src_bucket, src_key, dst_bucket, dst_key, size, part_size, &head,
-        )
+        self.copy_multipart(MultipartCopy {
+            src_bucket,
+            src_key,
+            dst_bucket,
+            dst_key,
+            size,
+            part_size,
+            head: &head,
+        })
         .await
     }
 
@@ -1565,16 +1599,16 @@ impl S3Client {
     /// Parts run one at a time. Each is a server-side range copy rather than a
     /// transfer, so the wall-clock cost is the server's, and doing them serially
     /// keeps the abort-on-failure path simple.
-    async fn copy_multipart(
-        &self,
-        src_bucket: &str,
-        src_key: &str,
-        dst_bucket: &str,
-        dst_key: &str,
-        size: u64,
-        part_size: u64,
-        head: &ObjectHead,
-    ) -> Result<()> {
+    async fn copy_multipart(&self, request: MultipartCopy<'_>) -> Result<()> {
+        let MultipartCopy {
+            src_bucket,
+            src_key,
+            dst_bucket,
+            dst_key,
+            size,
+            part_size,
+            head,
+        } = request;
         let source = encode_copy_source(src_bucket, src_key);
 
         let mut create = self
@@ -1588,7 +1622,9 @@ impl S3Client {
         let upload_id = create
             .send()
             .await
-            .with_context(|| format!("CreateMultipartUpload failed for s3://{dst_bucket}/{dst_key}"))?
+            .with_context(|| {
+                format!("CreateMultipartUpload failed for s3://{dst_bucket}/{dst_key}")
+            })?
             .upload_id()
             .map(str::to_owned)
             .context("CreateMultipartUpload returned no upload id")?;
@@ -1795,7 +1831,11 @@ impl S3Client {
                 .await
                 .with_context(|| format!("ListObjectsV2 failed for s3://{bucket}/{prefix}"))?;
 
-            keys.extend(out.contents().iter().filter_map(|o| o.key().map(str::to_owned)));
+            keys.extend(
+                out.contents()
+                    .iter()
+                    .filter_map(|o| o.key().map(str::to_owned)),
+            );
 
             match out.next_continuation_token() {
                 Some(next) => token = Some(next.to_string()),
@@ -1851,7 +1891,9 @@ pub fn presign_limit_for(temporary_credentials: bool) -> Duration {
 /// Path-style for providers that need it, virtual-hosted otherwise, matching how
 /// the client itself addresses the bucket.
 pub fn public_url(profile: &Profile, bucket: &str, key: &str) -> String {
-    let encoded = encode_copy_source("", key).trim_start_matches('/').to_string();
+    let encoded = encode_copy_source("", key)
+        .trim_start_matches('/')
+        .to_string();
 
     match &profile.endpoint {
         Some(endpoint) => {
@@ -1897,8 +1939,7 @@ pub fn encode_crc32(value: u32) -> String {
     let value = value.to_be_bytes();
 
     // Four bytes is one full 3-byte group plus a 1-byte remainder.
-    let triple =
-        u32::from(value[0]) << 16 | u32::from(value[1]) << 8 | u32::from(value[2]);
+    let triple = u32::from(value[0]) << 16 | u32::from(value[1]) << 8 | u32::from(value[2]);
     let mut out = String::with_capacity(8);
     for shift in [18, 12, 6, 0] {
         out.push(B64[((triple >> shift) & 0x3f) as usize] as char);
@@ -2196,26 +2237,50 @@ mod tests {
         // Loopback is a development object store, and those speak plain HTTP.
         // Guessing https here would trade `dispatch failure` for a TLS
         // handshake against a server that never had a certificate.
-        assert_eq!(normalize_endpoint("127.0.0.1:9000"), "http://127.0.0.1:9000");
-        assert_eq!(normalize_endpoint("localhost:9000"), "http://localhost:9000");
+        assert_eq!(
+            normalize_endpoint("127.0.0.1:9000"),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            normalize_endpoint("localhost:9000"),
+            "http://localhost:9000"
+        );
         // The whole loopback block, not just .0.1.
         assert_eq!(normalize_endpoint("127.1.2.3"), "http://127.1.2.3");
         // RFC 6761 reserves *.localhost to resolve to loopback.
-        assert_eq!(normalize_endpoint("minio.localhost"), "http://minio.localhost");
+        assert_eq!(
+            normalize_endpoint("minio.localhost"),
+            "http://minio.localhost"
+        );
         // Bracketed IPv6: the colons inside must not read as a port.
         assert_eq!(normalize_endpoint("[::1]:9000"), "http://[::1]:9000");
         // And a host that merely starts with the digits is not loopback.
-        assert_eq!(normalize_endpoint("127x.example.com"), "https://127x.example.com");
+        assert_eq!(
+            normalize_endpoint("127x.example.com"),
+            "https://127x.example.com"
+        );
 
         // Anything that already has a scheme is left exactly as it was, even a
         // scheme this app cannot use — failing loudly on `ftp://` beats
         // silently rewriting what someone typed.
-        assert_eq!(normalize_endpoint("http://s3.example.com"), "http://s3.example.com");
-        assert_eq!(normalize_endpoint("https://s3.example.com"), "https://s3.example.com");
-        assert_eq!(normalize_endpoint("ftp://s3.example.com"), "ftp://s3.example.com");
+        assert_eq!(
+            normalize_endpoint("http://s3.example.com"),
+            "http://s3.example.com"
+        );
+        assert_eq!(
+            normalize_endpoint("https://s3.example.com"),
+            "https://s3.example.com"
+        );
+        assert_eq!(
+            normalize_endpoint("ftp://s3.example.com"),
+            "ftp://s3.example.com"
+        );
 
         // Whitespace from a paste.
-        assert_eq!(normalize_endpoint("  s3.example.com \n"), "https://s3.example.com");
+        assert_eq!(
+            normalize_endpoint("  s3.example.com \n"),
+            "https://s3.example.com"
+        );
 
         // Empty stays empty: `https://` alone is not a better answer than
         // nothing, and no endpoint is how a profile says "plain AWS".
@@ -2294,13 +2359,21 @@ mod tests {
 
         // A custom endpoint that does virtual-hosted addressing.
         assert_eq!(
-            public_url(&profile_for(Some("https://s3.example.com"), false), "b", "k.txt"),
+            public_url(
+                &profile_for(Some("https://s3.example.com"), false),
+                "b",
+                "k.txt"
+            ),
             "https://b.s3.example.com/k.txt"
         );
 
         // A key needing encoding must not produce a URL that points elsewhere.
         assert_eq!(
-            public_url(&profile_for(Some("http://h:9000"), true), "b", "a file?.txt"),
+            public_url(
+                &profile_for(Some("http://h:9000"), true),
+                "b",
+                "a file?.txt"
+            ),
             "http://h:9000/b/a%20file%3F.txt"
         );
 
@@ -2488,9 +2561,15 @@ mod content_type_tests {
         // on this header alone.
         assert_eq!(content_type_for("a.jpg").as_deref(), Some("image/jpeg"));
         assert_eq!(content_type_for("a.png").as_deref(), Some("image/png"));
-        assert_eq!(content_type_for("a.pdf").as_deref(), Some("application/pdf"));
+        assert_eq!(
+            content_type_for("a.pdf").as_deref(),
+            Some("application/pdf")
+        );
         assert_eq!(content_type_for("index.html").as_deref(), Some("text/html"));
-        assert_eq!(content_type_for("a.json").as_deref(), Some("application/json"));
+        assert_eq!(
+            content_type_for("a.json").as_deref(),
+            Some("application/json")
+        );
         assert_eq!(content_type_for("a.csv").as_deref(), Some("text/csv"));
     }
 
@@ -2513,7 +2592,10 @@ mod content_type_tests {
     fn an_uppercase_extension_is_the_same_extension() {
         // Cameras and Windows both produce these, and a `.JPG` stored as
         // octet-stream is exactly the bug this function exists to stop.
-        assert_eq!(content_type_for("IMG_0001.JPG").as_deref(), Some("image/jpeg"));
+        assert_eq!(
+            content_type_for("IMG_0001.JPG").as_deref(),
+            Some("image/jpeg")
+        );
     }
 
     #[test]

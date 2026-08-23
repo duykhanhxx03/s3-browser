@@ -1,33 +1,35 @@
 //! The browser window: profiles and buckets on the left, one prefix listed on
 //! the right, with sorting, filtering, paging and folder operations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use gpui::{
-    div, prelude::*, px, uniform_list, App, ClickEvent, Context, Entity, ExternalPaths,
-    FocusHandle, KeyDownEvent, Modifiers, SharedString, Subscription, Task,
-    UniformListScrollHandle, Window,
-};
 use gpui::Focusable as _;
+use gpui::{
+    div, ease_out_quint, point, prelude::*, px, uniform_list, App, ClickEvent, Context, Entity,
+    ExternalPaths, FocusHandle, KeyDownEvent, Modifiers, ObjectFit, Pixels, Point, SharedString,
+    Subscription, Task, Transition, TransitionExt, UniformListScrollHandle, Window,
+};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::ContextMenuExt;
+use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tooltip::Tooltip;
 use gpui_tokio::Tokio;
 use s3core::{
-    format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectHead,
     capability::{Capabilities, CapabilityCache, Support},
-    ObjectAcl, ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
+    format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectAcl, ObjectHead,
+    ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
 
 use crate::failure::{Failure, Fix};
-use crate::settings::{Settings, SettingsStore, ThemeChoice};
 use crate::platform::{self, Chrome};
+use crate::settings::{MotionChoice, Settings, SettingsStore, ThemeChoice};
 use crate::theme::Theme;
 
 /// Diagnostic logging, enabled with `S3BROWSER_DEBUG=1`. Kept out of the normal
@@ -41,7 +43,73 @@ macro_rules! debug_log {
     };
 }
 
+static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
+
+fn motion_choice_reduces(choice: MotionChoice) -> bool {
+    match choice {
+        MotionChoice::System => platform::reduce_motion(),
+        MotionChoice::Full => false,
+        MotionChoice::Reduced => true,
+    }
+}
+
+fn set_reduce_motion(reduce: bool) {
+    REDUCE_MOTION.store(reduce, Ordering::Relaxed);
+}
+
+fn reduce_motion() -> bool {
+    REDUCE_MOTION.load(Ordering::Relaxed)
+}
+
+fn smooth_transition(duration_ms: u64) -> Transition {
+    let duration_ms = if reduce_motion() { 1 } else { duration_ms };
+    Transition::new(Duration::from_millis(duration_ms)).with_easing(ease_out_quint())
+}
+
+fn delayed_transition(duration_ms: u64, delay_ms: u64) -> Transition {
+    let delay_ms = if reduce_motion() { 0 } else { delay_ms };
+    smooth_transition(duration_ms).with_delay(Duration::from_millis(delay_ms))
+}
+
+fn motion_offset(x: f32, y: f32) -> Point<Pixels> {
+    if reduce_motion() {
+        point(px(0.0), px(0.0))
+    } else {
+        point(px(x), px(y))
+    }
+}
+
+fn row_stagger_from_end(position: usize, end: usize) -> u64 {
+    if reduce_motion() {
+        0
+    } else {
+        stagger_from_end(position, end, 11)
+    }
+}
+
+fn grid_stagger_from_end(position: usize, visible_end: usize) -> u64 {
+    if reduce_motion() {
+        0
+    } else {
+        stagger_from_end(position, visible_end, 17)
+    }
+}
+
+fn stagger_from_end(position: usize, end: usize, cap: usize) -> u64 {
+    let cells_from_end = end.saturating_sub(position + 1).min(cap);
+    (cells_from_end as u64) * MOTION_STAGGER_MS
+}
+
+fn animation_key_hash(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 const ROW_HEIGHT: f32 = 28.;
+const GRID_COLUMNS: usize = 5;
+const GRID_ROW_HEIGHT: f32 = 212.;
+const GRID_MEDIA_HEIGHT: f32 = 112.;
 /// One scale for every bar and panel, so nothing is a few pixels off its
 /// neighbour for no reason. Before this there were six different bar heights
 /// and three widths for what is visually the same dialog.
@@ -57,15 +125,20 @@ const JOB_ROW_HEIGHT: f32 = 38.;
 /// The drawer and the orphan list.
 const PANEL_HEIGHT: f32 = 200.;
 const DIALOG_WIDTH: f32 = 460.;
+/// Error details are long SDK strings, not prompts. Give them room so the
+/// useful part is not split into two-word shards.
+const FAILURE_DIALOG_WIDTH: f32 = 640.;
 /// The profile dialog is wider: an endpoint URL and a 64-character secret both
 /// need room, and eliding either of them in the field where it is being typed
 /// is the one place eliding is unacceptable.
 const PROFILE_DIALOG_WIDTH: f32 = 560.;
 /// The preview overlay. Wide, because the point of taking it out of the 320px
 /// inspector was to be able to see the thing.
-const PREVIEW_WIDTH: f32 = 760.;
+const PREVIEW_WIDTH: f32 = 980.;
 const PREVIEW_HEIGHT: f32 = 560.;
-const EDITOR_HEIGHT: f32 = 380.;
+const PREVIEW_TITLE_HEIGHT: f32 = CONTROL_BAR_HEIGHT;
+const PREVIEW_SIDE_WIDTH: f32 = 276.;
+const PREVIEW_BODY_HEIGHT: f32 = PREVIEW_HEIGHT - PREVIEW_TITLE_HEIGHT;
 /// Right-hand inspector.
 const INSPECTOR_WIDTH: f32 = 320.;
 /// Tall enough for every command without scrolling; it scrolls anyway once a
@@ -78,6 +151,22 @@ const PALETTE_WIDTH: f32 = 540.;
 /// grid; cramped rows read as a debug menu.
 const PALETTE_ROW_HEIGHT: f32 = 38.;
 const PROGRESS_HEIGHT: f32 = 4.;
+/// Queue progress is the one motion that should feel alive. 125ms is frequent
+/// enough to avoid chunky bars without repainting the whole app every frame.
+const TRANSFER_TICK_MS: u64 = 125;
+/// Short affordance fades: loading labels, empty states, and small state swaps.
+const MOTION_QUICK_MS: u64 = 160;
+/// Larger overlays need a hair more time so they arrive without popping.
+const MOTION_MODAL_MS: u64 = 180;
+/// Side panels are spatial changes; keep them calm and a little slower.
+const MOTION_PANEL_MS: u64 = 220;
+/// Full-pane swaps should be quieter than dialogs: just enough to avoid a hard
+/// cut when moving between Objects, Buckets, and Recent.
+const MOTION_PAGE_MS: u64 = 140;
+/// Row-level motion needs to be barely there: enough to prevent hard pops, not
+/// enough to make a data grid feel theatrical.
+const MOTION_ROW_MS: u64 = 120;
+const MOTION_STAGGER_MS: u64 = 8;
 /// Every button is this tall. Sizing to content let a long label grow taller
 /// than the bar holding it, so buttons in the same row did not match.
 const BUTTON_HEIGHT: f32 = 22.;
@@ -93,8 +182,8 @@ const CHECK_WIDTH: f32 = 22.;
 /// How long a bucket list stays good for. Buckets are created rarely and the
 /// list costs a request every time a profile is opened.
 const BUCKET_CACHE_TTL: i64 = 30 * 60;
-/// Three small icon buttons.
-const ACTIONS_WIDTH: f32 = 72.;
+/// Enough room for six small icon buttons without eating the name column.
+const ACTIONS_WIDTH: f32 = 146.;
 /// Fixed, so tabs do not resize under the pointer as their titles change.
 const TAB_WIDTH: f32 = 132.;
 /// How many trailing prefix levels the breadcrumb draws before it collapses the
@@ -112,10 +201,7 @@ const BUCKET_CREATED_WIDTH: f32 = 130.;
 /// How many failures to keep. A retry loop against a dead endpoint would grow
 /// the log without bound otherwise, and nobody reads the fiftieth copy.
 const FAILURE_LIMIT: usize = 50;
-/// How much of one provider error the log shows before clipping. Enough for the
-/// sentence that says what happened, not so much that one failure fills the
-/// panel and hides the four behind it.
-const DETAIL_HEIGHT: f32 = 108.;
+const FAILURE_DETAIL_HEIGHT: f32 = 92.;
 /// The filter field. Wide enough for a real file name, narrow enough that the
 /// breadcrumb keeps most of the bar.
 const FILTER_WIDTH: f32 = 196.;
@@ -131,6 +217,9 @@ const FIELD_HEIGHT: f32 = 26.;
 const BUCKET_FILTER_MIN: usize = 10;
 /// Start fetching the next page once the viewport comes this close to the end.
 const PREFETCH_MARGIN: usize = 40;
+/// Thumbnails arrive in small waves. Fetching every visible image in one task
+/// makes the list sit still and then repaint a wall of rows at once.
+const THUMBNAIL_BATCH: usize = 6;
 
 gpui::actions!(
     s3browser,
@@ -173,6 +262,7 @@ gpui::actions!(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormKind {
     NewProfile,
+    EditProfile(usize),
     NewFolder,
     NewBucket,
     /// Carries the key, so a rename still targets the right object if the
@@ -195,6 +285,7 @@ impl FormKind {
     fn title(&self) -> String {
         match self {
             FormKind::NewProfile => "Profile mới",
+            FormKind::EditProfile(_) => "Sửa profile",
             FormKind::NewFolder => "Thư mục mới",
             FormKind::NewBucket => "Bucket mới",
             FormKind::Rename(_) => "Đổi tên",
@@ -217,18 +308,27 @@ impl FormKind {
     /// dialog, which is most of them.
     fn fields(&self) -> Vec<(&'static str, &'static str, bool)> {
         match self {
-            FormKind::NewProfile => vec![
+            FormKind::NewProfile | FormKind::EditProfile(_) => vec![
                 ("Tên", "R2 của tôi", false),
                 ("Endpoint", "để trống nếu là AWS", false),
                 ("Region", "us-east-1", false),
+                ("Bucket thử", "nếu token không list bucket", false),
                 ("Access key", "", false),
-                ("Secret key", "", true),
+                (
+                    "Secret key",
+                    if matches!(self, FormKind::EditProfile(_)) {
+                        "giữ nguyên nếu để trống"
+                    } else {
+                        ""
+                    },
+                    true,
+                ),
             ],
             FormKind::NewFolder => vec![("Tên", "", false)],
             FormKind::NewBucket => vec![("Tên", "", false)],
             FormKind::Rename(_) => vec![("Tên mới", "", false)],
             FormKind::Duplicate(_) => vec![("Tên bản sao", "", false)],
-            FormKind::OpenBucket => vec![("Bucket", "", false)],
+            FormKind::OpenBucket => vec![("Bucket", "bucket hoặc s3://bucket/prefix/", false)],
             FormKind::EditHeaders(_) => vec![
                 ("Content-Type", "image/png", false),
                 ("Cache-Control", "public, max-age=3600", false),
@@ -247,7 +347,6 @@ impl FormKind {
         }
     }
 }
-
 
 /// A destructive action waiting for the user to say yes. Holding the entries
 /// rather than re-reading the selection means the dialog acts on exactly what
@@ -401,8 +500,20 @@ pub enum Probe {
     Running,
     /// Reached the endpoint and the signature was accepted.
     Ok(SharedString),
+    /// The key signed a real response, but a capability is missing.
+    Warning(SharedString),
     /// Did not. The message is already classified.
     Failed(SharedString),
+}
+
+enum ProfileProbe {
+    Buckets(usize),
+    Bucket {
+        bucket: String,
+        prefix: String,
+        entries: usize,
+    },
+    ListBucketsDenied(String),
 }
 
 impl Form {
@@ -505,7 +616,15 @@ pub struct TabState {
     cursor: Option<String>,
     anchor: Option<String>,
     scroll: UniformListScrollHandle,
+    layout: LayoutMode,
     search: Option<Search>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LayoutMode {
+    #[default]
+    List,
+    Grid,
 }
 
 impl Tab {
@@ -606,6 +725,108 @@ pub struct Clipboard {
     cut: bool,
 }
 
+#[derive(Debug)]
+struct PerfStats {
+    enabled: bool,
+    renders: u64,
+    last_render_at: Option<Instant>,
+    frame_ms: u128,
+    max_frame_ms: u128,
+    visible: Option<(usize, usize)>,
+    listing_ms: Option<u128>,
+    listing_rows: usize,
+    page_ms: Option<u128>,
+    page_rows: usize,
+    thumbnail_ms: Option<u128>,
+    thumbnail_rows: usize,
+}
+
+impl Default for PerfStats {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var_os("S3BROWSER_DEBUG").is_some(),
+            renders: 0,
+            last_render_at: None,
+            frame_ms: 0,
+            max_frame_ms: 0,
+            visible: None,
+            listing_ms: None,
+            listing_rows: 0,
+            page_ms: None,
+            page_rows: 0,
+            thumbnail_ms: None,
+            thumbnail_rows: 0,
+        }
+    }
+}
+
+impl PerfStats {
+    fn note_render(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(previous) = self.last_render_at.replace(now) {
+            self.frame_ms = now.duration_since(previous).as_millis();
+            self.max_frame_ms = self.max_frame_ms.max(self.frame_ms);
+        }
+        self.renders += 1;
+    }
+
+    fn note_visible(&mut self, range: &Range<usize>) {
+        if self.enabled {
+            self.visible = Some((range.start, range.end));
+        }
+    }
+
+    fn note_listing(&mut self, elapsed: Duration, rows: usize) {
+        if self.enabled {
+            self.listing_ms = Some(elapsed.as_millis());
+            self.listing_rows = rows;
+        }
+    }
+
+    fn note_page(&mut self, elapsed: Duration, rows: usize) {
+        if self.enabled {
+            self.page_ms = Some(elapsed.as_millis());
+            self.page_rows = rows;
+        }
+    }
+
+    fn note_thumbnails(&mut self, elapsed: Duration, rows: usize) {
+        if self.enabled {
+            self.thumbnail_ms = Some(elapsed.as_millis());
+            self.thumbnail_rows = rows;
+        }
+    }
+
+    fn label(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let visible = self
+            .visible
+            .map(|(start, end)| format!("{start}..{end}"))
+            .unwrap_or_else(|| "-".into());
+        let listing = self
+            .listing_ms
+            .map(|ms| format!("{ms}ms/{}", self.listing_rows))
+            .unwrap_or_else(|| "-".into());
+        let page = self
+            .page_ms
+            .map(|ms| format!("{ms}ms/{}", self.page_rows))
+            .unwrap_or_else(|| "-".into());
+        let thumbnails = self
+            .thumbnail_ms
+            .map(|ms| format!("{ms}ms/{}", self.thumbnail_rows))
+            .unwrap_or_else(|| "-".into());
+        Some(format!(
+            "ui {}ms max {}ms · rows {visible} · list {listing} · page {page} · thumb {thumbnails}",
+            self.frame_ms, self.max_frame_ms
+        ))
+    }
+}
+
 pub struct Browser {
     focus: FocusHandle,
     theme: Theme,
@@ -703,8 +924,16 @@ pub struct Browser {
     /// silently slides onto a different file when the filter changes is worse
     /// than no cursor at all.
     cursor: Option<String>,
+    /// The row currently under the pointer. Inline row actions are hidden until
+    /// they are useful; keeping the hover here lets them reveal with the same
+    /// motion language as the rest of the app instead of popping in as a style
+    /// override.
+    hovered_row: Option<usize>,
     /// Where a Shift-range started. A key too, and for the same reason.
     anchor: Option<String>,
+    /// Object pane presentation: dense list for operations, grid for scanning
+    /// folders and image-heavy prefixes.
+    layout: LayoutMode,
 
     scroll: UniformListScrollHandle,
     status: SharedString,
@@ -718,6 +947,7 @@ pub struct Browser {
     failures: Vec<Failure>,
     /// Whether the failure log is open.
     failures_open: bool,
+    perf: PerfStats,
 
     transfers: TransferEngine,
     drawer_open: bool,
@@ -727,7 +957,6 @@ pub struct Browser {
     /// from a snapshot every frame: state stored beside a job would be thrown
     /// away and the folder would snap shut while it was being read.
     expanded_folders: HashSet<String>,
-
 
     confirm: Option<Confirm>,
     /// An SSO sign-in in progress, and the roles it turned up once done.
@@ -775,6 +1004,7 @@ pub struct Browser {
     /// The share panel: which key it is for, and the URL once it exists.
     share: Option<Share>,
     inspector: Option<Inspection>,
+    acl_popup_open: bool,
     /// Whether the open bucket keeps versions, so a delete confirmation can say
     /// whether it removes data or only hides it. Refreshed when the bucket
     /// changes, not on every navigation within one.
@@ -846,9 +1076,8 @@ impl Browser {
             });
         });
 
-        let path_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("s3://bucket/prefix/")
-        });
+        let path_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("s3://bucket/prefix/"));
         let path_events = cx.subscribe_in(
             &path_input,
             window,
@@ -894,8 +1123,7 @@ impl Browser {
             },
         );
 
-        let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
+        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
         // Live rather than on Enter: the list is right there, and making someone
         // commit a filter to find out whether it matched anything is a round
         // trip through their own attention for no reason.
@@ -939,11 +1167,14 @@ impl Browser {
 
         let store = ProfileStore::default_location().ok();
         let place_store = store.as_ref().map(|store| PlaceStore::beside(store.path()));
-        let settings_store = store.as_ref().map(|store| SettingsStore::beside(store.path()));
+        let settings_store = store
+            .as_ref()
+            .map(|store| SettingsStore::beside(store.path()));
         let settings = settings_store
             .as_ref()
             .map(|store| store.load())
             .unwrap_or_default();
+        set_reduce_motion(motion_choice_reduces(settings.motion));
         let places = place_store
             .as_ref()
             .map(|store| store.load())
@@ -1011,11 +1242,14 @@ impl Browser {
             filter_input: Some(filter_input),
             selection: HashSet::new(),
             cursor: None,
+            hovered_row: None,
             anchor: None,
+            layout: LayoutMode::List,
             scroll: UniformListScrollHandle::new(),
             status: "Chọn một profile để bắt đầu".into(),
             failures: Vec::new(),
             failures_open: false,
+            perf: PerfStats::default(),
             transfers,
             drawer_open: false,
             expanded_folders: HashSet::new(),
@@ -1045,6 +1279,7 @@ impl Browser {
             palette_scroll: UniformListScrollHandle::new(),
             share: None,
             inspector: None,
+            acl_popup_open: false,
             bucket_versioned: false,
             capabilities: None,
             caps_cache: CapabilityCache::default(),
@@ -1103,6 +1338,42 @@ impl Browser {
         self.connect(self.profiles.len() - 1, cx);
     }
 
+    fn update_profile(
+        &mut self,
+        index: usize,
+        profile: StoredProfile,
+        secret: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.profiles.len() {
+            self.report("Profile không còn tồn tại".into());
+            return;
+        }
+        if let Some(secret) = secret.as_deref() {
+            if let Err(error) = vault::set_secret_key(&profile.id, secret) {
+                self.fail(Failure::known(
+                    "Không lưu được khoá bí mật vào chuỗi khoá",
+                    format!("{error}"),
+                    None,
+                ));
+                return;
+            }
+        }
+
+        let active = self.active_profile == Some(index);
+        let profile_id = profile.id.clone();
+        self.profiles[index] = profile;
+        self.bucket_cache.remove(&profile_id);
+        self.save_profiles();
+
+        if active {
+            self.connect(index, cx);
+        } else {
+            self.status = "Đã lưu profile".into();
+            cx.notify();
+        }
+    }
+
     fn add_minio_dev_profile(&mut self, cx: &mut Context<Self>) {
         let id = vault::new_profile_id("MinIO local", &self.profiles);
         let profile = StoredProfile {
@@ -1140,7 +1411,9 @@ impl Browser {
         let cached = self
             .bucket_cache
             .get(&stored.id)
-            .filter(|(_, at)| !self.bucket_cache_bypass && s3core::now_epoch() - at < BUCKET_CACHE_TTL)
+            .filter(|(_, at)| {
+                !self.bucket_cache_bypass && s3core::now_epoch() - at < BUCKET_CACHE_TTL
+            })
             .map(|(buckets, _)| buckets.clone());
         self.bucket_cache_bypass = false;
 
@@ -1201,7 +1474,7 @@ impl Browser {
                 this.connecting = false;
                 match outcome {
                     Ok(Ok((client, listed))) => {
-                        let buckets = match listed {
+                        let listed = match listed {
                             Ok(buckets) => {
                                 this.status = SharedString::default();
                                 this.bucket_cache.insert(
@@ -1209,9 +1482,7 @@ impl Browser {
                                     (
                                         buckets
                                             .iter()
-                                            .map(|bucket| {
-                                                SharedString::from(bucket.name.clone())
-                                            })
+                                            .map(|bucket| SharedString::from(bucket.name.clone()))
                                             .collect(),
                                         // Not refreshed on a cache hit: the age
                                         // shown has to be the age of the answer,
@@ -1223,7 +1494,7 @@ impl Browser {
                                             .unwrap_or_else(s3core::now_epoch),
                                     ),
                                 );
-                                buckets
+                                Some(buckets)
                             }
                             Err(error) => {
                                 debug_log!("ListBuckets failed: {error}");
@@ -1242,15 +1513,20 @@ impl Browser {
                                     Failure::new(format!("ListBuckets: {error:?}"))
                                         .or_fix(Fix::OpenBucketByName),
                                 );
-                                Vec::new()
+                                None
                             }
                         };
-                        debug_log!("connected: {} buckets", buckets.len());
-                        this.remember_bucket_dates(&buckets);
-                        this.buckets = buckets
-                            .into_iter()
-                            .map(|bucket| SharedString::from(bucket.name))
-                            .collect();
+                        if let Some(buckets) = listed {
+                            debug_log!("connected: {} buckets", buckets.len());
+                            this.remember_bucket_dates(&buckets);
+                            this.buckets = buckets
+                                .into_iter()
+                                .map(|bucket| SharedString::from(bucket.name))
+                                .collect();
+                        } else {
+                            debug_log!("connected: bucket list unavailable");
+                            this.status = "Nhập bucket bạn có quyền để mở trực tiếp".into();
+                        }
                         this.client = Some(client);
                         // `--open bucket/prefix/` jumps straight to a location,
                         // which keeps deep prefixes reachable from a script.
@@ -1304,8 +1580,13 @@ impl Browser {
         match fix {
             Fix::OpenBucketByName => self.open_form(FormKind::OpenBucket, window, cx),
             Fix::EditProfile => {
-                self.profiles_open = true;
-                cx.notify();
+                if let Some(index) = self.active_profile {
+                    self.profiles_open = false;
+                    self.open_form(FormKind::EditProfile(index), window, cx);
+                } else {
+                    self.profiles_open = true;
+                    cx.notify();
+                }
             }
             Fix::Retry => match (self.bucket.clone(), self.prefix.clone()) {
                 (Some(bucket), prefix) => self.open(bucket, prefix, cx),
@@ -1359,9 +1640,11 @@ impl Browser {
         self.loading = true;
         self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
 
-        let listing = Tokio::spawn(cx, async move {
-            client.list_page(&bucket, &prefix, None).await
-        });
+        let started = Instant::now();
+        let listing = Tokio::spawn(
+            cx,
+            async move { client.list_page(&bucket, &prefix, None).await },
+        );
 
         let task = cx.spawn(async move |this, cx| {
             let outcome = listing.await;
@@ -1373,9 +1656,12 @@ impl Browser {
                 this.loading = false;
                 match outcome {
                     Ok(Ok(page)) => {
+                        this.perf
+                            .note_listing(started.elapsed(), page.entries.len());
                         debug_log!(
-                            "listed {} entries, more={}",
+                            "listed {} entries in {}ms, more={}",
                             page.entries.len(),
+                            started.elapsed().as_millis(),
                             page.continuation.is_some()
                         );
                         this.entries = page.entries;
@@ -1414,6 +1700,7 @@ impl Browser {
         let generation = self.generation;
         let prefix = self.prefix.clone();
 
+        let started = Instant::now();
         let listing = Tokio::spawn(cx, async move {
             client.list_page(&bucket, &prefix, Some(token)).await
         });
@@ -1437,7 +1724,12 @@ impl Browser {
                 this.loading_more = false;
                 match outcome {
                     Ok(Ok(page)) => {
-                        debug_log!("page +{} entries", page.entries.len());
+                        this.perf.note_page(started.elapsed(), page.entries.len());
+                        debug_log!(
+                            "page +{} entries in {}ms",
+                            page.entries.len(),
+                            started.elapsed().as_millis()
+                        );
                         this.entries.extend(page.entries);
                         this.continuation = page.continuation;
                         this.resort_and_filter();
@@ -1518,6 +1810,7 @@ impl Browser {
             cursor: self.cursor.take(),
             anchor: self.anchor.take(),
             scroll: self.scroll.clone(),
+            layout: self.layout,
             search: self.search.take(),
         }
     }
@@ -1536,6 +1829,7 @@ impl Browser {
         self.cursor = state.cursor;
         self.anchor = state.anchor;
         self.scroll = state.scroll;
+        self.layout = state.layout;
         self.search = state.search;
     }
 
@@ -1622,6 +1916,7 @@ impl Browser {
                     bucket,
                     prefix,
                     sort: self.sort,
+                    layout: self.layout,
                     ..Default::default()
                 },
             },
@@ -1711,6 +2006,19 @@ impl Browser {
             .collect()
     }
 
+    fn inspection_key_for_selection(&self) -> Option<String> {
+        self.cursor
+            .as_ref()
+            .filter(|key| self.selection.contains(*key))
+            .and_then(|key| {
+                self.entries
+                    .iter()
+                    .find(|entry| entry.key == *key && !entry.is_folder)
+                    .map(|entry| entry.key.clone())
+            })
+            .or_else(|| self.selected_object_keys().first().cloned())
+    }
+
     /// Starts an operation over `keys`.
     fn start_bulk(
         &mut self,
@@ -1721,6 +2029,13 @@ impl Browser {
     ) {
         if keys.is_empty() || self.client.is_none() || self.bucket.is_none() {
             return;
+        }
+        if matches!(&op, BulkOp::Acl(_)) {
+            if let Some(failure) = self.acl_unavailable_failure() {
+                self.fail(failure);
+                cx.notify();
+                return;
+            }
         }
         self.bulk = Some(Bulk {
             what,
@@ -1737,11 +2052,9 @@ impl Browser {
 
     /// Does one key, then queues the next.
     fn bulk_step(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket), Some(bulk)) = (
-            self.client.clone(),
-            self.bucket.clone(),
-            self.bulk.as_ref(),
-        ) else {
+        let (Some(client), Some(bucket), Some(bulk)) =
+            (self.client.clone(), self.bucket.clone(), self.bulk.as_ref())
+        else {
             return;
         };
         if !bulk.running {
@@ -1753,6 +2066,7 @@ impl Browser {
         };
 
         let op = bulk.op.clone();
+        let op_is_acl = matches!(op, BulkOp::Acl(_));
         let running = Tokio::spawn(cx, async move {
             match op {
                 BulkOp::Headers(headers) => {
@@ -1765,15 +2079,27 @@ impl Browser {
         self.bulk_task = Some(cx.spawn(async move |this, cx| {
             let outcome = running.await;
             _ = this.update(cx, |this, cx| {
-                let Some(bulk) = this.bulk.as_mut() else {
-                    return;
-                };
-                let key = bulk.keys[bulk.done].clone();
-                bulk.done += 1;
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => bulk.failed.push(format!("{key}: {error}")),
-                    Err(error) => bulk.failed.push(format!("{key}: task lỗi: {error}")),
+                let mut acl_not_supported = false;
+                {
+                    let Some(bulk) = this.bulk.as_mut() else {
+                        return;
+                    };
+                    let key = bulk.keys[bulk.done].clone();
+                    bulk.done += 1;
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            let detail = format!("{error:?}");
+                            if op_is_acl && detail.contains("AccessControlListNotSupported") {
+                                acl_not_supported = true;
+                            }
+                            bulk.failed.push(format!("{key}: {detail}"));
+                        }
+                        Err(error) => bulk.failed.push(format!("{key}: task lỗi: {error}")),
+                    }
+                }
+                if acl_not_supported {
+                    this.mark_acl_unsupported();
                 }
                 this.status = this.bulk_summary();
                 this.bulk_step(cx);
@@ -1823,13 +2149,7 @@ impl Browser {
 
     fn bulk_summary(&self) -> SharedString {
         match self.bulk.as_ref() {
-            Some(bulk) => format!(
-                "{} {}/{}…",
-                bulk.what,
-                bulk.done,
-                bulk.keys.len()
-            )
-            .into(),
+            Some(bulk) => format!("{} {}/{}…", bulk.what, bulk.done, bulk.keys.len()).into(),
             None => self.search_summary(),
         }
     }
@@ -2068,6 +2388,7 @@ impl Browser {
             position,
             scroll_edge(previous.is_none_or(|old| position >= old)),
         );
+        self.sync_inspector_to_selection(cx);
         cx.notify();
     }
 
@@ -2247,7 +2568,9 @@ impl Browser {
         change(&mut self.settings);
 
         self.theme = theme_for(self.settings.theme, self.appearance, self.chrome);
-        self.transfers.set_bandwidth_limit(self.settings.bandwidth_limit);
+        set_reduce_motion(motion_choice_reduces(self.settings.motion));
+        self.transfers
+            .set_bandwidth_limit(self.settings.bandwidth_limit);
 
         if let Some(store) = self.settings_store.as_ref() {
             if let Err(error) = store.save(&self.settings) {
@@ -2343,6 +2666,31 @@ impl Browser {
         // left staring at the history page reads as a click that did nothing.
         self.screen = Screen::Objects;
         self.open(place.bucket.clone().into(), place.prefix.clone(), cx);
+    }
+
+    fn known_bucket_shortcuts(&self) -> Vec<SharedString> {
+        let mut seen = HashSet::new();
+        let mut buckets = Vec::new();
+        let mut push = |bucket: String| {
+            if seen.insert(bucket.clone()) {
+                buckets.push(SharedString::from(bucket));
+            }
+        };
+
+        for bucket in &self.buckets {
+            push(bucket.to_string());
+        }
+        if let Some(profile) = self.places_profile() {
+            for place in self.places.for_profile(profile) {
+                push(place.bucket.clone());
+            }
+            for place in self.places.recent_for_profile(profile) {
+                push(place.bucket.clone());
+            }
+        }
+
+        buckets.truncate(6);
+        buckets
     }
 
     /// Why the sidebar's rows and the pages behind them cannot be used.
@@ -2468,9 +2816,8 @@ impl Browser {
         // meant the last page set the flag and nothing ever swapped the buffer
         // in: the rows never updated and the status line said "loading" for
         // ever.
-        let finished = !completing.running
-            || completing.truncated
-            || completing.continuation.is_none();
+        let finished =
+            !completing.running || completing.truncated || completing.continuation.is_none();
         if finished {
             return self.finish_completing(cx);
         }
@@ -2682,6 +3029,31 @@ impl Browser {
             .unwrap_or(true)
     }
 
+    fn acl_support(&self) -> Option<Support> {
+        self.capabilities.as_ref().map(|caps| caps.acl)
+    }
+
+    fn acl_unavailable_failure(&self) -> Option<Failure> {
+        let (summary, detail) = acl_unavailable_copy(self.acl_support())?;
+        Some(Failure::known(summary, detail, None))
+    }
+
+    fn mark_acl_unsupported(&mut self) {
+        let Some(bucket) = self.bucket.clone() else {
+            return;
+        };
+        let mut capabilities = self.capabilities.unwrap_or(Capabilities {
+            versioning: Support::Yes,
+            tagging: Support::Yes,
+            lifecycle: Support::Yes,
+            object_lock: Support::Yes,
+            acl: Support::No,
+        });
+        capabilities.acl = Support::No;
+        self.capabilities = Some(capabilities);
+        self.caps_cache.insert(&bucket, capabilities);
+    }
+
     /// Asks before deleting. Everything here is irreversible in a way the user
     /// cannot undo from the app, so the count and the consequence are spelled
     /// out rather than left to a generic "are you sure".
@@ -2725,9 +3097,10 @@ impl Browser {
         self.status = "Đang bắt đầu đăng nhập SSO…".into();
         let region_for_flow = region.clone();
 
-        let beginning = Tokio::spawn(cx, async move {
-            s3core::sso::begin(&start_url, &region).await
-        });
+        let beginning = Tokio::spawn(
+            cx,
+            async move { s3core::sso::begin(&start_url, &region).await },
+        );
 
         self.op_task = Some(cx.spawn(async move |this, cx| {
             let outcome = beginning.await;
@@ -2764,11 +3137,16 @@ impl Browser {
                 cx.notify();
             });
 
-            this.update(cx, |this, cx| this.poll_sso(authorization, cx)).ok();
+            this.update(cx, |this, cx| this.poll_sso(authorization, cx))
+                .ok();
         }));
     }
 
-    fn poll_sso(&mut self, authorization: s3core::sso::DeviceAuthorization, cx: &mut Context<Self>) {
+    fn poll_sso(
+        &mut self,
+        authorization: s3core::sso::DeviceAuthorization,
+        cx: &mut Context<Self>,
+    ) {
         let Some(flow) = self.sso.as_ref() else {
             return;
         };
@@ -2940,7 +3318,11 @@ impl Browser {
     }
 
     fn open_form(&mut self, kind: FormKind, window: &mut Window, cx: &mut Context<Self>) {
-        let is_profile = kind == FormKind::NewProfile;
+        let editing_profile = match kind {
+            FormKind::EditProfile(index) => self.profiles.get(index).cloned(),
+            _ => None,
+        };
+        let is_profile = matches!(kind, FormKind::NewProfile | FormKind::EditProfile(_));
         let mut form = Form::new(kind, window, cx);
 
         if is_profile {
@@ -2963,11 +3345,7 @@ impl Browser {
             form._provider_events = Some(cx.subscribe_in(
                 &select,
                 window,
-                |this: &mut Self,
-                 _state,
-                 event: &SelectEvent<Vec<&'static str>>,
-                 window,
-                 cx| {
+                |this: &mut Self, _state, event: &SelectEvent<Vec<&'static str>>, window, cx| {
                     let SelectEvent::Confirm(Some(label)) = event else {
                         return;
                     };
@@ -2977,6 +3355,13 @@ impl Browser {
                 },
             ));
             form.provider_select = Some(select);
+        }
+
+        if let Some(profile) = editing_profile {
+            form.set_owned("Tên", profile.name, window, cx);
+            form.set_owned("Endpoint", profile.endpoint.unwrap_or_default(), window, cx);
+            form.set_owned("Region", profile.region, window, cx);
+            form.set_owned("Access key", profile.access_key, window, cx);
         }
 
         // Focus the first field. Nothing did this before, so every dialog
@@ -3004,7 +3389,10 @@ impl Browser {
         // button never silently does nothing.
         // `EditHeaders` is exempt: clearing a header *is* the edit, not a
         // half-filled form. So is the profile dialog, which validates per field.
-        let optional = matches!(kind, FormKind::NewProfile | FormKind::EditHeaders(_));
+        let optional = matches!(
+            kind,
+            FormKind::NewProfile | FormKind::EditProfile(_) | FormKind::EditHeaders(_)
+        );
         if first.is_empty() && !optional {
             if let Some(form) = self.form.as_mut() {
                 form.error = Some("Chưa nhập gì".into());
@@ -3014,7 +3402,7 @@ impl Browser {
         }
 
         match kind {
-            FormKind::NewProfile => return self.submit_profile_form(cx),
+            FormKind::NewProfile | FormKind::EditProfile(_) => return self.submit_profile_form(cx),
             FormKind::NewFolder => {
                 self.form = None;
                 self.create_folder(first, cx);
@@ -3032,9 +3420,33 @@ impl Browser {
                 self.duplicate_entry(key, first, cx);
             }
             FormKind::OpenBucket => {
+                let Some(path) = parse_s3_path(&first) else {
+                    if let Some(form) = self.form.as_mut() {
+                        form.error = Some("Nhập bucket hoặc s3://bucket/prefix/".into());
+                    }
+                    cx.notify();
+                    return;
+                };
+                if let Some(region) = path.region.as_ref() {
+                    let profile = self
+                        .active_profile
+                        .and_then(|ix| self.profiles.get(ix))
+                        .map(|profile| profile.region.as_str());
+                    if profile != Some(region.as_str()) {
+                        if let Some(form) = self.form.as_mut() {
+                            form.error = Some(
+                                format!(
+                                    "Path này ghi region {region}; profile đang dùng region khác"
+                                )
+                                .into(),
+                            );
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
                 self.form = None;
-                let bucket = SharedString::from(first);
-                self.open(bucket, String::new(), cx);
+                self.open(SharedString::from(path.bucket), path.prefix, cx);
             }
             FormKind::EditHeaders(keys) => {
                 let headers = s3core::ObjectHeaders {
@@ -3074,21 +3486,49 @@ impl Browser {
         let Some(form) = self.form.as_ref() else {
             return;
         };
+        let kind = form.kind.clone();
         let name = form.value("Tên", cx);
         let endpoint = form.value("Endpoint", cx);
         let region = form.value("Region", cx);
         let access_key = form.value("Access key", cx);
         let secret_key = form.value("Secret key", cx);
+        let editing = match kind {
+            FormKind::EditProfile(index) => Some(index),
+            _ => None,
+        };
 
         // Check everything before touching the keychain, so a rejected form
         // never leaves a half-made profile behind.
-        let taken: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
-        if let Some(message) = validate_profile(&name, &access_key, &secret_key, &taken) {
+        let taken: Vec<&str> = self
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != editing)
+            .map(|(_, p)| p.name.as_str())
+            .collect();
+        if let Some(message) =
+            validate_profile(&name, &access_key, &secret_key, &taken, editing.is_some())
+        {
             if let Some(form) = self.form.as_mut() {
                 form.error = Some(message.into());
             }
             cx.notify();
             return;
+        }
+        if secret_key.is_empty() {
+            if let Some(index) = editing {
+                if let Some(profile) = self.profiles.get(index) {
+                    if let Err(error) = vault::secret_key(&profile.id) {
+                        if let Some(form) = self.form.as_mut() {
+                            form.error = Some(
+                                format!("Không có secret cũ, nhập secret key mới ({error})").into(),
+                            );
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
         }
 
         // A pasted endpoint often carries the bucket; keep it to open later
@@ -3100,7 +3540,10 @@ impl Browser {
         };
 
         let stored = StoredProfile {
-            id: vault::new_profile_id(&name, &self.profiles),
+            id: editing
+                .and_then(|index| self.profiles.get(index))
+                .map(|profile| profile.id.clone())
+                .unwrap_or_else(|| vault::new_profile_id(&name, &self.profiles)),
             name,
             endpoint: (!endpoint.is_empty()).then_some(endpoint),
             region: if region.is_empty() {
@@ -3118,13 +3561,24 @@ impl Browser {
         .with_provider_defaults();
 
         self.form = None;
-        self.add_profile(stored, &secret_key, cx);
-        if let Some(bucket) = bucket_hint {
-            // The connection is still in flight; remembering it here means the
-            // sidebar has something even when ListBuckets is denied.
-            let bucket = SharedString::from(bucket);
-            if !self.buckets.contains(&bucket) {
-                self.buckets.push(bucket);
+        if let Some(index) = editing {
+            self.update_profile(
+                index,
+                stored,
+                (!secret_key.is_empty()).then_some(secret_key),
+                cx,
+            );
+        } else {
+            self.add_profile(stored, &secret_key, cx);
+        }
+        if editing.is_none() {
+            if let Some(bucket) = bucket_hint {
+                // The connection is still in flight; remembering it here means
+                // the sidebar has something even when ListBuckets is denied.
+                let bucket = SharedString::from(bucket);
+                if !self.buckets.contains(&bucket) {
+                    self.buckets.push(bucket);
+                }
             }
         }
     }
@@ -3156,15 +3610,33 @@ impl Browser {
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        let endpoint = form.value("Endpoint", cx);
-        let (endpoint, _) = if endpoint.is_empty() {
+        let endpoint_text = form.value("Endpoint", cx);
+        let (endpoint, endpoint_bucket) = if endpoint_text.is_empty() {
             (String::new(), None)
         } else {
-            split_endpoint(&endpoint)
+            split_endpoint(&endpoint_text)
         };
         let region = form.value("Region", cx);
+        let probe_bucket = form.value("Bucket thử", cx);
         let access_key = form.value("Access key", cx);
-        let secret_key = form.value("Secret key", cx);
+        let mut secret_key = form.value("Secret key", cx);
+        if secret_key.is_empty() {
+            if let FormKind::EditProfile(index) = &form.kind {
+                if let Some(profile) = self.profiles.get(*index) {
+                    match vault::secret_key(&profile.id) {
+                        Ok(secret) => secret_key = secret,
+                        Err(error) => {
+                            if let Some(form) = self.form.as_mut() {
+                                form.error =
+                                    Some(format!("Không đọc được secret cũ: {error}").into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
 
         if access_key.is_empty() || secret_key.is_empty() {
             if let Some(form) = self.form.as_mut() {
@@ -3172,6 +3644,47 @@ impl Browser {
             }
             cx.notify();
             return;
+        }
+
+        let probe_target = if probe_bucket.is_empty() {
+            endpoint_bucket.map(|bucket| S3Path {
+                bucket,
+                prefix: String::new(),
+                region: None,
+            })
+        } else {
+            match parse_s3_path(&probe_bucket) {
+                Some(path) => Some(path),
+                None => {
+                    if let Some(form) = self.form.as_mut() {
+                        form.error =
+                            Some("Bucket thử phải là bucket hoặc s3://bucket/prefix/".into());
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        if let Some(target) = probe_target.as_ref() {
+            if let Some(target_region) = target.region.as_ref() {
+                let profile_region = if region.is_empty() {
+                    "us-east-1"
+                } else {
+                    region.as_str()
+                };
+                if target_region != profile_region {
+                    if let Some(form) = self.form.as_mut() {
+                        form.error = Some(
+                            format!(
+                                "Bucket thử ghi region {target_region}; form đang dùng region {profile_region}"
+                            )
+                            .into(),
+                        );
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
         }
 
         // Through the same quirk logic a saved profile goes through, or the
@@ -3210,7 +3723,21 @@ impl Browser {
 
         let probing = Tokio::spawn(cx, async move {
             let client = S3Client::connect(&profile).await?;
-            anyhow::Ok(client.list_buckets().await)
+            if let Some(target) = probe_target {
+                let page = client
+                    .list_page(&target.bucket, &target.prefix, None)
+                    .await?;
+                anyhow::Ok(ProfileProbe::Bucket {
+                    bucket: target.bucket,
+                    prefix: target.prefix,
+                    entries: page.entries.len(),
+                })
+            } else {
+                match client.list_buckets().await {
+                    Ok(buckets) => anyhow::Ok(ProfileProbe::Buckets(buckets.len())),
+                    Err(error) => anyhow::Ok(ProfileProbe::ListBucketsDenied(format!("{error:?}"))),
+                }
+            }
         });
 
         self.op_task = Some(cx.spawn(async move |this, cx| {
@@ -3220,25 +3747,39 @@ impl Browser {
                     return;
                 };
                 form.probe = Some(match outcome {
-                    Ok(Ok(Ok(buckets))) => {
-                        Probe::Ok(format!("Kết nối được, thấy {} bucket", buckets.len()).into())
+                    Ok(Ok(ProfileProbe::Buckets(count))) => {
+                        Probe::Ok(format!("Kết nối được, thấy {count} bucket").into())
                     }
+                    Ok(Ok(ProfileProbe::Bucket {
+                        bucket,
+                        prefix,
+                        entries,
+                    })) => Probe::Ok(profile_probe_bucket_ok(&bucket, &prefix, entries).into()),
                     // Listing denied is not a failed credential. A token scoped
                     // to one bucket signs perfectly well and is what R2's own
                     // documentation recommends; reporting it as a bad key sends
                     // people to regenerate a key that was never wrong.
-                    Ok(Ok(Err(error))) => {
-                        let failure = Failure::new(format!("ListBuckets: {error:?}"));
+                    Ok(Ok(ProfileProbe::ListBucketsDenied(detail))) => {
+                        let failure = Failure::new(format!("ListBuckets: {detail}"));
                         if failure.fix == Some(Fix::EditProfile) {
                             Probe::Failed(failure.summary)
                         } else {
-                            Probe::Ok(
-                                "Khoá đúng, nhưng token không liệt kê được bucket".into(),
+                            Probe::Warning(
+                                "Kết nối được, nhưng token không liệt kê bucket. Nhập Bucket thử để kiểm tra bucket cụ thể."
+                                    .into(),
                             )
                         }
                     }
                     Ok(Err(error)) => {
-                        Probe::Failed(Failure::new(format!("{error:?}")).summary)
+                        let failure = Failure::new(format!("{error:?}"));
+                        if failure.fix == Some(Fix::EditProfile) {
+                            Probe::Failed(failure.summary)
+                        } else {
+                            Probe::Warning(
+                                format!("Kết nối được, nhưng bucket thử không đọc được: {}", failure.summary)
+                                    .into(),
+                            )
+                        }
                     }
                     Err(error) => Probe::Failed(format!("Task lỗi: {error}").into()),
                 });
@@ -3299,7 +3840,11 @@ impl Browser {
 
     /// Opens the header editor on the inspected object, prefilled.
     fn start_edit_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.inspector.as_ref().map(|inspector| inspector.key.clone()) else {
+        let Some(key) = self
+            .inspector
+            .as_ref()
+            .map(|inspector| inspector.key.clone())
+        else {
             return;
         };
         self.open_form(FormKind::EditHeaders(vec![key.clone()]), window, cx);
@@ -3458,7 +4003,7 @@ impl Browser {
             Command::Paste => self.paste(cx),
             Command::SelectAll => self.select_all(cx),
             Command::Share => self.start_share(cx),
-            Command::Inspect => self.toggle_inspector(cx),
+            Command::Inspect => self.open_inspector(cx),
             Command::Preview => self.quick_look(cx),
             Command::OpenExternally => {
                 // Needs the inspector's loaded head to know the size, so open it
@@ -3522,9 +4067,10 @@ impl Browser {
         self.status = format!("Đang xoá {} mục…", doomed.len()).into();
         let reopen = (bucket.clone(), self.prefix.clone());
 
-        let deleting = Tokio::spawn(cx, async move {
-            client.delete_entries(&bucket, &doomed).await
-        });
+        let deleting = Tokio::spawn(
+            cx,
+            async move { client.delete_entries(&bucket, &doomed).await },
+        );
 
         let task = cx.spawn(async move |this, cx| {
             let outcome = deleting.await;
@@ -3602,9 +4148,6 @@ impl Browser {
 
     /// Downloads the selected objects into the platform's Downloads folder.
     fn download_selection(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
-            return;
-        };
         // Folders come along now. They used to be filtered out here, so a
         // selection mixing files and folders quietly downloaded only the files
         // and said nothing about the rest.
@@ -3614,6 +4157,33 @@ impl Browser {
             .filter(|entry| self.selection.contains(&entry.key))
             .cloned()
             .collect();
+        self.download_entries(selected, cx);
+    }
+
+    fn download_current_detail(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.current_detail_key() else {
+            return;
+        };
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .cloned()
+            .unwrap_or_else(|| Entry {
+                name: entry_name_of(&key),
+                key,
+                is_folder: false,
+                size: 0,
+                modified_epoch: None,
+                storage_class: None,
+            });
+        self.download_entries(vec![entry], cx);
+    }
+
+    fn download_entries(&mut self, selected: Vec<Entry>, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
         if selected.is_empty() {
             return;
         }
@@ -3653,13 +4223,7 @@ impl Browser {
             for (key, relative) in targets {
                 ids.push(
                     engine
-                        .enqueue_download_to(
-                            client.clone(),
-                            &bucket,
-                            &key,
-                            &destination,
-                            &relative,
-                        )
+                        .enqueue_download_to(client.clone(), &bucket, &key, &destination, &relative)
                         .await?,
                 );
             }
@@ -3702,15 +4266,34 @@ impl Browser {
     }
 
     fn open_inspector(&mut self, cx: &mut Context<Self>) {
-        let mut selected = self.selection.iter();
-        let (Some(key), None) = (selected.next(), selected.next()) else {
+        let Some(key) = self.inspection_key_for_selection() else {
+            if !self.selection.is_empty() {
+                self.report("Thư mục không có metadata".into());
+            }
             return;
         };
-        if key.ends_with('/') {
-            self.report("Thư mục không có metadata".into());
+
+        self.inspect_key(key, cx);
+    }
+
+    fn sync_inspector_to_selection(&mut self, cx: &mut Context<Self>) {
+        if self.inspector.is_none() {
             return;
         }
-        let key = key.clone();
+        let Some(key) = self.inspection_key_for_selection() else {
+            return;
+        };
+        if self
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.key == key)
+        {
+            return;
+        }
+        self.inspect_key(key, cx);
+    }
+
+    fn inspect_key(&mut self, key: String, cx: &mut Context<Self>) {
         self.inspector = Some(Inspection {
             key: key.clone(),
             head: None,
@@ -3728,6 +4311,7 @@ impl Browser {
             return;
         };
 
+        let loaded_key = key.clone();
         let versioned = self.bucket_versioned;
         let acl_supported = self.supports(|caps| caps.acl);
         let loading = Tokio::spawn(cx, async move {
@@ -3736,7 +4320,10 @@ impl Browser {
             // implement it must not blank out the metadata that did load.
             let tags = client.object_tags(&bucket, &key).await.unwrap_or_default();
             let versions = if versioned {
-                client.list_versions(&bucket, &key).await.unwrap_or_default()
+                client
+                    .list_versions(&bucket, &key)
+                    .await
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -3760,6 +4347,9 @@ impl Browser {
             let outcome = loading.await;
             _ = this.update(cx, |this, cx| {
                 if let Some(inspector) = this.inspector.as_mut() {
+                    if inspector.key != loaded_key {
+                        return;
+                    }
                     inspector.loading = false;
                     match outcome {
                         Ok(Ok((head, tags, versions, acl))) => {
@@ -3818,7 +4408,19 @@ impl Browser {
             .filter(|inspector| inspector.key == key)
             .and_then(|inspector| inspector.head.as_ref())
             .and_then(|head| head.content_type.clone());
+        if html_opens_externally(&key, content_type.as_deref()) {
+            self.open_key_externally(key, cx);
+            return;
+        }
         let kind = preview_kind(&key, content_type.as_deref());
+
+        if self
+            .inspector
+            .as_ref()
+            .is_none_or(|inspector| inspector.key != key)
+        {
+            self.inspect_key(key.clone(), cx);
+        }
 
         self.previewing = Some(Previewing {
             key: key.clone(),
@@ -3829,12 +4431,11 @@ impl Browser {
             saving: false,
         });
 
-        // An image has to arrive whole to decode, so an oversized one is refused
-        // rather than fetched and shown broken. Text is fine truncated.
+        // Images have to arrive whole to decode, so oversized images are
+        // refused rather than fetched and shown broken. Text is fine truncated.
         let refusal = match kind {
-            // Not a byte fetched: a video, a PDF, an archive. Pulling eight
-            // megabytes of one to end up drawing a label that says "this is a
-            // video" is paying for nothing.
+            // Not a byte fetched: a PDF, an archive. Pulling eight megabytes
+            // of one to end up drawing a label is paying for nothing.
             PreviewKind::None => Some(Preview::Handoff("Không xem trước được kiểu này".into())),
             PreviewKind::Image if size > self.settings.preview_limit_bytes() as i64 => {
                 Some(Preview::Handoff(
@@ -3917,20 +4518,18 @@ impl Browser {
         if !self.preview_is_whole() {
             return;
         }
-        let Some(text) = self.previewing.as_ref().and_then(|previewing| {
-            match previewing.content.as_ref() {
-                Some(Preview::Text(text)) => Some(text.to_string()),
-                _ => None,
-            }
-        }) else {
+        let Some(text) =
+            self.previewing
+                .as_ref()
+                .and_then(|previewing| match previewing.content.as_ref() {
+                    Some(Preview::Text(text)) => Some(text.to_string()),
+                    _ => None,
+                })
+        else {
             return;
         };
 
-        let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(18)
-        });
+        let editor = cx.new(|cx| InputState::new(window, cx).multi_line(true).rows(18));
         editor.update(cx, |editor, cx| {
             editor.set_value(text, window, cx);
             editor.focus(window, cx);
@@ -3972,8 +4571,13 @@ impl Browser {
             // has no tags. Reading them first and putting them back is two extra
             // requests on a save; silently dropping someone's cost-allocation
             // tags because they fixed a typo is not a trade.
-            let tags = client.object_tags(&bucket, &target).await.unwrap_or_default();
-            client.put_object(&bucket, &target, text.into_bytes()).await?;
+            let tags = client
+                .object_tags(&bucket, &target)
+                .await
+                .unwrap_or_default();
+            client
+                .put_object(&bucket, &target, text.into_bytes())
+                .await?;
             if !tags.is_empty() {
                 client.set_object_tags(&bucket, &target, &tags).await?;
             }
@@ -3991,9 +4595,7 @@ impl Browser {
                         this.status = format!("Đã lưu {}", entry_name_of(&key)).into();
                         this.previewing = None;
                         // The size and date on the row are now the old ones.
-                        if let (Some(bucket), prefix) =
-                            (this.bucket.clone(), this.prefix.clone())
-                        {
+                        if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
                             this.open(bucket, prefix, cx);
                         }
                     }
@@ -4016,16 +4618,20 @@ impl Browser {
     /// it with.
     ///
     /// Reads the preview first, then the inspector: the preview is what is in
-    /// front of the user when there is one, and for a video or a PDF it is the
-    /// only thing offering this at all.
+    /// front of the user when there is one, and for a PDF or another handoff
+    /// type it is the only thing offering this at all.
     fn open_externally(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
-            return;
-        };
         let key = match (self.previewing.as_ref(), self.inspector.as_ref()) {
             (Some(previewing), _) => previewing.key.clone(),
             (None, Some(inspector)) => inspector.key.clone(),
             (None, None) => return,
+        };
+        self.open_key_externally(key, cx);
+    }
+
+    fn open_key_externally(&mut self, key: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
         };
         // From the listing, which has it, rather than from a HEAD that may not
         // have happened.
@@ -4034,7 +4640,12 @@ impl Browser {
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.size)
-            .or_else(|| self.inspector.as_ref().and_then(|i| i.head.as_ref()).map(|h| h.size))
+            .or_else(|| {
+                self.inspector
+                    .as_ref()
+                    .and_then(|i| i.head.as_ref())
+                    .map(|h| h.size)
+            })
             .unwrap_or(0)
             .max(0) as u64;
         let name = entry_name_of(&key);
@@ -4068,15 +4679,27 @@ impl Browser {
         }));
     }
 
-    /// Space: the Finder gesture. Opens the preview on whatever is selected
-    /// now, and closes it if it is already showing that object.
+    /// Space opens detail first, then the preview on a second press.
     fn quick_look(&mut self, cx: &mut Context<Self>) {
-        let showing = self.previewing.as_ref().map(|previewing| previewing.key.clone());
-        let selected = self.selected_object_keys().first().cloned();
-        if showing.is_some() && showing == selected {
+        let Some(key) = self.inspection_key_for_selection() else {
+            return;
+        };
+        let showing = self
+            .previewing
+            .as_ref()
+            .map(|previewing| previewing.key.clone());
+        if showing.as_deref() == Some(key.as_str()) {
             return self.close_preview(cx);
         }
-        self.open_preview(cx)
+        if self
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.key == key)
+        {
+            self.open_preview(cx);
+        } else {
+            self.inspect_key(key, cx);
+        }
     }
 
     /// The most destructive thing the app can do, so the dialog names the bucket
@@ -4107,9 +4730,10 @@ impl Browser {
         self.status = format!("Đang dọn {bucket}…").into();
         let reopen = bucket.clone();
 
-        let emptying = Tokio::spawn(cx, async move {
-            client.empty_bucket(&bucket, |_, _| {}).await
-        });
+        let emptying = Tokio::spawn(
+            cx,
+            async move { client.empty_bucket(&bucket, |_, _| {}).await },
+        );
 
         self.op_task = Some(cx.spawn(async move |this, cx| {
             let outcome = emptying.await;
@@ -4253,6 +4877,11 @@ impl Browser {
     /// deep search, because walking a prefix is the same LIST requests under a
     /// different name.
     fn set_acl_recursive(&mut self, canned: &'static str, cx: &mut Context<Self>) {
+        if let Some(failure) = self.acl_unavailable_failure() {
+            self.fail(failure);
+            cx.notify();
+            return;
+        }
         let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
             return;
         };
@@ -4325,9 +4954,18 @@ impl Browser {
     /// and collects failures either way, and a second single-object path would
     /// be a second place for the reporting to drift.
     fn set_acl(&mut self, canned: &'static str, cx: &mut Context<Self>) {
+        if let Some(failure) = self.acl_unavailable_failure() {
+            self.fail(failure);
+            cx.notify();
+            return;
+        }
         let mut keys = self.selected_object_keys();
         if keys.is_empty() {
-            keys.extend(self.inspector.as_ref().map(|inspector| inspector.key.clone()));
+            keys.extend(
+                self.inspector
+                    .as_ref()
+                    .map(|inspector| inspector.key.clone()),
+            );
         }
         self.start_bulk("Đổi quyền", keys, BulkOp::Acl(canned), cx);
     }
@@ -4431,10 +5069,44 @@ impl Browser {
         cx.notify();
     }
 
+    fn current_detail_key(&self) -> Option<String> {
+        match (self.previewing.as_ref(), self.inspector.as_ref()) {
+            (Some(previewing), _) => Some(previewing.key.clone()),
+            (None, Some(inspector)) => Some(inspector.key.clone()),
+            (None, None) => None,
+        }
+    }
+
+    fn start_share_current(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.current_detail_key() else {
+            return;
+        };
+        if key.ends_with('/') {
+            self.report("Không tạo được link cho thư mục".into());
+            return;
+        }
+
+        let temporary_credentials = self
+            .active_profile
+            .and_then(|ix| self.profiles.get(ix))
+            .is_some_and(|stored| vault::session_token(&stored.id).is_some());
+
+        self.share = Some(Share {
+            key,
+            chosen: PRESIGN_PRESETS[1].0,
+            url: None,
+            temporary_credentials,
+        });
+        self.presign(PRESIGN_PRESETS[1].0, PRESIGN_PRESETS[1].1, cx);
+        cx.notify();
+    }
+
     fn presign(&mut self, label: &'static str, expires: Duration, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket), Some(share)) =
-            (self.client.clone(), self.bucket.clone(), self.share.as_ref())
-        else {
+        let (Some(client), Some(bucket), Some(share)) = (
+            self.client.clone(),
+            self.bucket.clone(),
+            self.share.as_ref(),
+        ) else {
             return;
         };
         // Never sign for longer than the credentials can actually honour.
@@ -4557,6 +5229,10 @@ impl Browser {
     /// the map records failures too, or a broken object would be re-fetched on
     /// every repaint.
     fn load_thumbnails(&mut self, range: &Range<usize>, cx: &mut Context<Self>) {
+        if self.thumb_task.is_some() {
+            return;
+        }
+
         let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
             return;
         };
@@ -4574,6 +5250,7 @@ impl Browser {
                     && entry.size <= THUMBNAIL_LIMIT
                     && preview_kind(&entry.key, None) == PreviewKind::Image
             })
+            .take(THUMBNAIL_BATCH)
             .cloned()
             .collect();
 
@@ -4586,6 +5263,7 @@ impl Browser {
             self.thumbnails.insert(entry.key.clone(), None);
         }
 
+        let started = Instant::now();
         let fetching = Tokio::spawn(cx, async move {
             let mut loaded = Vec::new();
             for entry in wanted {
@@ -4603,8 +5281,10 @@ impl Browser {
         });
 
         self.thumb_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(loaded) = fetching.await else { return };
+            let loaded = fetching.await.unwrap_or_default();
             _ = this.update(cx, |this, cx| {
+                this.thumb_task = None;
+                this.perf.note_thumbnails(started.elapsed(), loaded.len());
                 for (key, image) in loaded {
                     this.thumbnails.insert(key, Some(image));
                 }
@@ -4659,9 +5339,10 @@ impl Browser {
 
         // Pasting where the items already are would copy each onto itself.
         if clipboard.bucket == bucket
-            && clipboard.entries.iter().all(|entry| {
-                parent_prefix_of(&entry.key) == prefix
-            })
+            && clipboard
+                .entries
+                .iter()
+                .all(|entry| parent_prefix_of(&entry.key) == prefix)
         {
             self.report("Đã ở đúng thư mục này".into());
             return;
@@ -4894,7 +5575,9 @@ impl Browser {
         let executor = cx.background_executor().clone();
         self.tick_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                executor.timer(Duration::from_millis(250)).await;
+                executor
+                    .timer(Duration::from_millis(TRANSFER_TICK_MS))
+                    .await;
                 let still_working = this.update(cx, |this, cx| {
                     cx.notify();
                     this.transfers.has_active_work()
@@ -5219,6 +5902,7 @@ impl Browser {
         self.selection.insert(key.clone());
         self.cursor = Some(key.clone());
         self.anchor = Some(key);
+        self.sync_inspector_to_selection(cx);
         cx.notify();
     }
 
@@ -5234,6 +5918,7 @@ impl Browser {
         }
         self.cursor = Some(key.clone());
         self.anchor = Some(key);
+        self.sync_inspector_to_selection(cx);
         cx.notify();
     }
 
@@ -5268,6 +5953,7 @@ impl Browser {
             self.cursor = Some(key.clone());
             self.anchor = Some(key);
         }
+        self.sync_inspector_to_selection(cx);
         cx.notify();
     }
 
@@ -5298,16 +5984,13 @@ impl Browser {
             .border_b_1()
             .border_color(theme.border)
             .when_some(self.path_input.clone(), |this, input| {
-                this.child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .child(
-                            Input::new(&input)
-                                .h(px(FIELD_HEIGHT))
-                                .prefix(sized_icon("path", 12., theme.text_faint)),
-                        ),
-                )
+                this.child(div().flex_1().min_w(px(0.)).child(
+                    Input::new(&input).h(px(FIELD_HEIGHT)).prefix(sized_icon(
+                        "path",
+                        12.,
+                        theme.text_faint,
+                    )),
+                ))
             })
             // The account, where Brows3 puts it: the same path under two
             // profiles is two different places, so it belongs beside the path.
@@ -5359,6 +6042,7 @@ impl Browser {
             .border_color(theme.border)
             .children(titles.into_iter().enumerate().map(|(index, title)| {
                 let selected = index == active;
+                let title_id = SharedString::from(format!("tab-title-{index}"));
                 div()
                     .id(SharedString::from(format!("tab-{index}")))
                     .h(px(TAB_HEIGHT - 6.))
@@ -5370,22 +6054,36 @@ impl Browser {
                     .rounded_md()
                     .text_xs()
                     .cursor_pointer()
-                    .bg(if selected { theme.selected } else { theme.hover })
-                    .text_color(if selected { theme.text } else { theme.text_muted })
+                    .bg(if selected {
+                        theme.selected
+                    } else {
+                        theme.hover
+                    })
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
                     .hover(|this| this.bg(theme.selected))
                     .child(sized_icon(
                         "folder",
                         12.,
-                        if selected { theme.accent } else { theme.text_faint },
+                        if selected {
+                            theme.accent
+                        } else {
+                            theme.text_faint
+                        },
                     ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(title),
-                    )
+                    .child(div().flex_1().min_w(px(0.)).child(ellipsis_text(
+                        title_id,
+                        title.to_string(),
+                        24,
+                        if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        },
+                    )))
                     // The close control only exists while there is another tab
                     // to fall back to.
                     .when(closable, |this| {
@@ -5396,13 +6094,15 @@ impl Browser {
                                 10.,
                                 theme,
                             )
-                                .on_click(cx.listener(move |this, event, window, cx| {
+                            .on_click(cx.listener(
+                                move |this, event, window, cx| {
                                     // Or the click reaches the tab underneath and
                                     // selects the tab it just closed.
                                     cx.stop_propagation();
                                     _ = event;
                                     this.close_tab(index, window, cx);
-                                })),
+                                },
+                            )),
                         )
                     })
                     .on_click(cx.listener(move |this, _event, window, cx| {
@@ -5487,22 +6187,19 @@ impl Browser {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(section_header("BUCKETS", "add-bucket", theme).on_click(
-                                cx.listener(|this, _event, window, cx| {
-                                    if this.client.is_some() {
-                                        // Opening by name rather than creating:
-                                        // a scoped token is denied CreateBucket
-                                        // too, and reaching a bucket that exists
-                                        // is the far more common need.
-                                        this.open_form(FormKind::OpenBucket, window, cx);
-                                    }
-                                }),
-                            )),
-                    )
+                    .child(div().flex_1().min_w(px(0.)).child(
+                        section_header("BUCKETS", "add-bucket", theme).on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                if this.client.is_some() {
+                                    // Opening by name rather than creating:
+                                    // a scoped token is denied CreateBucket
+                                    // too, and reaching a bucket that exists
+                                    // is the far more common need.
+                                    this.open_form(FormKind::OpenBucket, window, cx);
+                                }
+                            },
+                        )),
+                    ))
                     // Only when the list is a remembered one. A refresh button
                     // beside a list that was just fetched is a button that does
                     // nothing, and the note beside it would be a lie.
@@ -5541,38 +6238,35 @@ impl Browser {
             // Only past a threshold. Under a dozen buckets the whole list is
             // on screen already, and a search box over four rows is a control
             // nobody will ever use taking space from the rows they will.
-            .when(
-                self.buckets.len() >= BUCKET_FILTER_MIN,
-                |this| {
-                    this.when_some(self.bucket_filter_input.clone(), |this, input| {
-                        this.child(
-                            div().px_1().child(
-                                Input::new(&input)
-                                    .h(px(FIELD_HEIGHT))
-                                    .prefix(sized_icon("search", 12., theme.text_faint))
-                                    // Same story as the object filter above:
-                                    // `cleanable(true)` was here and drew an
-                                    // invisible control.
-                                    .when(!self.bucket_filter.is_empty(), |this| {
-                                        this.suffix(
-                                            small_icon_button(
-                                                "bucket-filter-clear".into(),
-                                                "close",
-                                                10.,
-                                                theme,
-                                            )
-                                            .on_click(cx.listener(
-                                                |this, _event, window, cx| {
-                                                    this.clear_bucket_filter(window, cx)
-                                                },
-                                            )),
+            .when(self.buckets.len() >= BUCKET_FILTER_MIN, |this| {
+                this.when_some(self.bucket_filter_input.clone(), |this, input| {
+                    this.child(
+                        div().px_1().child(
+                            Input::new(&input)
+                                .h(px(FIELD_HEIGHT))
+                                .prefix(sized_icon("search", 12., theme.text_faint))
+                                // Same story as the object filter above:
+                                // `cleanable(true)` was here and drew an
+                                // invisible control.
+                                .when(!self.bucket_filter.is_empty(), |this| {
+                                    this.suffix(
+                                        small_icon_button(
+                                            "bucket-filter-clear".into(),
+                                            "close",
+                                            10.,
+                                            theme,
                                         )
-                                    }),
-                            ),
-                        )
-                    })
-                },
-            )
+                                        .on_click(
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.clear_bucket_filter(window, cx)
+                                            }),
+                                        ),
+                                    )
+                                }),
+                        ),
+                    )
+                })
+            })
             .children(
                 self.visible_buckets()
                     .into_iter()
@@ -5631,12 +6325,10 @@ impl Browser {
                     None,
                     theme,
                 )
-                .on_click(
-                    cx.listener(|this, _event, _window, cx| {
-                        this.settings_open = true;
-                        cx.notify();
-                    }),
-                ),
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.settings_open = true;
+                    cx.notify();
+                })),
             )
             // Beside it rather than only in the palette: the person who needs
             // the version number is the one writing a bug report, and asking
@@ -5645,8 +6337,15 @@ impl Browser {
                 // Never blocked, for the same reason as Cài đặt: someone with
                 // nothing connected is exactly who needs to read off a version
                 // number and find the crash folder.
-                sidebar_item("about-open".into(), "info", "Giới thiệu".into(), false, None, theme)
-                    .on_click(cx.listener(|this, _event, _window, cx| this.open_about(cx))),
+                sidebar_item(
+                    "about-open".into(),
+                    "info",
+                    "Giới thiệu".into(),
+                    false,
+                    None,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| this.open_about(cx))),
             )
     }
 
@@ -5688,9 +6387,12 @@ impl Browser {
                 .flex_col()
                 .gap_1()
                 .child(section_label("ĐÃ GHIM", theme))
-                .children(favorites.iter().enumerate().map(|(ix, place)| {
-                    row(place, SharedString::from(format!("fav-{ix}")))
-                })),
+                .children(
+                    favorites
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, place)| row(place, SharedString::from(format!("fav-{ix}")))),
+                ),
         )
     }
 
@@ -5715,6 +6417,10 @@ impl Browser {
             return None;
         }
         let theme = self.theme;
+        let mono = self.mono_font.clone();
+        let failure_cards = failure_cards(&self.failures);
+        let failure_count = self.failures.len();
+        let distinct_count = failure_cards.len();
 
         Some(
             div()
@@ -5732,7 +6438,7 @@ impl Browser {
                 .child(
                     div()
                         .id("failures-dialog")
-                        .w(px(DIALOG_WIDTH))
+                        .w(px(FAILURE_DIALOG_WIDTH))
                         .p_4()
                         .flex()
                         .flex_col()
@@ -5746,50 +6452,94 @@ impl Browser {
                             div()
                                 .flex()
                                 .items_center()
-                                .child(div().flex_1().text_color(theme.text).child("Lỗi"))
+                                .gap_2()
                                 .child(
-                                    action_button("failures-clear", "Xoá hết", theme).on_click(
-                                        cx.listener(|this, _event, _window, cx| {
-                                            this.failures.clear();
-                                            this.failures_open = false;
-                                            cx.notify();
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(format!(
+                                            "Lỗi ({failure_count})"
+                                        )))
+                                        .when(distinct_count < failure_count, |this| {
+                                            this.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.text_faint)
+                                                    .child(SharedString::from(format!(
+                                                        "{distinct_count} loại lỗi, đã gộp các lỗi trùng"
+                                                    ))),
+                                            )
                                         }),
-                                    ),
-                                ),
+                                )
+                                .when(!self.failures.is_empty(), |this| {
+                                    this.child(
+                                        action_button("failures-clear", "Xoá hết", theme).on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.failures.clear();
+                                                this.failures_open = false;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                }),
                         )
                         .child(
                             div()
                                 .id("failures-list")
                                 .flex()
                                 .flex_col()
-                                .gap_2()
-                                .max_h(px(360.))
+                                .gap_3()
+                                .max_h(px(440.))
                                 .overflow_y_scroll()
                                 // Newest first: the one being asked about is
                                 // almost always the one that just happened.
-                                .children(self.failures.iter().rev().enumerate().map(
+                                .children(failure_cards.into_iter().enumerate().map(
                                     |(index, failure)| {
+                                        let detail = flatten(&failure.detail);
                                         div()
-                                            .p_2()
-                                            .rounded_md()
-                                            .bg(theme.panel)
+                                            .p_3()
+                                            .rounded_lg()
                                             .flex()
                                             .flex_col()
-                                            .gap_1()
+                                            .gap_2()
+                                            .bg(theme.panel)
+                                            .border_1()
+                                            .border_color(theme.border)
                                             .child(
                                                 div()
                                                     .flex()
-                                                    .items_center()
+                                                    .items_start()
                                                     .gap_2()
                                                     .child(
                                                         div()
                                                             .flex_1()
+                                                            .min_w(px(0.))
                                                             .text_xs()
                                                             .text_color(theme.danger)
-                                                            .child(failure.summary.clone()),
+                                                            .child(failure.summary),
                                                     )
+                                                    .when(failure.count > 1, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded_md()
+                                                                .bg(theme.hover)
+                                                                .text_xs()
+                                                                .text_color(theme.text_muted)
+                                                                .child(SharedString::from(
+                                                                    format!("x{}", failure.count),
+                                                                )),
+                                                        )
+                                                    })
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
                                                             .text_xs()
                                                             .text_color(theme.text_faint)
                                                             .child(SharedString::from(
@@ -5807,17 +6557,18 @@ impl Browser {
                                             // click away on the clipboard.
                                             .child(
                                                 div()
-                                                    .max_h(px(DETAIL_HEIGHT))
+                                                    .max_h(px(FAILURE_DETAIL_HEIGHT))
                                                     .overflow_hidden()
-                                                    // 52, not 64: a 64-character
-                                                    // line does not fit the
-                                                    // panel, so the layout wraps
-                                                    // it again and every line
-                                                    // gets a two-word stub
-                                                    // under it.
+                                                    .p_2()
+                                                    .rounded_md()
+                                                    .bg(theme.hover)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .font_family(mono.clone())
+                                                    .text_xs()
                                                     .child(wrapped_text(
-                                                        &flatten(failure.detail.as_ref()),
-                                                        52,
+                                                        &detail,
+                                                        82,
                                                         theme.text_muted,
                                                     )),
                                             )
@@ -5847,8 +6598,7 @@ impl Browser {
                                                     // the "paste it into a
                                                     // ticket" story is a story.
                                                     .child({
-                                                        let detail =
-                                                            failure.detail.to_string();
+                                                        let detail = failure.detail.clone();
                                                         action_button_dyn(
                                                             SharedString::from(format!(
                                                                 "failure-copy-{index}"
@@ -5878,6 +6628,14 @@ impl Browser {
                                     )
                                 }),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "failures-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -5898,6 +6656,7 @@ impl Browser {
         if places.is_empty() {
             return None;
         }
+        let place_count = places.len();
 
         Some(
             div()
@@ -5929,6 +6688,7 @@ impl Browser {
                         .child(sized_icon("clock", 12., theme.text_faint))
                         .child(
                             div()
+                                .id("acl-popup-body")
                                 .flex_1()
                                 .min_w(px(0.))
                                 .overflow_hidden()
@@ -5950,6 +6710,17 @@ impl Browser {
                                 cx.notify();
                             }),
                         )
+                        .transition_opacity_and_offset(
+                            SharedString::from(format!("path-suggest-in-{index}")),
+                            delayed_transition(
+                                MOTION_ROW_MS,
+                                row_stagger_from_end(index, place_count),
+                            ),
+                            0.0,
+                            1.0,
+                            motion_offset(0.0, -3.0),
+                            motion_offset(0.0, 0.0),
+                        )
                 }))
                 .into_any_element(),
         )
@@ -5965,6 +6736,7 @@ impl Browser {
     fn render_buckets_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let buckets = self.visible_buckets();
+        let bucket_count = buckets.len();
         let current = self.bucket.clone();
 
         div()
@@ -5992,14 +6764,12 @@ impl Browser {
                             .text_color(theme.text)
                             .child("Tất cả bucket"),
                     )
-                    .child(
-                        action_button("buckets-refresh", "Làm mới", theme).on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.bucket_cache_bypass = true;
-                                this.refresh_buckets(cx);
-                            },
-                        )),
-                    )
+                    .child(action_button("buckets-refresh", "Làm mới", theme).on_click(
+                        cx.listener(|this, _event, _window, cx| {
+                            this.bucket_cache_bypass = true;
+                            this.refresh_buckets(cx);
+                        }),
+                    ))
                     .child(
                         icon_button("buckets-close", "close", theme).on_click(cx.listener(
                             |this, _event, _window, cx| {
@@ -6073,17 +6843,18 @@ impl Browser {
                             .child(sized_icon(
                                 "bucket",
                                 14.,
-                                if selected { theme.accent } else { theme.text_faint },
+                                if selected {
+                                    theme.accent
+                                } else {
+                                    theme.text_faint
+                                },
                             ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_color(theme.text)
-                                    .child(name.clone()),
-                            )
+                            .child(div().flex_1().min_w(px(0.)).child(ellipsis_text(
+                                SharedString::from(format!("bucket-page-name-{index}")),
+                                name.clone().to_string(),
+                                34,
+                                theme.text,
+                            )))
                             .child(
                                 div()
                                     .w(px(BUCKET_CREATED_WIDTH))
@@ -6095,7 +6866,26 @@ impl Browser {
                                 this.screen = Screen::Objects;
                                 this.open(target.clone(), String::new(), cx);
                             }))
+                            .transition_opacity_and_offset(
+                                SharedString::from(format!("bucket-row-in-{index}")),
+                                delayed_transition(
+                                    MOTION_ROW_MS,
+                                    row_stagger_from_end(index, bucket_count),
+                                ),
+                                0.0,
+                                1.0,
+                                motion_offset(0.0, -3.0),
+                                motion_offset(0.0, 0.0),
+                            )
                     })),
+            )
+            .transition_opacity_and_offset(
+                "buckets-page-in",
+                smooth_transition(MOTION_PAGE_MS),
+                0.0,
+                1.0,
+                motion_offset(0.0, 4.0),
+                motion_offset(0.0, 0.0),
             )
     }
 
@@ -6126,6 +6916,7 @@ impl Browser {
                     .collect()
             })
             .unwrap_or_default();
+        let recent_count = recent.len();
 
         div()
             .id("recent-page")
@@ -6155,11 +6946,9 @@ impl Browser {
                             .child("Gần đây"),
                     )
                     .when(!recent.is_empty(), |this| {
-                        this.child(
-                            action_button("recent-clear", "Xoá hết", theme).on_click(
-                                cx.listener(|this, _event, _window, cx| this.clear_recent(cx)),
-                            ),
-                        )
+                        this.child(action_button("recent-clear", "Xoá hết", theme).on_click(
+                            cx.listener(|this, _event, _window, cx| this.clear_recent(cx)),
+                        ))
                     })
                     .child(
                         icon_button("recent-close", "close", theme).on_click(cx.listener(
@@ -6180,7 +6969,12 @@ impl Browser {
                         .justify_center()
                         .gap_2()
                         .child(sized_icon("clock", 24., theme.text_faint))
-                        .child(div().text_sm().text_color(theme.text_muted).child("Chưa đi đâu cả"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.text_muted)
+                                .child("Chưa đi đâu cả"),
+                        )
                         .child(
                             div()
                                 .text_xs()
@@ -6212,7 +7006,11 @@ impl Browser {
                             .child(sized_icon(
                                 if pinned { "star" } else { "folder" },
                                 14.,
-                                if pinned { theme.accent } else { theme.text_faint },
+                                if pinned {
+                                    theme.accent
+                                } else {
+                                    theme.text_faint
+                                },
                             ))
                             // The whole path, not just the last segment: two
                             // `2026/` under different buckets are one word apart
@@ -6239,7 +7037,26 @@ impl Browser {
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 this.open_place(&target, cx)
                             }))
+                            .transition_opacity_and_offset(
+                                SharedString::from(format!("recent-row-in-{ix}")),
+                                delayed_transition(
+                                    MOTION_ROW_MS,
+                                    row_stagger_from_end(ix, recent_count),
+                                ),
+                                0.0,
+                                1.0,
+                                motion_offset(0.0, -3.0),
+                                motion_offset(0.0, 0.0),
+                            )
                     })),
+            )
+            .transition_opacity_and_offset(
+                "recent-page-in",
+                smooth_transition(MOTION_PAGE_MS),
+                0.0,
+                1.0,
+                motion_offset(0.0, 4.0),
+                motion_offset(0.0, 0.0),
             )
     }
 
@@ -6249,25 +7066,390 @@ impl Browser {
         let theme = self.theme;
         let limit_mb = self.settings.preview_limit_bytes() / (1024 * 1024);
         let kind: SharedString = type_badge_of(&previewing.name).unwrap_or_else(|| "TỆP".into());
-        // Text is fetched only as far as the limit, and that fact belongs in
-        // its own strip rather than tacked onto the end of the title: it is the
-        // difference between reading a file and reading the start of one, and
-        // it is also why the "Sửa" button is missing — which on its own looks
-        // like a broken button.
         let truncated = matches!(
             previewing.content,
             Some(Preview::Text(_)) | Some(Preview::Table(_))
         ) && !self.preview_is_whole();
-        // The total is already at the end of the title row, so this says the
-        // part the title cannot: how much of it is here, and what that costs.
-        let cut_note: SharedString =
-            format!("Chỉ hiện {limit_mb} MB đầu — không sửa trực tiếp được").into();
-        // No type here. The extension is already in the name directly above it,
-        // and repeating it as `TXT · 31 B` reads like a debug line.
+        let preview_note: SharedString = if truncated {
+            format!("Chỉ hiện {limit_mb} MB đầu — không sửa trực tiếp được").into()
+        } else if previewing.content.is_none() {
+            "Đang tải nội dung".into()
+        } else if self.preview_is_whole() {
+            "Toàn bộ object".into()
+        } else {
+            "Xem trước".into()
+        };
         let size_text: SharedString = format_size(previewing.size).into();
         let editable = previewing.editing.is_none()
             && matches!(previewing.content, Some(Preview::Text(_)))
             && self.preview_is_whole();
+        let modified_text = self
+            .entries
+            .iter()
+            .find(|entry| entry.key == previewing.key)
+            .and_then(|entry| entry.modified_epoch)
+            .map(format_timestamp)
+            .unwrap_or_else(|| "Không rõ".into());
+        let content_type = self
+            .inspector
+            .as_ref()
+            .filter(|inspector| inspector.key == previewing.key)
+            .and_then(|inspector| inspector.head.as_ref())
+            .and_then(|head| head.content_type.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| kind.to_string());
+        let state_text: SharedString = if truncated {
+            format!("Giới hạn {limit_mb} MB").into()
+        } else if previewing.content.is_none() {
+            "Đang tải".into()
+        } else if self.preview_is_whole() {
+            "Đủ nội dung".into()
+        } else {
+            "Xem nhanh".into()
+        };
+        let preview_inspector = self
+            .inspector
+            .as_ref()
+            .filter(|inspector| inspector.key == previewing.key);
+        let head_loading = preview_inspector.is_some_and(|inspector| inspector.loading);
+        let preview_head = preview_inspector.and_then(|inspector| inspector.head.as_ref());
+        let preview_acl = preview_inspector.and_then(|inspector| inspector.acl.clone());
+        let preview_tags = preview_inspector
+            .map(|inspector| inspector.tags.clone())
+            .unwrap_or_default();
+        let acl_support = self.acl_support();
+        let acl_supported = acl_support.map(Support::is_usable).unwrap_or(true);
+        let acl_unavailable = acl_unavailable_copy(acl_support);
+        let preview_acl_target = acl_target_label(self.selected_object_keys().len().max(1));
+
+        let preview_content = if let Some(editor) = previewing.editing.clone() {
+            div()
+                .font_family(self.mono_font.clone())
+                .text_xs()
+                .child(Input::new(&editor).h(px(PREVIEW_BODY_HEIGHT - 48.)))
+                .when(previewing.saving, |this| {
+                    this.child(
+                        div()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("Đang lưu…"),
+                    )
+                })
+                .into_any_element()
+        } else {
+            match previewing.content.as_ref() {
+                None => div()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("Đang tải…")
+                    .into_any_element(),
+                Some(Preview::Image(image)) => div()
+                    .relative()
+                    .h_full()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(
+                        gpui::img(image.clone())
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .blur(px(18.))
+                            .opacity(0.28),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .bg(preview_veil(theme))
+                            .opacity(0.76),
+                    )
+                    .child(
+                        gpui::img(image.clone())
+                            .max_w_full()
+                            .max_h(px(PREVIEW_BODY_HEIGHT - 48.))
+                            .object_fit(ObjectFit::Contain)
+                            .rounded_lg(),
+                    )
+                    .into_any_element(),
+                Some(Preview::Text(text)) => div()
+                    .font_family(self.mono_font.clone())
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child(text.clone())
+                    .into_any_element(),
+                Some(Preview::Table(table)) => {
+                    render_table(table, self.mono_font.clone(), theme).into_any_element()
+                }
+                Some(Preview::Handoff(reason)) => div()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(64.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(theme.hover)
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child(kind.clone()),
+                    )
+                    .child(div().text_color(theme.text).child(reason.clone()))
+                    .into_any_element(),
+            }
+        };
+
+        let preview_detail_body = div()
+            .id("preview-detail-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                preview_detail_section("THUỘC TÍNH", theme)
+                    .child(preview_detail_row("Loại", content_type, theme))
+                    .child(preview_detail_row("Cỡ", size_text.to_string(), theme))
+                    .child(preview_detail_row("Sửa đổi", modified_text, theme))
+                    .child(preview_detail_row(
+                        "Trạng thái",
+                        state_text.to_string(),
+                        theme,
+                    ))
+                    .when_some(
+                        preview_head.and_then(|head| head.storage_class.clone()),
+                        |this, value| this.child(preview_detail_row("Lớp lưu trữ", value, theme)),
+                    )
+                    .when_some(
+                        preview_head.and_then(|head| head.cache_control.clone()),
+                        |this, value| this.child(preview_detail_row("Cache", value, theme)),
+                    )
+                    .when_some(
+                        preview_head.and_then(|head| head.content_disposition.clone()),
+                        |this, value| this.child(preview_detail_row("Trả về", value, theme)),
+                    )
+                    .when_some(
+                        preview_head
+                            .and_then(|head| head.etag.clone())
+                            .map(|etag| elide_middle(&etag.replace('"', ""), 28)),
+                        |this, value| this.child(preview_detail_row("ETag", value, theme)),
+                    )
+                    .when(head_loading, |this| {
+                        this.child(
+                            div()
+                                .text_color(theme.text_faint)
+                                .child("Đang đọc thêm metadata…"),
+                        )
+                    }),
+            )
+            .when_some(acl_unavailable, |this, (summary, detail)| {
+                this.child(
+                    preview_detail_section("QUYỀN TRUY CẬP", theme)
+                        .child(acl_unavailable_notice(summary, detail, theme)),
+                )
+            })
+            .when(acl_supported, |this| {
+                let public = preview_acl
+                    .as_ref()
+                    .is_some_and(|acl| acl.grants.iter().any(|grant| grant.public));
+                let section = preview_detail_section("QUYỀN TRUY CẬP", theme).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(acl_status_chip(public, theme))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(preview_acl_target.clone())),
+                        ),
+                );
+
+                let section = if let Some(acl) = preview_acl {
+                    section
+                        .child(preview_detail_row(
+                            "Chủ sở hữu",
+                            elide_middle(&acl.owner, 28),
+                            theme,
+                        ))
+                        .child(
+                            action_button("preview-acl-table", "Bảng quyền", theme).on_click(
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.acl_popup_open = true;
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                } else {
+                    section.child(div().text_color(theme.text_faint).child(if head_loading {
+                        "Đang đọc ACL…"
+                    } else {
+                        "Chưa có ACL đọc được, vẫn có thể thử đặt ACL canned."
+                    }))
+                };
+
+                this.child(
+                    section
+                        .child(div().text_color(theme.text_faint).child("Preset nhanh"))
+                        .child(div().flex().flex_wrap().gap_1().children(
+                            s3core::CANNED_ACLS.iter().map(|(canned, label)| {
+                                let canned = *canned;
+                                action_button_dyn(
+                                    SharedString::from(format!("preview-acl-{canned}")),
+                                    SharedString::from(*label),
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| this.set_acl(canned, cx),
+                                ))
+                            }),
+                        )),
+                )
+            })
+            .when(self.supports(|caps| caps.tagging), |this| {
+                this.child(
+                    preview_detail_section("THẺ", theme)
+                        .child(div().flex().items_center().justify_end().child(
+                            action_button("preview-add-tag", "Thêm", theme).on_click(cx.listener(
+                                |this, _event, window, cx| {
+                                    this.open_form(FormKind::AddTag, window, cx)
+                                },
+                            )),
+                        ))
+                        .children(preview_tags.iter().map(|(name, value)| {
+                            div()
+                                .text_color(theme.text)
+                                .child(SharedString::from(format!("{name} = {value}")))
+                        }))
+                        .when(preview_tags.is_empty(), |this| {
+                            this.child(div().text_color(theme.text_faint).child("Chưa có thẻ nào"))
+                        }),
+                )
+            });
+
+        let preview_detail = div()
+            .id("preview-detail")
+            .w(px(PREVIEW_SIDE_WIDTH))
+            .h(px(PREVIEW_BODY_HEIGHT - 24.))
+            .flex_shrink_0()
+            .rounded_lg()
+            .bg(preview_veil(theme))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .overflow_hidden()
+            .text_xs()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .size(px(30.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_lg()
+                                    .bg(theme.hover)
+                                    .text_color(theme.text_muted)
+                                    .child(kind.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        ellipsis_text(
+                                            SharedString::from(format!(
+                                                "preview-detail-name-{}",
+                                                animation_key_hash(&previewing.key)
+                                            )),
+                                            previewing.name.clone(),
+                                            32,
+                                            theme.text,
+                                        )
+                                        .text_xs(),
+                                    )
+                                    .child(div().text_color(theme.text_faint).child(preview_note)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(
+                                detail_action_button(
+                                    "preview-edit-headers",
+                                    "Headers",
+                                    "rename",
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, window, cx| this.start_edit_headers(window, cx),
+                                )),
+                            )
+                            .child(
+                                detail_action_button("preview-share", "Chia sẻ", "link", theme)
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.start_share_current(cx)
+                                    })),
+                            )
+                            .child(
+                                detail_action_button(
+                                    "preview-open-external",
+                                    "Mở app",
+                                    "external",
+                                    theme,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.open_externally(cx)
+                                    }),
+                                ),
+                            )
+                            .child(
+                                detail_action_button(
+                                    "preview-download",
+                                    "Tải xuống",
+                                    "download",
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| this.download_current_detail(cx),
+                                )),
+                            ),
+                    ),
+            )
+            .child(preview_detail_body);
 
         Some(
             div()
@@ -6277,43 +7459,41 @@ impl Browser {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui::hsla(0., 0., 0., 0.55))
+                .bg(gpui::hsla(0., 0., 0., 0.38))
+                .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _event, _window, cx| this.close_preview(cx)))
                 .child(
                     div()
                         .id("preview")
                         .w(px(PREVIEW_WIDTH))
-                        .max_h(px(PREVIEW_HEIGHT))
+                        .h(px(PREVIEW_HEIGHT))
                         .flex()
                         .flex_col()
                         .rounded_xl()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
+                        .bg(preview_shell(theme))
+                        .overflow_hidden()
+                        .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .h(px(HEADER_HEIGHT))
+                                .h(px(PREVIEW_TITLE_HEIGHT))
                                 .flex_shrink_0()
                                 .px_3()
                                 .flex()
                                 .items_center()
                                 .gap_3()
-                                .border_b_1()
-                                .border_color(theme.border)
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_color(theme.text)
-                                        .child(previewing.name.clone()),
-                                )
-                                // The size sits quietly at the end of the title
-                                // row, ahead of the buttons: half of "is this
-                                // the file I wanted" is how big it is, and it
-                                // does not deserve a line of its own.
+                                .bg(preview_veil(theme))
+                                .rounded_tl(px(12.))
+                                .rounded_tr(px(12.))
+                                .child(div().flex_1().min_w(px(0.)).text_sm().child(ellipsis_text(
+                                    SharedString::from(format!(
+                                        "preview-title-{}",
+                                        animation_key_hash(&previewing.key)
+                                    )),
+                                    previewing.name.clone(),
+                                    64,
+                                    theme.text,
+                                )))
                                 .child(
                                     div()
                                         .text_xs()
@@ -6321,10 +7501,6 @@ impl Browser {
                                         .text_color(theme.text_faint)
                                         .child(size_text),
                                 )
-                                // Only for text, and only when the whole object
-                                // is here. Editing a preview that stopped at the
-                                // limit and saving it back would delete the rest
-                                // of the file.
                                 .when(editable, |this| {
                                     this.child(
                                         action_button("preview-edit", "Sửa", theme).on_click(
@@ -6334,11 +7510,6 @@ impl Browser {
                                         ),
                                     )
                                 })
-                                // A way out that is not "save" and not "close
-                                // the whole thing": backing out of an edit and
-                                // still being able to read the file is the
-                                // ordinary case, and closing the modal to do it
-                                // loses your place in the list.
                                 .when(previewing.editing.is_some(), |this| {
                                     this.child(
                                         action_button("preview-cancel", "Huỷ", theme).on_click(
@@ -6355,169 +7526,40 @@ impl Browser {
                                         ),
                                     )
                                 })
-                                .child(
-                                    icon_button("preview-close", "close", theme).on_click(
-                                        cx.listener(|this, _event, _window, cx| {
-                                            this.close_preview(cx)
-                                        }),
-                                    ),
-                                ),
+                                .child(icon_button("preview-close", "close", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| this.close_preview(cx)),
+                                )),
                         )
-                        // A strip of its own, between the title and the text
-                        // it is about.
-                        .when(truncated, |this| {
-                            this.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(theme.hover)
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .text_xs()
-                                    .text_color(theme.text_muted)
-                                    .child(cut_note),
-                            )
-                        })
                         .child(
                             div()
                                 .id("preview-body")
-                                .flex_1()
+                                .h(px(PREVIEW_BODY_HEIGHT))
                                 .min_h(px(0.))
-                                .overflow_scroll()
                                 .p_3()
-                                .when_some(previewing.editing.clone(), |this, editor| {
-                                    this.child(
-                                        div()
-                                            .font_family(self.mono_font.clone())
-                                            .text_xs()
-                                            // Height on the element, not rows
-                                            // on the state: `rows` did nothing
-                                            // here and the box came out one
-                                            // line tall with the rest of the
-                                            // file hidden behind it.
-                                            .child(Input::new(&editor).h(px(EDITOR_HEIGHT))),
-                                    )
-                                })
-                                .when(previewing.editing.is_some(), |this| {
-                                    this.when(previewing.saving, |this| {
-                                        this.child(
-                                            div()
-                                                .pt_2()
-                                                .text_xs()
-                                                .text_color(theme.text_muted)
-                                                .child("Đang lưu…"),
-                                        )
-                                    })
-                                })
-                                .when(previewing.editing.is_none(), |this| {
-                                this.child(match previewing.content.as_ref() {
-                                    None => div()
-                                        .text_xs()
-                                        .text_color(theme.text_faint)
-                                        .child("Đang tải…")
-                                        .into_any_element(),
-                                    // Centred and bounded. Left to itself a
-                                    // tall image runs past the bottom of the
-                                    // modal and a small one sits in the corner.
-                                    Some(Preview::Image(image)) => div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            gpui::img(image.clone())
-                                                .max_w_full()
-                                                .max_h(px(PREVIEW_HEIGHT - 140.)),
-                                        )
-                                        .into_any_element(),
-                                    Some(Preview::Text(text)) => div()
-                                        .font_family(self.mono_font.clone())
-                                        .text_xs()
-                                        .text_color(theme.text_muted)
-                                        .child(text.clone())
-                                        .into_any_element(),
-                                    Some(Preview::Table(table)) => {
-                                        render_table(table, self.mono_font.clone(), theme)
-                                            .into_any_element()
-                                    }
-                                    // Nothing to draw, but every one of these
-                                    // has a viewer on the machine. Naming the
-                                    // type, saying why, and offering the door
-                                    // beats a flat "cannot" with nowhere to go.
-                                    Some(Preview::Handoff(reason)) => div()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .gap_1()
-                                        .py_8()
-                                        .child(
-                                            // A file-type tile: the same shape
-                                            // whatever the file is, readable at
-                                            // a glance, and it fills a panel
-                                            // that would otherwise be one
-                                            // apologetic sentence in the middle
-                                            // of a lot of nothing.
-                                            div()
-                                                .size(px(64.))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_md()
-                                                .bg(theme.hover)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .text_xs()
-                                                .text_color(theme.text_muted)
-                                                .child(kind.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .pt_2()
-                                                .text_color(theme.text)
-                                                .child(reason.clone()),
-                                        )
-                                        // No size here: the header already
-                                        // carries type and size, and printing
-                                        // it twice in one dialog reads as two
-                                        // different facts that happen to agree.
-                                        // Nothing to open and nothing to save
-                                        // when there are no bytes.
-                                        .when(previewing.size > 0, |this| {
-                                            this.child(
-                                                div()
-                                                    .pt_3()
-                                                    .flex()
-                                                    .gap_2()
-                                                    .child(
-                                                        action_button(
-                                                            "preview-open-external",
-                                                            "Mở bằng app",
-                                                            theme,
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.open_externally(cx)
-                                                            },
-                                                        )),
-                                                    )
-                                                    .child(
-                                                        action_button(
-                                                            "preview-download",
-                                                            "Tải xuống",
-                                                            theme,
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.download_selection(cx)
-                                                            },
-                                                        )),
-                                                    ),
-                                            )
-                                        })
-                                        .into_any_element(),
-                                })
-                                }),
+                                .flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .id("preview-content")
+                                        .h(px(PREVIEW_BODY_HEIGHT - 24.))
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .rounded_lg()
+                                        .bg(preview_veil(theme))
+                                        .overflow_scroll()
+                                        .p_3()
+                                        .child(preview_content),
+                                )
+                                .child(preview_detail),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "preview-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -6567,38 +7609,65 @@ impl Browser {
                             // No note: the chip says "Theo hệ thống", which is
                             // the only part that needed explaining.
                             None,
-                            div().flex().gap_1().children(
-                                ThemeChoice::ALL.into_iter().map(|choice| {
+                            div()
+                                .flex()
+                                .gap_1()
+                                .children(ThemeChoice::ALL.into_iter().map(|choice| {
                                     choice_chip(
                                         SharedString::from(format!("theme-{}", choice.label())),
                                         choice.label().into(),
                                         settings.theme == choice,
                                         theme,
                                     )
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.update_settings(|s| s.theme = choice, cx)
-                                    }))
-                                }),
-                            ),
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            this.update_settings(|s| s.theme = choice, cx)
+                                        },
+                                    ))
+                                })),
+                            theme,
+                        ))
+                        .child(setting_row(
+                            "Chuyển động",
+                            Some("Ảnh hưởng tới mở panel và danh sách"),
+                            div()
+                                .flex()
+                                .gap_1()
+                                .children(MotionChoice::ALL.into_iter().map(|choice| {
+                                    choice_chip(
+                                        SharedString::from(format!("motion-{}", choice.label())),
+                                        choice.label().into(),
+                                        settings.motion == choice,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            this.update_settings(|s| s.motion = choice, cx)
+                                        },
+                                    ))
+                                })),
                             theme,
                         ))
                         .child(settings_group("TRUYỀN TẢI", theme))
                         .child(setting_row(
                             "Băng thông",
                             Some("Trần cho cả hàng đợi"),
-                            div().flex().gap_1().children(
-                                BANDWIDTH_PRESETS.into_iter().map(|limit| {
+                            div()
+                                .flex()
+                                .gap_1()
+                                .children(BANDWIDTH_PRESETS.into_iter().map(|limit| {
                                     choice_chip(
                                         SharedString::from(format!("bw-{limit}")),
                                         SharedString::from(bandwidth_label(limit)),
                                         settings.bandwidth_limit == limit,
                                         theme,
                                     )
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.update_settings(|s| s.bandwidth_limit = limit, cx)
-                                    }))
-                                }),
-                            ),
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            this.update_settings(|s| s.bandwidth_limit = limit, cx)
+                                        },
+                                    ))
+                                })),
                             theme,
                         ))
                         .child(setting_row(
@@ -6609,17 +7678,21 @@ impl Browser {
                             // means taking permits back from work in flight.
                             Some("Áp dụng từ lần mở app sau"),
                             div().flex().gap_1().children(
-                                crate::settings::JOB_CONCURRENCY_CHOICES.into_iter().map(|n| {
-                                    choice_chip(
-                                        SharedString::from(format!("jobs-{n}")),
-                                        SharedString::from(n.to_string()),
-                                        settings.job_concurrency == n,
-                                        theme,
-                                    )
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.update_settings(|s| s.job_concurrency = n, cx)
-                                    }))
-                                }),
+                                crate::settings::JOB_CONCURRENCY_CHOICES
+                                    .into_iter()
+                                    .map(|n| {
+                                        choice_chip(
+                                            SharedString::from(format!("jobs-{n}")),
+                                            SharedString::from(n.to_string()),
+                                            settings.job_concurrency == n,
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.update_settings(|s| s.job_concurrency = n, cx)
+                                            }),
+                                        )
+                                    }),
                             ),
                             theme,
                         ))
@@ -6640,9 +7713,11 @@ impl Browser {
                                         settings.preview_limit_mb == mb,
                                         theme,
                                     )
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.update_settings(|s| s.preview_limit_mb = mb, cx)
-                                    }))
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            this.update_settings(|s| s.preview_limit_mb = mb, cx)
+                                        },
+                                    ))
                                 }),
                             ),
                             theme,
@@ -6676,26 +7751,33 @@ impl Browser {
                                     SharedString::from(elide_middle(&shown, 44)),
                                     theme,
                                 )
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if let Err(error) = opener::open(&dir) {
-                                        this.report(format!("Không mở được thư mục: {error}"));
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        if let Err(error) = opener::open(&dir) {
+                                            this.report(format!("Không mở được thư mục: {error}"));
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
                                 theme,
                             ))
                         })
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .child(action_button("settings-close", "Xong", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.settings_open = false;
-                                        cx.notify();
-                                    }),
-                                )),
-                        ),
+                        .child(div().flex().justify_end().child(
+                            action_button("settings-close", "Xong", theme).on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.settings_open = false;
+                                    cx.notify();
+                                },
+                            )),
+                        )),
+                )
+                .transition_opacity_and_offset(
+                    "settings-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -6815,17 +7897,22 @@ impl Browser {
                             crash_dir,
                             cx,
                         ))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .child(action_button("about-close", "Xong", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.about_open = false;
-                                        cx.notify();
-                                    }),
-                                )),
-                        ),
+                        .child(div().flex().justify_end().child(
+                            action_button("about-close", "Xong", theme).on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.about_open = false;
+                                    cx.notify();
+                                },
+                            )),
+                        )),
+                )
+                .transition_opacity_and_offset(
+                    "about-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -6898,6 +7985,26 @@ impl Browser {
                                             .child(
                                                 icon_button_dyn(
                                                     SharedString::from(format!(
+                                                        "edit-profile-{}",
+                                                        profile.id
+                                                    )),
+                                                    "rename",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, window, cx| {
+                                                        this.profiles_open = false;
+                                                        this.open_form(
+                                                            FormKind::EditProfile(index),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                icon_button_dyn(
+                                                    SharedString::from(format!(
                                                         "rm-profile-{}",
                                                         profile.id
                                                     )),
@@ -6939,6 +8046,14 @@ impl Browser {
                                     }),
                                 )),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "profiles-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -6982,10 +8097,11 @@ impl Browser {
                     .when_some(bucket.clone(), |this, bucket| {
                         let target = bucket.clone();
                         this.child(
-                            crumb(SharedString::from(format!("crumb-root")), bucket, theme)
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                            crumb(SharedString::from("crumb-root"), bucket, theme).on_click(
+                                cx.listener(move |this, _event, _window, cx| {
                                     this.open(target.clone(), String::new(), cx);
-                                })),
+                                }),
+                            ),
                         )
                     })
                     // `…` for the levels that were dropped. Not dead text: it
@@ -6994,13 +8110,9 @@ impl Browser {
                     // would only put the overflow back.
                     .when(collapsed, |this| {
                         this.child(div().text_color(theme.text_faint).text_sm().child("/"))
-                            .child(
-                                crumb("crumb-more".into(), "…".into(), theme).on_click(
-                                    cx.listener(|this, _event, window, cx| {
-                                        this.edit_path(window, cx)
-                                    }),
-                                ),
-                            )
+                            .child(crumb("crumb-more".into(), "…".into(), theme).on_click(
+                                cx.listener(|this, _event, window, cx| this.edit_path(window, cx)),
+                            ))
                     })
                     .children(shown.into_iter().map(|(name, prefix)| {
                         let bucket = bucket.clone();
@@ -7010,16 +8122,12 @@ impl Browser {
                             .gap_0p5()
                             .child(div().text_color(theme.text_faint).text_sm().child("/"))
                             .child(
-                                crumb(
-                                    SharedString::from(format!("crumb-{prefix}")),
-                                    name,
-                                    theme,
-                                )
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if let Some(bucket) = bucket.clone() {
-                                        this.open(bucket, prefix.clone(), cx);
-                                    }
-                                })),
+                                crumb(SharedString::from(format!("crumb-{prefix}")), name, theme)
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        if let Some(bucket) = bucket.clone() {
+                                            this.open(bucket, prefix.clone(), cx);
+                                        }
+                                    })),
                             )
                     }))
                     .child(div().flex_1()),
@@ -7036,10 +8144,14 @@ impl Browser {
                     .is_some_and(|place| self.places.is_favorite(&place));
                 this.child(
                     icon_button("pin", "star", theme)
-                        .text_color(if pinned { theme.accent } else { theme.text_faint })
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.toggle_favorite(cx)
-                        })),
+                        .text_color(if pinned {
+                            theme.accent
+                        } else {
+                            theme.text_faint
+                        })
+                        .on_click(
+                            cx.listener(|this, _event, _window, cx| this.toggle_favorite(cx)),
+                        ),
                 )
             })
             .when_some(self.filter_input.clone(), |this, input| {
@@ -7091,41 +8203,70 @@ impl Browser {
             })
             .when(bucket.is_some(), |this| {
                 this.child(
+                    div()
+                        .h(px(BUTTON_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(theme.hover)
+                        .child(
+                            icon_button("layout-list", "list", theme)
+                                .h(px(BUTTON_HEIGHT))
+                                .w(px(BUTTON_HEIGHT))
+                                .when(self.layout == LayoutMode::List, |this| {
+                                    this.bg(theme.selected)
+                                })
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Hiển thị dạng danh sách").build(window, cx)
+                                })
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.layout = LayoutMode::List;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            icon_button("layout-grid", "grid", theme)
+                                .h(px(BUTTON_HEIGHT))
+                                .w(px(BUTTON_HEIGHT))
+                                .when(self.layout == LayoutMode::Grid, |this| {
+                                    this.bg(theme.selected)
+                                })
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Hiển thị dạng lưới").build(window, cx)
+                                })
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.layout = LayoutMode::Grid;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(bucket.is_some(), |this| {
+                this.child(
                     action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
                         |this, _event, window, cx| this.open_form(FormKind::NewFolder, window, cx),
                     )),
                 )
             })
-
-            .when(self.selection.len() == 1, |this| {
-                this.child(
-                    action_button("rename", "Đổi tên", theme).on_click(cx.listener(
-                        |this, _event, window, cx| this.start_rename(window, cx),
-                    )),
-                )
-                .child(
-                    icon_button("share", "link", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.start_share(cx),
-                    )),
-                )
-                .child(
-                    icon_button("inspect", "info", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.toggle_inspector(cx),
-                    )),
-                )
-            })
             .when(!self.selection.is_empty(), |this| {
                 let count = self.selection.len();
-                this.child(
-                    icon_button("download", "download", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.download_selection(cx),
-                    )),
-                )
+                let object_count = self.selected_object_keys().len();
+                this.when(object_count > 0, |this| {
+                    this.child(
+                        icon_button("selection-details", "info", theme)
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Chi tiết / phân quyền").build(window, cx)
+                            })
+                            .on_click(
+                                cx.listener(|this, _event, _window, cx| this.open_inspector(cx)),
+                            ),
+                    )
+                })
                 .child(
                     danger_button("delete", SharedString::from(format!("Xoá {count}")), theme)
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.ask_delete_selection(cx)
-                        })),
+                        .on_click(
+                            cx.listener(|this, _event, _window, cx| this.ask_delete_selection(cx)),
+                        ),
                 )
             })
             // Every command, reachable with a mouse. The palette holds the ones
@@ -7134,8 +8275,9 @@ impl Browser {
             // only door to them was ⌘K, which is to say no door at all for
             // anyone who does not already know it is there.
             .child(
-                icon_button("commands", "more", theme)
-                    .on_click(cx.listener(|this, _event, window, cx| this.open_palette(window, cx))),
+                icon_button("commands", "more", theme).on_click(
+                    cx.listener(|this, _event, window, cx| this.open_palette(window, cx)),
+                ),
             )
     }
 
@@ -7158,6 +8300,109 @@ impl Browser {
             .flatten()
             .cloned();
         let has_failure = failure.is_some();
+        let bucket_scoped = failure
+            .as_ref()
+            .is_some_and(|failure| failure.fix == Some(Fix::OpenBucketByName));
+
+        if bucket_scoped {
+            let known = self.known_bucket_shortcuts();
+            return Some(div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(520.))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_xl()
+                        .bg(theme.modal)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(sized_icon("bucket", 18., theme.accent))
+                                .child(
+                                    div()
+                                        .text_color(theme.text)
+                                        .child("Profile này không được liệt kê bucket"),
+                                ),
+                        )
+                        .child(div().text_xs().child(wrapped_text(
+                            "Kết nối đã thành công, nhưng token không có quyền ListBuckets. Nếu token được cấp quyền trên một vài bucket cụ thể, mở trực tiếp bằng tên bucket hoặc s3://bucket/prefix/.",
+                            68,
+                            theme.text_muted,
+                        )))
+                        .when(!known.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.text_faint)
+                                            .child("Bucket đã biết"),
+                                    )
+                                    .child(
+                                        div().flex().flex_wrap().gap_2().children(
+                                            known.into_iter().map(|bucket| {
+                                                let target = bucket.clone();
+                                                action_button_dyn(
+                                                    SharedString::from(format!(
+                                                        "known-bucket-{bucket}"
+                                                    )),
+                                                    bucket,
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        this.open(
+                                                            target.clone(),
+                                                            String::new(),
+                                                            cx,
+                                                        )
+                                                    },
+                                                ))
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    action_button("scoped-open-bucket", "Mở bucket theo tên", theme)
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            this.open_form(FormKind::OpenBucket, window, cx)
+                                        })),
+                                )
+                                .child(action_button("scoped-errors", "Xem lỗi", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.failures_open = true;
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                )
+                .transition_opacity_and_offset(
+                    "scoped-bucket-state-in",
+                    smooth_transition(MOTION_QUICK_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, 6.0),
+                    motion_offset(0.0, 0.0),
+                ));
+        }
 
         Some(
             div()
@@ -7196,18 +8441,18 @@ impl Browser {
                                 .and_then(|failure| failure.fix)
                                 .filter(|fix| *fix != Fix::OpenBucketByName),
                             |this, fix| {
-                            this.child(
-                                action_button_dyn(
-                                    "empty-fix".into(),
-                                    SharedString::from(fix.label()),
-                                    theme,
+                                this.child(
+                                    action_button_dyn(
+                                        "empty-fix".into(),
+                                        SharedString::from(fix.label()),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _event, window, cx| {
+                                            this.apply_fix(fix, window, cx)
+                                        },
+                                    )),
                                 )
-                                .on_click(cx.listener(
-                                    move |this, _event, window, cx| {
-                                        this.apply_fix(fix, window, cx)
-                                    },
-                                )),
-                            )
                             },
                         )
                         // Always reachable, whatever the failure was: a bucket
@@ -7220,15 +8465,21 @@ impl Browser {
                                 })),
                         )
                         .when(has_failure, |this| {
-                            this.child(
-                                action_button("empty-errors", "Xem lỗi", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.failures_open = true;
-                                        cx.notify();
-                                    }),
-                                ),
-                            )
+                            this.child(action_button("empty-errors", "Xem lỗi", theme).on_click(
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.failures_open = true;
+                                    cx.notify();
+                                }),
+                            ))
                         }),
+                )
+                .transition_opacity_and_offset(
+                    "bucket-empty-state-in",
+                    smooth_transition(MOTION_QUICK_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, 6.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -7236,6 +8487,34 @@ impl Browser {
     fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let sort = self.sort;
+        if self.layout == LayoutMode::Grid {
+            let chip = |key: SortKey, label: &'static str| {
+                let active = sort.key == key;
+                choice_chip(
+                    SharedString::from(format!("grid-sort-{label}")),
+                    SharedString::from(label),
+                    active,
+                    theme,
+                )
+                .on_click(cx.listener(move |this, _event, _window, cx| this.toggle_sort(key, cx)))
+            };
+            return div()
+                .h(px(HEADER_HEIGHT))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .border_b_1()
+                .border_color(theme.border_strong)
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child("Sắp xếp")
+                .child(chip(SortKey::Name, "Tên"))
+                .child(chip(SortKey::Size, "Kích thước"))
+                .child(chip(SortKey::Modified, "Sửa đổi"))
+                .child(div().flex_1())
+                .child(SharedString::from(format!("{} cột", GRID_COLUMNS)));
+        }
         let all_selected = !self.visible.is_empty()
             && self
                 .visible
@@ -7297,9 +8576,11 @@ impl Browser {
                     .cursor_pointer()
                     .child(check_box(all_selected, theme))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        if this.visible.iter().all(|&index| {
-                            this.selection.contains(&this.entries[index].key)
-                        }) {
+                        if this
+                            .visible
+                            .iter()
+                            .all(|&index| this.selection.contains(&this.entries[index].key))
+                        {
                             this.selection.clear();
                             cx.notify();
                         } else {
@@ -7308,11 +8589,11 @@ impl Browser {
                     })),
             )
             .child(div().w(px(22.)))
-            .child(
-                div().flex_1().min_w(px(NAME_MIN_WIDTH)).child(header(SortKey::Name, "Tên").on_click(
+            .child(div().flex_1().min_w(px(NAME_MIN_WIDTH)).child(
+                header(SortKey::Name, "Tên").on_click(
                     cx.listener(|this, _event, _window, cx| this.toggle_sort(SortKey::Name, cx)),
-                )),
-            )
+                ),
+            ))
             .child(
                 div()
                     .w(px(TYPE_WIDTH))
@@ -7321,9 +8602,11 @@ impl Browser {
                     .child("Loại"),
             )
             .child(
-                div().w(px(84.)).child(header(SortKey::Size, "Kích thước").on_click(
-                    cx.listener(|this, _event, _window, cx| this.toggle_sort(SortKey::Size, cx)),
-                )),
+                div()
+                    .w(px(84.))
+                    .child(header(SortKey::Size, "Kích thước").on_click(cx.listener(
+                        |this, _event, _window, cx| this.toggle_sort(SortKey::Size, cx),
+                    ))),
             )
             .child(
                 div()
@@ -7364,12 +8647,10 @@ impl Browser {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(div().flex_1().min_h(px(0.)).child(self.render_rows(cx)))
-            // Paging appends to a list already on screen, so it gets a line
-            // under the rows rather than replacing them with placeholders.
-            .when(self.loading_more, |this| {
-                this.child(loading_strip("Đang tải thêm…", theme))
-            })
+            .child(div().flex_1().min_h(px(0.)).child(match self.layout {
+                LayoutMode::List => self.render_rows(cx).into_any_element(),
+                LayoutMode::Grid => self.render_grid(cx).into_any_element(),
+            }))
             .into_any_element()
     }
 
@@ -7403,6 +8684,16 @@ impl Browser {
             .child(SharedString::from(format!(
                 "{folders} thư mục, {files} tệp"
             )))
+            .when(self.loading_more, |this| {
+                this.child(status_divider(theme)).child(
+                    div().child("Đang tải thêm…").transition_opacity(
+                        "list-loading-more",
+                        smooth_transition(MOTION_QUICK_MS),
+                        0.35,
+                        1.0,
+                    ),
+                )
+            })
     }
 
     /// Why the list is empty. An empty prefix and a filter that matched nothing
@@ -7451,6 +8742,14 @@ impl Browser {
                         )
                     }),
                 ))
+                .transition_opacity_and_offset(
+                    "search-empty-state-in",
+                    smooth_transition(MOTION_QUICK_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, 6.0),
+                    motion_offset(0.0, 0.0),
+                )
                 .into_any_element();
         }
 
@@ -7489,6 +8788,14 @@ impl Browser {
                     ),
                 )
             })
+            .transition_opacity_and_offset(
+                "listing-empty-state-in",
+                smooth_transition(MOTION_QUICK_MS),
+                0.0,
+                1.0,
+                motion_offset(0.0, 6.0),
+                motion_offset(0.0, 0.0),
+            )
             .into_any_element()
     }
 
@@ -7535,9 +8842,16 @@ impl Browser {
                     )
                 })
                 .child(
-                    action_button("search-exit", "Thoát", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| this.exit_search(cx),
-                    )),
+                    action_button("search-exit", "Thoát", theme)
+                        .on_click(cx.listener(|this, _event, _window, cx| this.exit_search(cx))),
+                )
+                .transition_opacity_and_offset(
+                    "search-strip-in",
+                    smooth_transition(MOTION_QUICK_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -4.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -7549,9 +8863,11 @@ impl Browser {
             "objects",
             self.visible.len(),
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+                this.perf.note_visible(&range);
                 this.maybe_prefetch(&range, cx);
                 this.load_thumbnails(&range, cx);
 
+                let range_end = range.end;
                 range
                     .map(|position| {
                         let entry_index = this.visible[position];
@@ -7559,17 +8875,16 @@ impl Browser {
                         let selected = this.selection.contains(&entry.key);
                         let is_cursor = this.cursor.as_deref() == Some(entry.key.as_str());
                         let is_folder = entry.is_folder;
+                        let right_click_key = entry.key.clone();
 
-                        let thumbnail = this
-                            .thumbnails
-                            .get(&entry.key)
-                            .cloned()
-                            .flatten();
+                        let thumbnail = this.thumbnails.get(&entry.key).cloned().flatten();
                         // What the menu may offer depends on the row and on the
                         // clipboard, so it is decided per row rather than once.
                         let single = this.selection.len() <= 1;
                         let can_paste = this.clipboard.is_some();
                         let acl_supported = this.supports(|caps| caps.acl);
+                        let actions_visible =
+                            selected || is_cursor || this.hovered_row == Some(position);
                         let checkbox = div()
                             .id(("check", position))
                             .w(px(CHECK_WIDTH))
@@ -7588,50 +8903,165 @@ impl Browser {
 
                         // Straight to the things worth one click, rather than
                         // select-then-travel-to-the-toolbar. Only what applies:
-                        // a folder has nothing to preview and nothing to
-                        // download as one file.
-                        let actions = div()
-                            .w(px(ACTIONS_WIDTH))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_0p5()
-                            .when(!is_folder, |this| {
-                                this.child(
-                                    row_action(("row-preview", position), "eye", theme).on_click(
-                                        cx.listener(move |this, _event, _window, cx| {
-                                            cx.stop_propagation();
-                                            this.select_only(position, cx);
-                                            this.open_preview(cx);
-                                        }),
-                                    ),
-                                )
-                                .child(
-                                    row_action(("row-download", position), "download", theme)
-                                        .on_click(cx.listener(
-                                            move |this, _event, _window, cx| {
+                        // a folder has nothing to preview or share, so its row
+                        // stays quieter. Hidden rows still reserve the column
+                        // width; showing the buttons must not shove the name.
+                        let actions = if actions_visible {
+                            let actions = div()
+                                .w(px(ACTIONS_WIDTH))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_0p5();
+
+                            let actions = if is_folder {
+                                actions
+                                    .child(
+                                        row_action(
+                                            ("row-open-tab", position),
+                                            "external",
+                                            "Mở trong tab mới",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.open_cursor_in_tab(window, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(
+                                            ("row-download", position),
+                                            "download",
+                                            "Tải xuống",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
                                                 cx.stop_propagation();
                                                 this.select_only(position, cx);
                                                 this.download_selection(cx);
-                                            },
-                                        )),
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(("row-delete", position), "trash", "Xoá", theme)
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.select_only(position, cx);
+                                                    this.ask_delete_selection(cx);
+                                                },
+                                            )),
+                                    )
+                            } else {
+                                actions
+                                    .child(
+                                        row_action(
+                                            ("row-info", position),
+                                            "info",
+                                            "Chi tiết",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.open_inspector(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(
+                                            ("row-preview", position),
+                                            "eye",
+                                            "Xem trước",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.open_preview(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(
+                                            ("row-open-external", position),
+                                            "external",
+                                            "Mở bằng app",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.open_externally(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(
+                                            ("row-share", position),
+                                            "link",
+                                            "Chia sẻ",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.start_share(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(
+                                            ("row-download", position),
+                                            "download",
+                                            "Tải xuống",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.download_selection(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        row_action(("row-delete", position), "trash", "Xoá", theme)
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.select_only(position, cx);
+                                                    this.ask_delete_selection(cx);
+                                                },
+                                            )),
+                                    )
+                            };
+
+                            actions
+                                .transition_opacity_and_offset(
+                                    SharedString::from(format!("row-actions-in-{position}")),
+                                    smooth_transition(MOTION_QUICK_MS),
+                                    0.0,
+                                    1.0,
+                                    motion_offset(5.0, 0.0),
+                                    motion_offset(0.0, 0.0),
                                 )
-                            })
-                            .child(
-                                row_action(("row-info", position), "info", theme).on_click(
-                                    cx.listener(move |this, _event, _window, cx| {
-                                        cx.stop_propagation();
-                                        this.select_only(position, cx);
-                                        if this.inspector.is_none() {
-                                            this.toggle_inspector(cx);
-                                        } else {
-                                            this.open_inspector(cx);
-                                        }
-                                    }),
-                                ),
-                            )
-                            .into_any_element();
+                                .into_any_element()
+                        } else {
+                            div()
+                                .w(px(ACTIONS_WIDTH))
+                                .flex_shrink_0()
+                                .into_any_element()
+                        };
 
                         object_row(
                             entry,
@@ -7645,130 +9075,300 @@ impl Browser {
                             actions,
                             theme,
                         )
-                            .on_click(cx.listener(
-                            move |this, event: &ClickEvent, _window, cx| {
-                                // gpui 0.2.2 has no `on_double_click`, but the click
-                                // event carries the count, so both gestures live here.
-                                if click_count(event) >= 2 {
-                                    // Selecting first means the preview and the
-                                    // inspector act on the row just opened.
-                                    this.click_row(position, event.modifiers(), cx);
-                                    if is_folder {
-                                        this.enter(entry_index, cx);
-                                    } else {
-                                        // A double-clicked file used to do
-                                        // nothing but select, which no file
-                                        // manager does.
-                                        this.quick_look(cx);
-                                    }
-                                } else {
-                                    this.click_row(position, event.modifiers(), cx);
+                        .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                            if *hovered {
+                                if this.hovered_row != Some(position) {
+                                    this.hovered_row = Some(position);
+                                    cx.notify();
                                 }
-                            },
-                        ))
-                        // Items the row cannot do are left out rather than shown
-                        // greyed: a menu of mostly-dead entries is harder to read
-                        // than a short live one.
+                            } else if this.hovered_row == Some(position) {
+                                this.hovered_row = None;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                            // gpui 0.2.2 has no `on_double_click`, but the click
+                            // event carries the count, so both gestures live here.
+                            if click_count(event) >= 2 {
+                                // Selecting first means the preview and the
+                                // inspector act on the row just opened.
+                                this.click_row(position, event.modifiers(), cx);
+                                if is_folder {
+                                    this.enter(entry_index, cx);
+                                } else {
+                                    // A double-clicked file used to do
+                                    // nothing but select, which no file
+                                    // manager does.
+                                    this.open_preview(cx);
+                                }
+                            } else {
+                                this.click_row(position, event.modifiers(), cx);
+                            }
+                        }))
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, _event, _window, cx| {
+                                if !this.selection.contains(&right_click_key) {
+                                    this.select_only(position, cx);
+                                }
+                            }),
+                        )
                         .context_menu(move |menu, _window, _cx| {
-                            let menu = menu
-                                .menu_with_icon("Chép", menu_icon("copy"), Box::new(ActionCopy))
-                                .menu_with_icon("Cắt", menu_icon("cut"), Box::new(ActionCut))
-                                .menu_with_icon_and_disabled(
-                                    "Dán",
-                                    menu_icon("paste"),
-                                    Box::new(ActionPaste),
-                                    !can_paste,
-                                )
-                                .separator();
-
-                            let menu = if single {
-                                menu.menu_with_icon(
-                                    "Đổi tên",
-                                    menu_icon("rename"),
-                                    Box::new(ActionRename),
-                                )
-                                .menu_with_icon_and_disabled(
-                                    "Nhân bản",
-                                    menu_icon("duplicate"),
-                                    Box::new(ActionDuplicate),
-                                    is_folder,
-                                )
-                            } else {
-                                menu
-                            };
-
-                            // A folder has no metadata of its own and cannot be
-                            // shared as a link, so those never appear on one.
-                            let menu = if is_folder {
-                                let menu = menu.menu_with_icon(
-                                    "Mở trong tab mới",
-                                    menu_icon("external"),
-                                    Box::new(ActionOpenInTab),
-                                );
-                                // Only where the provider has ACLs at all. On a
-                                // bucket with them switched off — the default
-                                // since 2023 — these two can only ever fail.
-                                if acl_supported {
-                                    menu.menu_with_icon(
-                                        "Đặt riêng tư cho cả thư mục",
-                                        menu_icon("eye"),
-                                        Box::new(ActionAclPrivate),
-                                    )
-                                    .menu_with_icon(
-                                        "Đặt ai cũng đọc được cho cả thư mục",
-                                        menu_icon("eye"),
-                                        Box::new(ActionAclPublic),
-                                    )
-                                } else {
-                                    menu
-                                }
-                            } else {
-                                menu.menu_with_icon(
-                                    "Xem trước",
-                                    menu_icon("eye"),
-                                    Box::new(ActionPreview),
-                                )
-                                .menu_with_icon(
-                                    "Mở bằng app",
-                                    menu_icon("external"),
-                                    Box::new(ActionOpenExternally),
-                                )
-                                .menu_with_icon("Chia sẻ", menu_icon("link"), Box::new(ActionShare))
-                                .menu_with_icon(
-                                    "Chi tiết",
-                                    menu_icon("info"),
-                                    Box::new(ActionInspect),
-                                )
-                                .menu_with_icon(
-                                    "Sửa header",
-                                    menu_icon("rename"),
-                                    Box::new(ActionEditHeaders),
-                                )
-                            };
-
-                            menu.menu_with_icon(
-                                "Tải xuống",
-                                menu_icon("download"),
-                                Box::new(ActionDownload),
-                            )
-                            .separator()
-                            // Their own group, away from "Chép": that one puts
-                            // objects on the clipboard for a paste, these two
-                            // put text on it for somewhere else entirely.
-                            .menu_with_icon(
-                                "Chép đường dẫn s3://",
-                                menu_icon("path"),
-                                Box::new(ActionCopyPath),
-                            )
-                            .menu_with_icon(
-                                "Chép key",
-                                menu_icon("copy"),
-                                Box::new(ActionCopyKey),
-                            )
-                            .separator()
-                            .menu_with_icon("Xoá", menu_icon("trash"), Box::new(ActionDelete))
+                            object_context_menu(menu, single, can_paste, is_folder, acl_supported)
                         })
+                        .transition_opacity_and_offset(
+                            SharedString::from(format!("object-row-in-{position}")),
+                            delayed_transition(
+                                MOTION_ROW_MS,
+                                row_stagger_from_end(position, range_end),
+                            ),
+                            0.0,
+                            1.0,
+                            motion_offset(0.0, -3.0),
+                            motion_offset(0.0, 0.0),
+                        )
                         .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(self.scroll.clone())
+        .h_full()
+    }
+
+    fn render_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let rows = grid_row_count(self.visible.len());
+
+        uniform_list(
+            "objects-grid",
+            rows,
+            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+                let object_start = range.start * GRID_COLUMNS;
+                let object_end = (range.end * GRID_COLUMNS).min(this.visible.len());
+                let object_range = object_start..object_end;
+                this.perf.note_visible(&object_range);
+                this.maybe_prefetch(&object_range, cx);
+                this.load_thumbnails(&object_range, cx);
+
+                range
+                    .map(|row| {
+                        let start = row * GRID_COLUMNS;
+                        let end = (start + GRID_COLUMNS).min(this.visible.len());
+                        div()
+                            .id(SharedString::from(format!("grid-row-{row}")))
+                            .h(px(GRID_ROW_HEIGHT))
+                            .w_full()
+                            .px_3()
+                            .pt_3()
+                            .flex()
+                            .gap_3()
+                            .children((start..end).map(|position| {
+                                let entry_index = this.visible[position];
+                                let entry = &this.entries[entry_index];
+                                let selected = this.selection.contains(&entry.key);
+                                let is_cursor = this.cursor.as_deref() == Some(entry.key.as_str());
+                                let is_folder = entry.is_folder;
+                                let right_click_key = entry.key.clone();
+                                let thumbnail = this.thumbnails.get(&entry.key).cloned().flatten();
+                                let single = this.selection.len() <= 1;
+                                let multi_selection = this.selection.len() > 1;
+                                let can_paste = this.clipboard.is_some();
+                                let acl_supported = this.supports(|caps| caps.acl);
+                                let actions_visible = !multi_selection
+                                    && (selected
+                                        || is_cursor
+                                        || this.hovered_row == Some(position));
+
+                                let checkbox = div()
+                                    .id(("grid-check", position))
+                                    .size(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .child(check_box(selected, theme))
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_row(position, cx);
+                                    }))
+                                    .into_any_element();
+
+                                let actions = if actions_visible {
+                                    let actions = div()
+                                        .h(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .gap_0p5();
+                                    let actions = if is_folder {
+                                        actions
+                                            .child(
+                                                row_action(
+                                                    ("grid-open-tab", position),
+                                                    "external",
+                                                    "Mở trong tab mới",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.select_only(position, cx);
+                                                        this.open_cursor_in_tab(window, cx);
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                row_action(
+                                                    ("grid-download", position),
+                                                    "download",
+                                                    "Tải xuống",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.select_only(position, cx);
+                                                        this.download_selection(cx);
+                                                    },
+                                                )),
+                                            )
+                                    } else {
+                                        actions
+                                            .child(
+                                                row_action(
+                                                    ("grid-info", position),
+                                                    "info",
+                                                    "Chi tiết",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.select_only(position, cx);
+                                                        this.open_inspector(cx);
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                row_action(
+                                                    ("grid-preview", position),
+                                                    "eye",
+                                                    "Xem trước",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.select_only(position, cx);
+                                                        this.open_preview(cx);
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                row_action(
+                                                    ("grid-download", position),
+                                                    "download",
+                                                    "Tải xuống",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.select_only(position, cx);
+                                                        this.download_selection(cx);
+                                                    },
+                                                )),
+                                            )
+                                    };
+                                    actions
+                                        .transition_opacity_and_offset(
+                                            SharedString::from(format!(
+                                                "grid-actions-in-{position}"
+                                            )),
+                                            smooth_transition(MOTION_QUICK_MS),
+                                            0.0,
+                                            1.0,
+                                            motion_offset(0.0, 4.0),
+                                            motion_offset(0.0, 0.0),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div().h(px(22.)).into_any_element()
+                                };
+
+                                object_grid_card(
+                                    entry,
+                                    RowState {
+                                        position,
+                                        selected,
+                                        cursor: is_cursor,
+                                        thumbnail,
+                                    },
+                                    checkbox,
+                                    actions,
+                                    theme,
+                                )
+                                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                                    if *hovered {
+                                        if this.hovered_row != Some(position) {
+                                            this.hovered_row = Some(position);
+                                            cx.notify();
+                                        }
+                                    } else if this.hovered_row == Some(position) {
+                                        this.hovered_row = None;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, _window, cx| {
+                                        if click_count(event) >= 2 {
+                                            this.click_row(position, event.modifiers(), cx);
+                                            if is_folder {
+                                                this.enter(entry_index, cx);
+                                            } else {
+                                                this.open_preview(cx);
+                                            }
+                                        } else {
+                                            this.click_row(position, event.modifiers(), cx);
+                                        }
+                                    },
+                                ))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Right,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        if !this.selection.contains(&right_click_key) {
+                                            this.select_only(position, cx);
+                                        }
+                                    }),
+                                )
+                                .context_menu(move |menu, _window, _cx| {
+                                    object_context_menu(
+                                        menu,
+                                        single,
+                                        can_paste,
+                                        is_folder,
+                                        acl_supported,
+                                    )
+                                })
+                                .transition_opacity_and_offset(
+                                    SharedString::from(format!("object-grid-in-{position}")),
+                                    delayed_transition(
+                                        MOTION_PAGE_MS,
+                                        grid_stagger_from_end(position, object_end),
+                                    ),
+                                    0.0,
+                                    1.0,
+                                    motion_offset(0.0, 10.0),
+                                    motion_offset(0.0, 0.0),
+                                )
+                                .into_any_element()
+                            }))
+                            .children(
+                                (end - start..GRID_COLUMNS)
+                                    .map(|_| div().flex_1().min_w(px(0.)).into_any_element()),
+                            )
+                            .into_any_element()
                     })
                     .collect::<Vec<_>>()
             }),
@@ -7807,10 +9407,7 @@ impl Browser {
             } else {
                 String::new()
             };
-            format!(
-                "{} đang chạy, {} chờ{speed}",
-                stats.active, stats.queued
-            )
+            format!("{} đang chạy, {} chờ{speed}", stats.active, stats.queued)
         } else {
             // Nothing while idle. "24 xong" sat in the bar for the rest of the
             // session after one download, and the sidebar's queue row carries
@@ -7832,9 +9429,7 @@ impl Browser {
             // under two profiles is two different places, and that is worth a
             // permanent line rather than a thing to go and check.
             .when(self.status.is_empty() && self.failures.is_empty(), |this| {
-                let profile = self
-                    .active_profile
-                    .and_then(|ix| self.profiles.get(ix));
+                let profile = self.active_profile.and_then(|ix| self.profiles.get(ix));
                 this.child(
                     div()
                         .flex_shrink_0()
@@ -7889,15 +9484,23 @@ impl Browser {
             // the right is a control or a fact, and half of one of those is
             // worth nothing.
             .child(div().flex_1().min_w(px(0.)))
+            .when_some(self.perf.label(), |this, label| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(label)),
+                )
+                .child(status_divider(theme))
+            })
             // A batch of four hundred copies takes long enough that "no way to
             // stop it" is not an acceptable answer.
             .when_some(
                 self.bulk.as_ref().filter(|bulk| bulk.running).map(|_| ()),
                 |this, ()| {
                     this.child(
-                        action_button("bulk-stop", "Dừng", theme).on_click(cx.listener(
-                            |this, _event, _window, cx| this.stop_bulk(cx),
-                        )),
+                        action_button("bulk-stop", "Dừng", theme)
+                            .on_click(cx.listener(|this, _event, _window, cx| this.stop_bulk(cx))),
                     )
                 },
             )
@@ -7908,11 +9511,9 @@ impl Browser {
             .when_some(
                 self.completing.as_ref().filter(|c| c.running).map(|_| ()),
                 |this, ()| {
-                    this.child(
-                        action_button("complete-stop", "Dừng", theme).on_click(cx.listener(
-                            |this, _event, _window, cx| this.stop_completing(cx),
-                        )),
-                    )
+                    this.child(action_button("complete-stop", "Dừng", theme).on_click(
+                        cx.listener(|this, _event, _window, cx| this.stop_completing(cx)),
+                    ))
                 },
             )
             // One pointer instead of four hints. The old strip listed ⌘F, ⌘N,
@@ -7935,9 +9536,9 @@ impl Browser {
                         "{}K lệnh",
                         platform::primary_modifier()
                     )))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.open_palette(window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.open_palette(window, cx)),
+                    ),
             )
             .child(status_divider(theme))
             // What the sidebar's queue row cannot hold. That row answers "is
@@ -8013,13 +9614,14 @@ impl Browser {
                                 bandwidth_label(self.transfers.bandwidth_limit()),
                                 theme,
                             )
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    let next = next_bandwidth_limit(
-                                        this.transfers.bandwidth_limit(),
-                                    );
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    let next =
+                                        next_bandwidth_limit(this.transfers.bandwidth_limit());
                                     this.transfers.set_bandwidth_limit(next);
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         )
                         .child(
                             action_button("clear-finished", "Xoá đã xong", theme).on_click(
@@ -8056,19 +9658,29 @@ impl Browser {
                         .flex()
                         .flex_col()
                         .child(self.render_job_header())
-                        .child(uniform_list(
-                        "transfers",
-                        lines,
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|ix| rows.get(ix).cloned())
-                                .map(|row| this.render_queue_row(row, cx))
-                                .collect::<Vec<_>>()
-                            }),
+                        .child(
+                            uniform_list(
+                                "transfers",
+                                lines,
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    range
+                                        .filter_map(|ix| rows.get(ix).cloned())
+                                        .map(|row| this.render_queue_row(row, cx))
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .flex_1(),
                         )
-                        .flex_1())
                         .into_any_element()
-                }),
+                })
+                .transition_opacity_and_offset(
+                    "transfer-drawer-in",
+                    smooth_transition(MOTION_PANEL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, 14.0),
+                    motion_offset(0.0, 0.0),
+                ),
         )
     }
 
@@ -8089,25 +9701,30 @@ impl Browser {
             (Some(head), _) => {
                 let class = head.storage_class.as_deref().unwrap_or("STANDARD");
                 let state = restore_state(head.restore.as_deref(), head.storage_class.as_deref());
+                let acl_target_count = self.selected_object_keys().len();
+                let acl_target = acl_target_label(acl_target_count);
+                let acl_support = self.acl_support();
+                let acl_supported = acl_support.map(Support::is_usable).unwrap_or(true);
+                let acl_unavailable = acl_unavailable_copy(acl_support);
 
                 div()
                     .id("inspector-body")
                     .flex_1()
-                    .overflow_hidden()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
                     .p_3()
                     .flex()
                     .flex_col()
                     .gap_3()
                     .text_xs()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
+                        inspector_section("THUỘC TÍNH", theme)
                             .child(detail_row("Kích thước", format_size(head.size), theme))
                             .child(detail_row(
                                 "Sửa đổi",
-                                head.modified_epoch.map(format_timestamp).unwrap_or_default(),
+                                head.modified_epoch
+                                    .map(format_timestamp)
+                                    .unwrap_or_default(),
                                 theme,
                             ))
                             .child(detail_row(
@@ -8138,18 +9755,19 @@ impl Browser {
                             ))
                             .child(detail_row(
                                 "ETag",
-                                elide_middle(&head.etag.clone().unwrap_or_default().replace('"', ""), 28),
+                                elide_middle(
+                                    &head.etag.clone().unwrap_or_default().replace('"', ""),
+                                    28,
+                                ),
                                 theme,
                             )),
                     )
                     // Next to the headers it edits. These three decide whether a
                     // shared link renders in a tab or lands in the downloads
                     // folder, which is not something to go hunting for.
-                    .child(
-                        action_button("edit-headers", "Sửa header", theme).on_click(cx.listener(
-                            |this, _event, window, cx| this.start_edit_headers(window, cx),
-                        )),
-                    )
+                    .child(action_button("edit-headers", "Sửa header", theme).on_click(
+                        cx.listener(|this, _event, window, cx| this.start_edit_headers(window, cx)),
+                    ))
                     // Only archived objects get the restore control, and its
                     // label says which of the three states it is in.
                     .when(state != RestoreState::NotArchived, |this| {
@@ -8171,249 +9789,253 @@ impl Browser {
                                 .into_any_element(),
                         })
                     })
-                    .when_some(inspector.acl.clone(), |this, acl| {
-                        let public = acl.grants.iter().any(|grant| grant.public);
+                    .when_some(acl_unavailable, |this, (summary, detail)| {
                         this.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(div().text_color(theme.text_faint).child("QUYỀN TRUY CẬP"))
-                                // Public is the one state worth colouring: it
-                                // means anyone on the internet can read this.
-                                .child(div().text_color(if public {
-                                    theme.danger
-                                } else {
-                                    theme.text
-                                }).child(SharedString::from(if public {
-                                    "Công khai".to_string()
-                                } else {
-                                    format!("Riêng tư ({})", acl.owner)
-                                })))
-                                .children(acl.grants.iter().map(|grant| {
-                                    div()
-                                        .text_color(if grant.public {
-                                            theme.danger
-                                        } else {
-                                            theme.text_muted
-                                        })
-                                        .child(SharedString::from(format!(
-                                            "{} {}",
-                                            grant.grantee, grant.permission
-                                        )))
-                                }))
+                            inspector_section("QUYỀN TRUY CẬP", theme)
+                                .child(acl_unavailable_notice(summary, detail, theme)),
+                        )
+                    })
+                    .when(acl_supported, |this| {
+                        let acl = inspector.acl.clone();
+                        let acl_target = acl_target.clone();
+                        this.child({
+                            let public = acl
+                                .as_ref()
+                                .is_some_and(|acl| acl.grants.iter().any(|grant| grant.public));
+                            let section = inspector_section("QUYỀN TRUY CẬP", theme)
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_wrap()
-                                        .gap_1()
-                                        .children(s3core::CANNED_ACLS.iter().map(
-                                            |(canned, label)| {
-                                                let canned = *canned;
-                                                action_button_dyn(
-                                                    SharedString::from(format!("acl-{canned}")),
-                                                    SharedString::from(*label),
-                                                    theme,
-                                                )
-                                                .on_click(cx.listener(
-                                                    move |this, _event, _window, cx| {
-                                                        this.set_acl(canned, cx)
-                                                    },
-                                                ))
-                                            },
-                                        )),
-                                ),
-                        )
-                    })
-                    .when(self.supports(|caps| caps.tagging), |this| this
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(acl_status_chip(public, theme))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .text_color(theme.text_faint)
+                                                .child(SharedString::from(acl_target)),
+                                        ),
+                                );
+
+                            let section = if let Some(acl) = acl {
+                                section
+                                    .child(detail_row(
+                                        "Chủ sở hữu",
+                                        elide_middle(&acl.owner, 30),
+                                        theme,
+                                    ))
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .text_color(theme.text_faint)
-                                            .child("THẺ"),
+                                        action_button("acl-table", "Bảng quyền", theme).on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.acl_popup_open = true;
+                                                cx.notify();
+                                            }),
+                                        ),
                                     )
-                                    .child(action_button("add-tag", "Thêm", theme).on_click(
-                                        cx.listener(|this, _event, window, cx| {
-                                            this.open_form(FormKind::AddTag, window, cx)
-                                        }),
-                                    )),
-                            )
-                            .children(inspector.tags.iter().map(|(name, value)| {
-                                let name = name.clone();
-                                let removing = name.clone();
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_color(theme.text)
-                                            .child(SharedString::from(format!("{name} = {value}"))),
-                                    )
-                                    .child(
-                                        icon_button_dyn(
-                                            SharedString::from(format!("rm-tag-{name}")),
-                                            "close",
+                            } else {
+                                section.child(
+                                    div()
+                                        .text_color(theme.text_faint)
+                                        .child("Provider không trả ACL đọc được, vẫn có thể thử đặt ACL canned."),
+                                )
+                            };
+
+                            section
+                                .child(div().text_color(theme.text_faint).child("Preset nhanh"))
+                                .child(div().flex().flex_wrap().gap_1().children(
+                                    s3core::CANNED_ACLS.iter().map(|(canned, label)| {
+                                        let canned = *canned;
+                                        action_button_dyn(
+                                            SharedString::from(format!("acl-{canned}")),
+                                            SharedString::from(*label),
                                             theme,
                                         )
-                                        .on_click(cx.listener(
-                                            move |this, _event, _window, cx| {
-                                                this.remove_tag(removing.clone(), cx)
-                                            },
-                                        )),
-                                    )
-                            }))
-                            .when(inspector.tags.is_empty(), |this| {
-                                this.child(
-                                    div().text_color(theme.text_faint).child("Chưa có thẻ nào"),
-                                )
-                            }),
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                action_button("preview", "Xem trước", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.open_preview(cx)
+                                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                                            this.set_acl(canned, cx)
+                                        }))
                                     }),
-                                ),
-                            )
-                            .child(
-                                action_button("open-external", "Mở bằng app", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.open_externally(cx)
-                                    }),
-                                ),
-                            ),
-                    )
-                    .when(
-                        !inspector.versions.is_empty()
-                            && self.supports(|caps| caps.versioning),
-                        |this| {
-                        this.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(div().text_color(theme.text_faint).child(
-                                    SharedString::from(format!(
-                                        "PHIÊN BẢN {}",
-                                        inspector.versions.len()
-                                    )),
                                 ))
-                                .children(inspector.versions.iter().map(|version| {
-                                    let for_restore = version.version_id.clone();
-                                    let for_delete = version.clone();
-                                    let when = version
-                                        .modified_epoch
-                                        .map(format_timestamp)
-                                        .unwrap_or_default();
-
+                        })
+                    })
+                    .when(self.supports(|caps| caps.tagging), |this| {
+                        this.child(
+                            inspector_section("THẺ", theme)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .child(action_button("add-tag", "Thêm", theme).on_click(
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.open_form(FormKind::AddTag, window, cx)
+                                            }),
+                                        )),
+                                )
+                                .children(inspector.tags.iter().map(|(name, value)| {
+                                    let name = name.clone();
+                                    let removing = name.clone();
                                     div()
                                         .flex()
                                         .items_center()
                                         .gap_2()
                                         .child(
-                                            div()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                // A delete marker holds no data;
-                                                // saying so stops the user asking
-                                                // to download nothing.
-                                                .text_color(if version.is_delete_marker {
-                                                    theme.text_faint
-                                                } else {
-                                                    theme.text
-                                                })
-                                                .child(SharedString::from(if version
-                                                    .is_delete_marker
-                                                {
-                                                    format!("{when}   delete marker")
-                                                } else {
-                                                    format!(
-                                                        "{when}   {}{}",
-                                                        format_size(version.size),
-                                                        if version.is_latest {
-                                                            "   hiện tại"
-                                                        } else {
-                                                            ""
-                                                        }
-                                                    )
-                                                })),
-                                        )
-                                        .when(
-                                            !version.is_latest && !version.is_delete_marker,
-                                            |row| {
-                                                row.child(
-                                                    action_button_dyn(
-                                                        SharedString::from(format!(
-                                                            "restore-{for_restore}"
-                                                        )),
-                                                        "Khôi phục".into(),
-                                                        theme,
-                                                    )
-                                                    .on_click(cx.listener(
-                                                        move |this, _event, _window, cx| {
-                                                            this.restore_version(
-                                                                for_restore.clone(),
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                                )
-                                            },
+                                            div().flex_1().text_color(theme.text).child(
+                                                SharedString::from(format!("{name} = {value}")),
+                                            ),
                                         )
                                         .child(
                                             icon_button_dyn(
-                                                SharedString::from(format!(
-                                                    "rm-ver-{}",
-                                                    for_delete.version_id
-                                                )),
-                                                "trash",
+                                                SharedString::from(format!("rm-tag-{name}")),
+                                                "close",
                                                 theme,
                                             )
-                                            .on_click(cx.listener(
-                                                move |this, _event, _window, cx| {
-                                                    this.ask_delete_version(for_delete.clone(), cx)
-                                                },
-                                            )),
+                                            .on_click(
+                                                cx.listener(move |this, _event, _window, cx| {
+                                                    this.remove_tag(removing.clone(), cx)
+                                                }),
+                                            ),
                                         )
-                                })),
+                                }))
+                                .when(inspector.tags.is_empty(), |this| {
+                                    this.child(
+                                        div().text_color(theme.text_faint).child("Chưa có thẻ nào"),
+                                    )
+                                }),
                         )
                     })
+                    .when(
+                        !inspector.versions.is_empty() && self.supports(|caps| caps.versioning),
+                        |this| {
+                            this.child(
+                                inspector_section(
+                                    SharedString::from(format!(
+                                        "PHIÊN BẢN {}",
+                                        inspector.versions.len()
+                                    )),
+                                    theme,
+                                )
+                                    .children(inspector.versions.iter().map(|version| {
+                                        let for_restore = version.version_id.clone();
+                                        let for_delete = version.clone();
+                                        let when = version
+                                            .modified_epoch
+                                            .map(format_timestamp)
+                                            .unwrap_or_default();
+
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .overflow_hidden()
+                                                    // A delete marker holds no data;
+                                                    // saying so stops the user asking
+                                                    // to download nothing.
+                                                    .text_color(if version.is_delete_marker {
+                                                        theme.text_faint
+                                                    } else {
+                                                        theme.text
+                                                    })
+                                                    .child(SharedString::from(
+                                                        if version.is_delete_marker {
+                                                            format!("{when}   delete marker")
+                                                        } else {
+                                                            format!(
+                                                                "{when}   {}{}",
+                                                                format_size(version.size),
+                                                                if version.is_latest {
+                                                                    "   hiện tại"
+                                                                } else {
+                                                                    ""
+                                                                }
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .when(
+                                                !version.is_latest && !version.is_delete_marker,
+                                                |row| {
+                                                    row.child(
+                                                        action_button_dyn(
+                                                            SharedString::from(format!(
+                                                                "restore-{for_restore}"
+                                                            )),
+                                                            "Khôi phục".into(),
+                                                            theme,
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _event, _window, cx| {
+                                                                this.restore_version(
+                                                                    for_restore.clone(),
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        )),
+                                                    )
+                                                },
+                                            )
+                                            .child(
+                                                icon_button_dyn(
+                                                    SharedString::from(format!(
+                                                        "rm-ver-{}",
+                                                        for_delete.version_id
+                                                    )),
+                                                    "trash",
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _event, _window, cx| {
+                                                        this.ask_delete_version(
+                                                            for_delete.clone(),
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                            )
+                                    })),
+                            )
+                        },
+                    )
                     .when(!head.metadata.is_empty(), |this| {
                         this.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(div().text_color(theme.text_faint).child("METADATA"))
+                            inspector_section("METADATA", theme)
                                 .children(head.metadata.iter().map(|(name, value)| {
-                                    div().text_color(theme.text).child(SharedString::from(
-                                        format!("{name} = {value}"),
-                                    ))
+                                    div()
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(format!("{name} = {value}")))
                                 })),
                         )
                     })
                     .into_any_element()
             }
         };
+        let selected_object_count = self.selected_object_keys().len();
+        let detail_is_multi = selected_object_count > 1;
+        let inspected_name = entry_name_of(&inspector.key);
+        let detail_title: SharedString = if detail_is_multi {
+            format!("{selected_object_count} tệp đã chọn").into()
+        } else {
+            SharedString::from(inspected_name.clone())
+        };
+        let detail_subtitle = detail_is_multi.then(|| {
+            SharedString::from(format!("Đang xem: {}", elide_middle(&inspected_name, 28)))
+        });
+        let inspector_kind = if detail_is_multi {
+            SharedString::from(selected_object_count.to_string())
+        } else {
+            type_badge_of(&inspector.key).unwrap_or_else(|| "TỆP".into())
+        };
 
         Some(
             div()
+                .id("inspector-panel")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
                 .w(px(INSPECTOR_WIDTH))
                 // Never squeezed. It is a panel someone opened on purpose, and
                 // half of one is worse than none: the labels survive a squeeze
@@ -8422,34 +10044,169 @@ impl Browser {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(theme.panel)
-                .border_l_1()
+                .bg(theme.modal)
+                .border_1()
                 .border_color(theme.border)
+                .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
+                .on_click(|_event, _window, cx| cx.stop_propagation())
                 .child(
                     div()
-                        .h(px(CONTROL_BAR_HEIGHT))
+                        .flex_shrink_0()
                         .px_3()
+                        .py_2()
                         .flex()
-                        .items_center()
+                        .flex_col()
                         .gap_2()
                         .border_b_1()
                         .border_color(theme.border)
                         .child(
                             div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(theme.text)
-                                .overflow_hidden()
-                                .child(SharedString::from(entry_name_of(&inspector.key))),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .size(px(30.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_lg()
+                                        .bg(theme.hover)
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child(inspector_kind),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            ellipsis_text(
+                                                SharedString::from(format!(
+                                                    "detail-title-{}",
+                                                    animation_key_hash(&inspector.key)
+                                                )),
+                                                detail_title.to_string(),
+                                                34,
+                                                theme.text,
+                                            )
+                                            .text_xs(),
+                                        )
+                                        .when_some(detail_subtitle, |this, subtitle| {
+                                            this.child(
+                                                ellipsis_text(
+                                                    SharedString::from(format!(
+                                                        "detail-subtitle-{}",
+                                                        animation_key_hash(&inspector.key)
+                                                    )),
+                                                    subtitle.to_string(),
+                                                    34,
+                                                    theme.text_faint,
+                                                )
+                                                .text_xs(),
+                                            )
+                                        }),
+                                )
+                                .child(icon_button("close-inspector", "close", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.inspector = None;
+                                        cx.notify();
+                                    }),
+                                )),
                         )
-                        .child(icon_button("close-inspector", "close", theme).on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.inspector = None;
-                                cx.notify();
-                            },
-                        ))),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .when(!detail_is_multi, |this| {
+                                    this.child(
+                                        detail_action_button("detail-preview", "Xem", "eye", theme)
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                this.open_preview(cx)
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    detail_action_button(
+                                        "detail-edit-headers",
+                                        "Headers",
+                                        "rename",
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _event, window, cx| {
+                                            if detail_is_multi {
+                                                this.edit_headers_for_selection(window, cx);
+                                            } else {
+                                                this.start_edit_headers(window, cx);
+                                            }
+                                        },
+                                    )),
+                                )
+                                .when(!detail_is_multi, |this| {
+                                    this.child(
+                                        detail_action_button(
+                                            "detail-share",
+                                            "Chia sẻ",
+                                            "link",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.start_share_current(cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    detail_action_button(
+                                        "detail-download",
+                                        "Tải xuống",
+                                        "download",
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            if detail_is_multi {
+                                                this.download_selection(cx);
+                                            } else {
+                                                this.download_current_detail(cx);
+                                            }
+                                        },
+                                    )),
+                                )
+                                .when(!detail_is_multi, |this| {
+                                    this.child(
+                                        detail_action_button(
+                                            "detail-open-external",
+                                            "Mở app",
+                                            "external",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.open_externally(cx)
+                                            }),
+                                        ),
+                                    )
+                                }),
+                        ),
                 )
-                .child(body),
+                .child(body)
+                .transition_opacity_and_offset(
+                    "inspector-panel-in",
+                    smooth_transition(MOTION_PANEL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(16.0, 0.0),
+                    motion_offset(0.0, 0.0),
+                ),
         )
     }
 
@@ -8489,27 +10246,26 @@ impl Browser {
                                 .text_color(theme.text)
                                 .child(SharedString::from(format!("Chia sẻ {name}"))),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .children(PRESIGN_PRESETS.iter().map(|(label, expires)| {
-                                    let expires = *expires;
-                                    let label = *label;
-                                    let active = share.chosen == label;
-                                    action_button_dyn(
-                                        SharedString::from(format!("presign-{label}")),
-                                        SharedString::from(label),
-                                        theme,
-                                    )
-                                    // The active preset has to look chosen, or
-                                    // the row is four buttons with no state.
-                                    .when(active, |this| this.bg(theme.selected))
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        .child(div().flex().gap_2().children(PRESIGN_PRESETS.iter().map(
+                            |(label, expires)| {
+                                let expires = *expires;
+                                let label = *label;
+                                let active = share.chosen == label;
+                                action_button_dyn(
+                                    SharedString::from(format!("presign-{label}")),
+                                    SharedString::from(label),
+                                    theme,
+                                )
+                                // The active preset has to look chosen, or
+                                // the row is four buttons with no state.
+                                .when(active, |this| this.bg(theme.selected))
+                                .on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
                                         this.presign(label, expires, cx)
-                                    }))
-                                })),
-                        )
+                                    },
+                                ))
+                            },
+                        )))
                         // The credential warning is the whole point of the panel:
                         // a link that dies with the session looks identical to one
                         // that lasts a week.
@@ -8554,11 +10310,7 @@ impl Browser {
                                     this.child(
                                         action_button("copy-signed", "Chép link", theme).on_click(
                                             cx.listener(move |this, _event, _window, cx| {
-                                                this.copy_to_clipboard(
-                                                    url.to_string(),
-                                                    "link",
-                                                    cx,
-                                                )
+                                                this.copy_to_clipboard(url.to_string(), "link", cx)
                                             }),
                                         ),
                                     )
@@ -8570,6 +10322,147 @@ impl Browser {
                                     }),
                                 )),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "share-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
+                ),
+        )
+    }
+
+    fn render_acl_popup(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.acl_popup_open {
+            return None;
+        }
+        let inspector = self.inspector.as_ref()?;
+        let theme = self.theme;
+        let selected_object_count = self.selected_object_keys().len();
+        let detail_is_multi = selected_object_count > 1;
+        let title = if detail_is_multi {
+            format!("Quyền truy cập của {selected_object_count} tệp")
+        } else {
+            format!("Quyền truy cập {}", entry_name_of(&inspector.key))
+        };
+        let target = acl_target_label(selected_object_count);
+
+        Some(
+            div()
+                .id("acl-popup-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.34))
+                .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.acl_popup_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("acl-popup")
+                        .w(px(560.))
+                        .max_h(px(560.))
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .text_xs()
+                        .rounded_xl()
+                        .bg(preview_shell(theme))
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            ellipsis_text(
+                                                SharedString::from(format!(
+                                                    "acl-popup-title-{}",
+                                                    animation_key_hash(&inspector.key)
+                                                )),
+                                                title,
+                                                48,
+                                                theme.text,
+                                            )
+                                            .text_sm(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_faint)
+                                                .child(SharedString::from(target)),
+                                        ),
+                                )
+                                .child(icon_button("close-acl-popup", "close", theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.acl_popup_open = false;
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("acl-popup-body")
+                                .flex_1()
+                                .min_h(px(0.))
+                                .overflow_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .when_some(inspector.acl.clone(), |this, acl| {
+                                    this.child(acl_permission_table(&acl, theme))
+                                })
+                                .when(inspector.acl.is_none(), |this| {
+                                    this.child(div().text_color(theme.text_faint).child(
+                                        if inspector.loading {
+                                            "Đang đọc ACL…"
+                                        } else {
+                                            "Provider không trả ACL đọc được."
+                                        },
+                                    ))
+                                })
+                                .child(div().text_color(theme.text_faint).child("Preset nhanh"))
+                                .child(div().flex().flex_wrap().gap_1().children(
+                                    s3core::CANNED_ACLS.iter().map(|(canned, label)| {
+                                        let canned = *canned;
+                                        action_button_dyn(
+                                            SharedString::from(format!("acl-popup-{canned}")),
+                                            SharedString::from(*label),
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.set_acl(canned, cx)
+                                            }),
+                                        )
+                                    }),
+                                )),
+                        ),
+                )
+                .transition_opacity_and_offset(
+                    "acl-popup-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, 10.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -8583,9 +10476,10 @@ impl Browser {
         }
         let theme = self.theme;
 
-        let step = |title: &'static str, detail: &'static str, button: &'static str, id: &'static str| {
-            (title, detail, button, id)
-        };
+        let step = |title: &'static str,
+                    detail: &'static str,
+                    button: &'static str,
+                    id: &'static str| { (title, detail, button, id) };
 
         Some(
             div()
@@ -8615,9 +10509,19 @@ impl Browser {
                         )
                         .children(
                             [
-                                step("Nhập thủ công", "R2, B2, Wasabi, Spaces, MinIO", "Tạo", "onboard-manual"),
+                                step(
+                                    "Nhập thủ công",
+                                    "R2, B2, Wasabi, Spaces, MinIO",
+                                    "Tạo",
+                                    "onboard-manual",
+                                ),
                                 step("MinIO trên máy", "127.0.0.1:9000", "Tạo", "onboard-minio"),
-                                step("Đăng nhập AWS SSO", "Qua trình duyệt", "Đăng nhập", "onboard-sso"),
+                                step(
+                                    "Đăng nhập AWS SSO",
+                                    "Qua trình duyệt",
+                                    "Đăng nhập",
+                                    "onboard-sso",
+                                ),
                             ]
                             .map(|(title, detail, button, id)| {
                                 div()
@@ -8665,6 +10569,14 @@ impl Browser {
                                 this.child(div().text_xs().text_color(theme.danger).child(summary))
                             },
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "onboarding-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, 8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -8672,7 +10584,7 @@ impl Browser {
     fn render_form(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let form = self.form.as_ref()?;
         let theme = self.theme;
-        let is_profile = form.kind == FormKind::NewProfile;
+        let is_profile = matches!(form.kind, FormKind::NewProfile | FormKind::EditProfile(_));
         let label_width = form_label_width(&form.kind);
 
         Some(
@@ -8726,11 +10638,9 @@ impl Browser {
                                                 .text_color(theme.text_faint)
                                                 .child("Dịch vụ"),
                                         )
-                                        .child(
-                                            div().flex_1().min_w(px(0.)).child(
-                                                Select::new(&select).placeholder("Chọn dịch vụ"),
-                                            ),
-                                        ),
+                                        .child(div().flex_1().min_w(px(0.)).child(
+                                            Select::new(&select).placeholder("Chọn dịch vụ"),
+                                        )),
                                 )
                             },
                         )
@@ -8749,20 +10659,17 @@ impl Browser {
                                 )
                                 // The real thing: cursor, selection, ⌘A, ⌘V,
                                 // undo and IME are the widget's, not ours.
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .child(Input::new(&field.state).when(
-                                            field.masked,
-                                            // A secret typed blind cannot be
-                                            // checked for a typo, and a wrong
-                                            // secret fails identically to a
-                                            // wrong endpoint. The eye is how
-                                            // that gets ruled out.
-                                            |input| input.mask_toggle(),
-                                        )),
-                                )
+                                .child(div().flex_1().min_w(px(0.)).child(
+                                    Input::new(&field.state).when(
+                                        field.masked,
+                                        // A secret typed blind cannot be
+                                        // checked for a typo, and a wrong
+                                        // secret fails identically to a
+                                        // wrong endpoint. The eye is how
+                                        // that gets ruled out.
+                                        |input| input.mask_toggle(),
+                                    ),
+                                ))
                         }))
                         .when_some(form.error.clone(), |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
@@ -8793,6 +10700,7 @@ impl Browser {
                                                 (theme.text_muted, "Đang thử…".into())
                                             }
                                             Probe::Ok(message) => (theme.accent, message),
+                                            Probe::Warning(message) => (theme.text_muted, message),
                                             Probe::Failed(message) => (theme.danger, message),
                                         };
                                         this.child(div().text_xs().text_color(colour).child(text))
@@ -8811,11 +10719,17 @@ impl Browser {
                                     }),
                                 ))
                                 .child(action_button("form-save", "Lưu", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.submit_form(cx)
-                                    }),
+                                    cx.listener(|this, _event, _window, cx| this.submit_form(cx)),
                                 )),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "form-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -8911,16 +10825,22 @@ impl Browser {
                                     }),
                             )
                         })
-                        .child(
-                            div().flex().justify_end().child(
-                                action_button("sso-cancel", "Huỷ", theme).on_click(cx.listener(
-                                    |this, _event, _window, cx| {
-                                        this.sso = None;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                        ),
+                        .child(div().flex().justify_end().child(
+                            action_button("sso-cancel", "Huỷ", theme).on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.sso = None;
+                                    cx.notify();
+                                },
+                            )),
+                        )),
+                )
+                .transition_opacity_and_offset(
+                    "sso-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -9028,6 +10948,7 @@ impl Browser {
                                                     let matches = this.palette_matches();
                                                     let selected = this.palette_selected;
                                                     let theme = this.theme;
+                                                    let range_end = range.end;
                                                     range
                                                         .filter_map(|ix| {
                                                             let command = *matches.get(ix)?;
@@ -9046,7 +10967,22 @@ impl Browser {
                                                                             cx,
                                                                         )
                                                                     },
-                                                                )),
+                                                                ))
+                                                                .transition_opacity_and_offset(
+                                                                    SharedString::from(format!(
+                                                                        "palette-row-in-{ix}"
+                                                                    )),
+                                                                    delayed_transition(
+                                                                        MOTION_ROW_MS,
+                                                                        row_stagger_from_end(
+                                                                            ix, range_end,
+                                                                        ),
+                                                                    ),
+                                                                    0.0,
+                                                                    1.0,
+                                                                    motion_offset(0.0, -3.0),
+                                                                    motion_offset(0.0, 0.0),
+                                                                ),
                                                             )
                                                         })
                                                         .collect::<Vec<_>>()
@@ -9077,6 +11013,14 @@ impl Browser {
                                 .child("↑↓ chọn   ↵ chạy   esc đóng")
                                 .child(SharedString::from(format!("{} lệnh", matches.len()))),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "palette-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -10.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -9111,11 +11055,7 @@ impl Browser {
                         .border_color(theme.border_strong)
                         // Clicks inside the dialog must not reach the scrim.
                         .on_click(|_event, _window, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .text_color(theme.text)
-                                .child(confirm.title.clone()),
-                        )
+                        .child(div().text_color(theme.text).child(confirm.title.clone()))
                         .child(
                             div()
                                 .text_xs()
@@ -9132,14 +11072,20 @@ impl Browser {
                                         this.cancel_confirm(cx)
                                     }),
                                 ))
-                                .child(
-                                    danger_button("confirm-ok", "Xoá".into(), theme).on_click(
-                                        cx.listener(|this, _event, _window, cx| {
-                                            this.commit_confirm(cx)
-                                        }),
-                                    ),
-                                ),
+                                .child(danger_button("confirm-ok", "Xoá".into(), theme).on_click(
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.commit_confirm(cx)
+                                    }),
+                                )),
                         ),
+                )
+                .transition_opacity_and_offset(
+                    "confirm-scrim-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
                 ),
         )
     }
@@ -9309,27 +11255,17 @@ impl Browser {
                             .h(px(PROGRESS_HEIGHT))
                             .rounded_sm()
                             .bg(theme.hover)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(fraction))
-                                    .rounded_sm()
-                                    .bg(if folder.section == QueueSection::Failed {
-                                        theme.danger
-                                    } else {
-                                        theme.accent
-                                    }),
-                            ),
+                            .child(div().h_full().w(gpui::relative(fraction)).rounded_sm().bg(
+                                if folder.section == QueueSection::Failed {
+                                    theme.danger
+                                } else {
+                                    theme.accent
+                                },
+                            )),
                     )
-                    .child(
-                        div()
-                            .w(px(36.))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(format!(
-                                "{}%",
-                                (fraction * 100.0).round() as u32
-                            ))),
-                    ),
+                    .child(div().w(px(36.)).text_color(theme.text_faint).child(
+                        SharedString::from(format!("{}%", (fraction * 100.0).round() as u32)),
+                    )),
             )
             .child(
                 div()
@@ -9357,15 +11293,17 @@ impl Browser {
                                 "pause",
                                 theme,
                             )
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                // Or the row underneath fires too and pausing
-                                // the folder also opens it.
-                                cx.stop_propagation();
-                                for id in &pause_ids {
-                                    this.transfers.pause(*id);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    // Or the row underneath fires too and pausing
+                                    // the folder also opens it.
+                                    cx.stop_propagation();
+                                    for id in &pause_ids {
+                                        this.transfers.pause(*id);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
                         )
                     })
                     .when(folder.resumable, |this| {
@@ -9375,16 +11313,18 @@ impl Browser {
                                 "play",
                                 theme,
                             )
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                if let Some(client) = this.client.clone() {
-                                    for id in &resume_ids {
-                                        this.transfers.resume(*id, client.clone());
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(client) = this.client.clone() {
+                                        for id in &resume_ids {
+                                            this.transfers.resume(*id, client.clone());
+                                        }
+                                        this.start_ticking(cx);
                                     }
-                                    this.start_ticking(cx);
-                                }
-                                cx.notify();
-                            })),
+                                    cx.notify();
+                                },
+                            )),
                         )
                     })
                     .child(
@@ -9393,14 +11333,16 @@ impl Browser {
                             "close",
                             theme,
                         )
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            cx.stop_propagation();
-                            for id in &remove_ids {
-                                this.transfers.remove_job(*id);
-                            }
-                            this.prune_expanded_folders();
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                for id in &remove_ids {
+                                    this.transfers.remove_job(*id);
+                                }
+                                this.prune_expanded_folders();
+                                cx.notify();
+                            },
+                        )),
                     ),
             )
     }
@@ -9489,27 +11431,17 @@ impl Browser {
                             .h(px(PROGRESS_HEIGHT))
                             .rounded_sm()
                             .bg(theme.hover)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(fraction))
-                                    .rounded_sm()
-                                    .bg(if job.state == JobState::Failed {
-                                        theme.danger
-                                    } else {
-                                        theme.accent
-                                    }),
-                            ),
+                            .child(div().h_full().w(gpui::relative(fraction)).rounded_sm().bg(
+                                if job.state == JobState::Failed {
+                                    theme.danger
+                                } else {
+                                    theme.accent
+                                },
+                            )),
                     )
-                    .child(
-                        div()
-                            .w(px(36.))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(format!(
-                                "{}%",
-                                (fraction * 100.0).round() as u32
-                            ))),
-                    ),
+                    .child(div().w(px(36.)).text_color(theme.text_faint).child(
+                        SharedString::from(format!("{}%", (fraction * 100.0).round() as u32)),
+                    )),
             )
             .child(
                 div()
@@ -9524,45 +11456,37 @@ impl Browser {
                     .justify_end()
                     .gap_1()
                     .child(match job.state {
-                        JobState::Running | JobState::Queued => {
-                            icon_button_dyn(
-                                SharedString::from(format!("pause-{id}")),
-                                "pause",
-                                theme,
-                            )
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.transfers.pause(id);
-                                cx.notify();
-                            }))
-                            .into_any_element()
-                        }
-                        JobState::Paused | JobState::Failed => {
-                            icon_button_dyn(
-                                SharedString::from(format!("resume-{id}")),
-                                "play",
-                                theme,
-                            )
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                if let Some(client) = this.client.clone() {
-                                    this.transfers.resume(id, client);
-                                    this.start_ticking(cx);
-                                }
-                                cx.notify();
-                            }))
-                            .into_any_element()
-                        }
-                        _ => div().into_any_element(),
-                    })
-                    .child(
-                        icon_button_dyn(
-                            SharedString::from(format!("remove-{id}")),
-                            "close",
+                        JobState::Running | JobState::Queued => icon_button_dyn(
+                            SharedString::from(format!("pause-{id}")),
+                            "pause",
                             theme,
                         )
                         .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.transfers.remove_job(id);
+                            this.transfers.pause(id);
                             cx.notify();
-                        })),
+                        }))
+                        .into_any_element(),
+                        JobState::Paused | JobState::Failed => icon_button_dyn(
+                            SharedString::from(format!("resume-{id}")),
+                            "play",
+                            theme,
+                        )
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            if let Some(client) = this.client.clone() {
+                                this.transfers.resume(id, client);
+                                this.start_ticking(cx);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                        _ => div().into_any_element(),
+                    })
+                    .child(
+                        icon_button_dyn(SharedString::from(format!("remove-{id}")), "close", theme)
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.transfers.remove_job(id);
+                                cx.notify();
+                            })),
                     ),
             )
     }
@@ -9570,6 +11494,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.perf.note_render();
         let theme = self.theme;
 
         sync_component_theme(theme_mode(self.settings.theme, self.appearance), window, cx);
@@ -9599,22 +11524,22 @@ impl Render for Browser {
                 this.copy_to_clipboard_selection(true, cx)
             }))
             .on_action(cx.listener(|this, _: &ActionPaste, _window, cx| this.paste(cx)))
-            .on_action(cx.listener(|this, _: &ActionRename, window, cx| {
-                this.start_rename(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ActionDuplicate, window, cx| {
-                this.start_duplicate(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ActionDelete, _window, cx| {
-                this.ask_delete_selection(cx)
-            }))
-            .on_action(cx.listener(|this, _: &ActionDownload, _window, cx| {
-                this.download_selection(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ActionRename, window, cx| this.start_rename(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ActionDuplicate, window, cx| {
+                    this.start_duplicate(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ActionDelete, _window, cx| this.ask_delete_selection(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ActionDownload, _window, cx| this.download_selection(cx)),
+            )
             .on_action(cx.listener(|this, _: &ActionShare, _window, cx| this.start_share(cx)))
-            .on_action(cx.listener(|this, _: &ActionInspect, _window, cx| {
-                this.toggle_inspector(cx)
-            }))
+            .on_action(cx.listener(|this, _: &ActionInspect, _window, cx| this.open_inspector(cx)))
             .on_action(cx.listener(|this, _: &ActionSelectAll, _window, cx| this.select_all(cx)))
             .on_action(cx.listener(|this, _: &ActionRefresh, _window, cx| {
                 if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
@@ -9625,21 +11550,21 @@ impl Render for Browser {
                 this.open_form(FormKind::NewFolder, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ActionPreview, _window, cx| this.quick_look(cx)))
-            .on_action(cx.listener(|this, _: &ActionOpenExternally, _window, cx| {
-                this.open_externally(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ActionOpenExternally, _window, cx| this.open_externally(cx)),
+            )
             .on_action(cx.listener(|this, _: &ActionEditHeaders, window, cx| {
                 this.edit_headers_for_selection(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ActionOpenInTab, window, cx| {
                 this.open_cursor_in_tab(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActionCopyPath, _window, cx| {
-                this.copy_location(true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ActionCopyKey, _window, cx| {
-                this.copy_location(false, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ActionCopyPath, _window, cx| this.copy_location(true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ActionCopyKey, _window, cx| this.copy_location(false, cx)),
+            )
             .on_action(cx.listener(|this, _: &ActionAclPrivate, _window, cx| {
                 this.set_acl_recursive("private", cx)
             }))
@@ -9660,75 +11585,86 @@ impl Render for Browser {
             .when(!self.profiles.is_empty(), |this| {
                 this.child(self.render_title_bar(cx))
                     .child(self.render_tabs(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .overflow_hidden()
-                    .child(self.render_sidebar(cx))
-                    // The history page takes the whole pane, and takes the drop
-                    // target with it: a file dropped on a list of *past*
-                    // locations has no obvious destination, and the honest
-                    // answers — the current prefix, or the row under the
-                    // cursor — are both things nobody asked for.
-                    .when(self.screen == Screen::Recent, |this| {
-                        this.child(self.render_recent_page(cx))
-                    })
-                    .when(self.screen == Screen::Buckets, |this| {
-                        this.child(self.render_buckets_page(cx))
-                    })
-                    .when(self.screen == Screen::Objects, |this| {
-                        this.child(
+                    .child(
                         div()
-                            .id("object-pane")
                             .flex_1()
-                            // A flex child's floor is its content unless it is
-                            // told otherwise, and this one's content is a
-                            // toolbar full of fixed-width buttons. Without
-                            // these two the pane refused to go below about
-                            // 700px and shoved the inspector off the right edge
-                            // of the window — labels still on screen, every
-                            // value gone.
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .h_full()
+                            .relative()
                             .flex()
-                            .flex_col()
-                            .drag_over::<ExternalPaths>(move |style, _paths, _window, _cx| {
-                                style.bg(theme.drop_target)
+                            .overflow_hidden()
+                            .child(self.render_sidebar(cx))
+                            // The history page takes the whole pane, and takes the drop
+                            // target with it: a file dropped on a list of *past*
+                            // locations has no obvious destination, and the honest
+                            // answers — the current prefix, or the row under the
+                            // cursor — are both things nobody asked for.
+                            .when(self.screen == Screen::Recent, |this| {
+                                this.child(self.render_recent_page(cx))
                             })
-                            .on_drop::<ExternalPaths>(cx.listener(
-                                |this, paths: &ExternalPaths, _window, cx| {
-                                    this.start_uploads(paths.paths().to_vec(), cx);
-                                },
-                            ))
-                            .when_some(self.render_empty_state(cx), |this, empty| {
-                                this.child(empty)
+                            .when(self.screen == Screen::Buckets, |this| {
+                                this.child(self.render_buckets_page(cx))
                             })
-                            // `connecting` too: the pane is waiting on the same
-                            // request the sidebar is, and leaving it blank until
-                            // a bucket exists reads as a broken window rather
-                            // than as a wait.
-                            .children(self.render_search_bar(cx))
-                            .child(self.render_toolbar(cx))
-                            .when(self.bucket.is_some() || self.connecting, |this| {
-                                this.child(self.render_columns(cx))
-                                    .child(self.render_listing(cx))
+                            .when(self.screen == Screen::Objects, |this| {
+                                this.child(
+                                    div()
+                                        .id("object-pane")
+                                        .flex_1()
+                                        // A flex child's floor is its content unless it is
+                                        // told otherwise, and this one's content is a
+                                        // toolbar full of fixed-width buttons. Without
+                                        // these two the pane refused to go below about
+                                        // 700px and shoved the inspector off the right edge
+                                        // of the window — labels still on screen, every
+                                        // value gone.
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .h_full()
+                                        .flex()
+                                        .flex_col()
+                                        .drag_over::<ExternalPaths>(
+                                            move |style, _paths, _window, _cx| {
+                                                style.bg(theme.drop_target)
+                                            },
+                                        )
+                                        .on_drop::<ExternalPaths>(cx.listener(
+                                            |this, paths: &ExternalPaths, _window, cx| {
+                                                this.start_uploads(paths.paths().to_vec(), cx);
+                                            },
+                                        ))
+                                        .when_some(self.render_empty_state(cx), |this, empty| {
+                                            this.child(empty)
+                                        })
+                                        // `connecting` too: the pane is waiting on the same
+                                        // request the sidebar is, and leaving it blank until
+                                        // a bucket exists reads as a broken window rather
+                                        // than as a wait.
+                                        .children(self.render_search_bar(cx))
+                                        .child(self.render_toolbar(cx))
+                                        .when(self.bucket.is_some() || self.connecting, |this| {
+                                            this.child(self.render_columns(cx))
+                                                .child(self.render_listing(cx))
+                                        })
+                                        // Outside `render_listing` on purpose: the count
+                                        // belongs to the pane, not to whichever of the
+                                        // three states the list happens to be in.
+                                        .when(self.bucket.is_some() && !self.loading, |this| {
+                                            this.child(self.render_list_footer())
+                                        })
+                                        .transition_opacity_and_offset(
+                                            "object-pane-in",
+                                            smooth_transition(MOTION_PAGE_MS),
+                                            0.0,
+                                            1.0,
+                                            motion_offset(0.0, 4.0),
+                                            motion_offset(0.0, 0.0),
+                                        ),
+                                )
                             })
-                            // Outside `render_listing` on purpose: the count
-                            // belongs to the pane, not to whichever of the
-                            // three states the list happens to be in.
-                            .when(self.bucket.is_some() && !self.loading, |this| {
-                                this.child(self.render_list_footer())
+                            .when(self.screen == Screen::Objects, |this| {
+                                this.children(self.render_inspector(cx))
                             }),
                     )
-                    })
-                    .when(self.screen == Screen::Objects, |this| {
-                        this.children(self.render_inspector(cx))
-                    }),
-            )
                     .children(self.render_drawer(cx))
-                    })
+            })
             .child(self.render_status(cx))
             .children(self.render_confirm(cx))
             .children(self.render_share(cx))
@@ -9739,6 +11675,7 @@ impl Render for Browser {
             .children(self.render_preview(cx))
             .children(self.render_settings(cx))
             .children(self.render_about(cx))
+            .children(self.render_acl_popup(cx))
             .children(self.render_path_suggestions(cx))
             // Last, so it paints over everything. The palette can be summoned
             // from on top of any of these — "Sửa nội dung" only makes sense
@@ -9753,11 +11690,7 @@ impl Render for Browser {
 /// A section label with an add button. The button was the missing half: every
 /// way to create a profile or bucket existed only as a keyboard shortcut or as
 /// buttons that appeared when the list was empty and vanished once it was not.
-fn section_header(
-    text: &'static str,
-    id: &'static str,
-    theme: Theme,
-) -> gpui::Stateful<gpui::Div> {
+fn section_header(text: &'static str, id: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_2()
@@ -9790,7 +11723,11 @@ fn sidebar_row(
         .rounded_md()
         .text_sm()
         .cursor_pointer()
-        .text_color(if selected { theme.text } else { theme.text_muted })
+        .text_color(if selected {
+            theme.text
+        } else {
+            theme.text_muted
+        })
         .when(selected, |this| this.bg(theme.selected))
         .hover(|this| this.bg(theme.hover))
         .child(label)
@@ -9812,6 +11749,28 @@ fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::S
         .child(label)
 }
 
+fn detail_action_button(
+    id: &'static str,
+    label: &'static str,
+    icon_name: &'static str,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(24.))
+        .px_1p5()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .bg(theme.hover)
+        .text_color(theme.text)
+        .hover(|this| this.bg(theme.selected))
+        .child(sized_icon(icon_name, 12., theme.text_muted))
+        .child(label)
+}
 
 /// A compact toggle showing what it is set to. The label is faint and the value
 /// is not, so the eye lands on the part that changes.
@@ -9834,23 +11793,298 @@ fn setting_chip(
         .bg(theme.hover)
         .hover(|this| this.bg(theme.selected))
         .child(div().text_color(theme.text_faint).child(label))
-        .child(div().text_color(theme.text).child(SharedString::from(value)))
+        .child(
+            div()
+                .text_color(theme.text)
+                .child(SharedString::from(value)),
+        )
 }
-
 
 /// One `label: value` line in the inspector.
 fn detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElement {
+    let id = SharedString::from(format!("detail-row-{label}-{}", animation_key_hash(&value)));
+
     div()
         .flex()
         .gap_2()
-        .child(div().w(px(84.)).text_color(theme.text_faint).child(label))
+        .child(div().w(px(72.)).text_color(theme.text_faint).child(label))
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
+                .child(ellipsis_text(id, value, 38, theme.text)),
+        )
+}
+
+fn preview_detail_row(label: &'static str, value: String, theme: Theme) -> impl IntoElement {
+    let id = SharedString::from(format!(
+        "preview-detail-row-{label}-{}",
+        animation_key_hash(&value)
+    ));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(div().text_color(theme.text_faint).child(label))
+        .child(ellipsis_text(id, value, 34, theme.text))
+}
+
+fn preview_detail_section(title: impl Into<SharedString>, theme: Theme) -> gpui::Div {
+    let title = title.into();
+    div()
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .bg(theme.hover)
+        .child(div().text_xs().text_color(theme.text_faint).child(title))
+}
+
+fn inspector_section(title: impl Into<SharedString>, theme: Theme) -> gpui::Div {
+    let title = title.into();
+    div()
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .bg(theme.modal)
+        .border_1()
+        .border_color(theme.border)
+        .child(div().text_xs().text_color(theme.text_faint).child(title))
+}
+
+fn preview_shell(theme: Theme) -> gpui::Hsla {
+    if theme.text.l > 0.5 {
+        gpui::rgba(0x17191dde).into()
+    } else {
+        gpui::rgba(0xffffffd9).into()
+    }
+}
+
+fn preview_veil(theme: Theme) -> gpui::Hsla {
+    if theme.text.l > 0.5 {
+        gpui::rgba(0xffffff0f).into()
+    } else {
+        gpui::rgba(0xffffff99).into()
+    }
+}
+
+fn acl_unavailable_copy(support: Option<Support>) -> Option<(&'static str, &'static str)> {
+    match support {
+        Some(Support::No) => Some((
+            "Bucket này đã tắt ACL",
+            "Bucket/provider không hỗ trợ chỉnh ACL. Dùng bucket policy, IAM hoặc policy của provider để phân quyền.",
+        )),
+        Some(Support::Forbidden) => Some((
+            "Token không có quyền ACL",
+            "Token hiện tại không đọc được ACL. Cấp quyền ACL tương ứng hoặc dùng policy thay thế.",
+        )),
+        _ => None,
+    }
+}
+
+fn acl_unavailable_notice(
+    summary: &'static str,
+    detail: &'static str,
+    theme: Theme,
+) -> impl IntoElement {
+    div()
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .rounded_lg()
+        .bg(theme.hover)
+        .border_1()
+        .border_color(theme.border)
+        .child(div().text_color(theme.text).child(summary))
+        .child(
+            div()
+                .text_color(theme.text_faint)
+                .child(SharedString::from(detail)),
+        )
+}
+
+fn acl_status_chip(public: bool, theme: Theme) -> impl IntoElement {
+    div()
+        .px_1p5()
+        .py_0p5()
+        .rounded_md()
+        .bg(if public { theme.danger } else { theme.hover })
+        .text_color(if public {
+            theme.text_on_accent
+        } else {
+            theme.text
+        })
+        .child(if public { "Công khai" } else { "Riêng tư" })
+}
+
+fn acl_target_label(selected_objects: usize) -> String {
+    match selected_objects {
+        0 | 1 => "Áp dụng cho object này".to_string(),
+        count => format!("Áp dụng cho {count} tệp đã chọn"),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AclPermissionRow {
+    grantee: String,
+    read: bool,
+    write: bool,
+    full: bool,
+    public: bool,
+}
+
+fn acl_permission_rows(acl: &ObjectAcl) -> Vec<AclPermissionRow> {
+    let mut seen = HashSet::new();
+    let mut grantees = Vec::new();
+
+    for grantee in [&acl.owner, "Mọi người", "Người dùng đã xác thực"] {
+        if !grantee.is_empty() && seen.insert(grantee.to_string()) {
+            grantees.push(grantee.to_string());
+        }
+    }
+
+    for grant in &acl.grants {
+        if !grant.grantee.is_empty() && seen.insert(grant.grantee.clone()) {
+            grantees.push(grant.grantee.clone());
+        }
+    }
+
+    grantees
+        .into_iter()
+        .map(|grantee| {
+            let grants = acl.grants.iter().filter(|grant| grant.grantee == grantee);
+            let mut row = AclPermissionRow {
+                grantee: grantee.clone(),
+                read: false,
+                write: false,
+                full: false,
+                public: false,
+            };
+            for grant in grants {
+                row.public |= grant.public;
+                match grant.permission.as_str() {
+                    "FULL_CONTROL" => {
+                        row.read = true;
+                        row.write = true;
+                        row.full = true;
+                    }
+                    "READ" => row.read = true,
+                    "WRITE" => row.write = true,
+                    _ => {}
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+fn acl_permission_table(acl: &ObjectAcl, theme: Theme) -> impl IntoElement {
+    div()
+        .rounded_lg()
+        .bg(preview_veil(theme))
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_xs()
+        .child(acl_permission_header(theme))
+        .children(
+            acl_permission_rows(acl)
+                .into_iter()
+                .map(|row| acl_permission_row(row, theme)),
+        )
+}
+
+fn acl_permission_header(theme: Theme) -> impl IntoElement {
+    div()
+        .h(px(20.))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_color(theme.text_faint)
+        .child(div().flex_1().min_w(px(0.)).child("Ai"))
+        .child(acl_permission_heading("Đọc"))
+        .child(acl_permission_heading("Ghi"))
+        .child(acl_permission_heading("Toàn"))
+}
+
+fn acl_permission_heading(label: &'static str) -> impl IntoElement {
+    div()
+        .w(px(42.))
+        .flex_shrink_0()
+        .text_align(gpui::TextAlign::Center)
+        .child(label)
+}
+
+fn acl_permission_row(row: AclPermissionRow, theme: Theme) -> impl IntoElement {
+    let grantee = row.grantee.clone();
+    let grantee_tooltip = grantee.clone();
+
+    div()
+        .min_h(px(26.))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded_md()
+        .text_color(if row.public {
+            theme.danger
+        } else {
+            theme.text_muted
+        })
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "acl-grantee-{}",
+                    animation_key_hash(&grantee)
+                )))
+                .flex_1()
+                .min_w(px(0.))
                 .overflow_hidden()
-                .text_color(theme.text)
-                .child(SharedString::from(value)),
+                .whitespace_nowrap()
+                .child(SharedString::from(elide_middle(&grantee, 28)))
+                .tooltip(move |window, cx| Tooltip::new(grantee_tooltip.clone()).build(window, cx)),
+        )
+        .child(acl_permission_cell(row.read, row.public, theme))
+        .child(acl_permission_cell(row.write, row.public, theme))
+        .child(acl_permission_cell(row.full, row.public, theme))
+}
+
+fn acl_permission_cell(checked: bool, public: bool, theme: Theme) -> impl IntoElement {
+    div()
+        .w(px(42.))
+        .flex_shrink_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .size(px(12.))
+                .rounded_sm()
+                .border_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_color(if checked {
+                    if public {
+                        theme.danger
+                    } else {
+                        theme.accent
+                    }
+                } else {
+                    theme.border_strong
+                })
+                .when(checked, |this| {
+                    this.bg(if public { theme.danger } else { theme.accent })
+                })
+                .when(checked, |this| {
+                    this.child(sized_icon("check", 9., theme.text_on_accent))
+                }),
         )
 }
 
@@ -9986,6 +12220,7 @@ fn icon_button_dyn(
         .items_center()
         .justify_center()
         .rounded_md()
+        .cursor_pointer()
         .hover(|style| style.bg(theme.hover))
         .child(icon(name, theme.text_muted))
 }
@@ -10004,12 +12239,12 @@ fn action_button_dyn(
         .items_center()
         .rounded_md()
         .text_xs()
+        .cursor_pointer()
         .text_color(theme.text)
         .bg(theme.hover)
         .hover(|style| style.bg(theme.selected))
         .child(label)
 }
-
 
 fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
@@ -10026,7 +12261,6 @@ fn danger_button(id: &'static str, label: SharedString, theme: Theme) -> gpui::S
         .text_color(theme.text_on_accent)
         .child(label)
 }
-
 
 /// Why the sidebar's rows cannot be used, or `None` when they can.
 ///
@@ -10091,8 +12325,16 @@ fn sidebar_item_with_badge(
     blocked: Option<&'static str>,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
+    let row_id = id.clone();
+    let label_id = SharedString::from(format!("sidebar-label-{}", animation_key_hash(id.as_ref())));
+    let label_color = match (blocked.is_some(), active) {
+        (true, _) => theme.text_faint,
+        (false, true) => theme.text,
+        (false, false) => theme.text_muted,
+    };
+
     div()
-        .id(id)
+        .id(row_id)
         .px_2()
         .py_1()
         .rounded_md()
@@ -10101,11 +12343,7 @@ fn sidebar_item_with_badge(
         .gap_1p5()
         .text_sm()
         .when(active, |this| this.bg(theme.selected))
-        .text_color(match (blocked.is_some(), active) {
-            (true, _) => theme.text_faint,
-            (false, true) => theme.text,
-            (false, false) => theme.text_muted,
-        })
+        .text_color(label_color)
         // A hover highlight and a hand cursor on a row whose click is dropped
         // are both promises the row cannot keep.
         .when_else(
@@ -10125,14 +12363,12 @@ fn sidebar_item_with_badge(
                 theme.text_faint
             },
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(label),
-        )
+        .child(div().flex_1().min_w(px(0.)).child(ellipsis_text(
+            label_id,
+            label.to_string(),
+            28,
+            label_color,
+        )))
         .children(badge.map(|badge| {
             div()
                 .flex_shrink_0()
@@ -10259,6 +12495,8 @@ fn visible_crumbs(
 }
 
 fn crumb(id: SharedString, label: SharedString, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    let label_id = SharedString::from(format!("crumb-label-{}", animation_key_hash(id.as_ref())));
+
     div()
         .id(id)
         .px_1p5()
@@ -10268,7 +12506,7 @@ fn crumb(id: SharedString, label: SharedString, theme: Theme) -> gpui::Stateful<
         .cursor_pointer()
         .text_color(theme.text)
         .hover(|this| this.bg(theme.hover))
-        .child(label)
+        .child(ellipsis_text(label_id, label.to_string(), 22, theme.text))
 }
 
 /// How a row is drawn, apart from what it holds. Grouped because the list of
@@ -10380,14 +12618,15 @@ fn object_row(
                 .items_center()
                 .gap_1p5()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_color(theme.text)
-                        .child(SharedString::from(entry.name.clone())),
-                )
+                .child(ellipsis_text(
+                    SharedString::from(format!(
+                        "row-name-{position}-{}",
+                        animation_key_hash(&entry.key)
+                    )),
+                    entry.name.clone(),
+                    72,
+                    theme.text,
+                )),
         )
         // Its own column rather than a chip beside the name: a chip sits at
         // whatever x the name happens to end at, so scanning a list for "the
@@ -10415,6 +12654,174 @@ fn object_row(
                 .child(SharedString::from(modified)),
         )
         .child(actions)
+}
+
+fn object_grid_card(
+    entry: &Entry,
+    state: RowState,
+    checkbox: gpui::AnyElement,
+    actions: gpui::AnyElement,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let RowState {
+        position,
+        selected,
+        cursor,
+        thumbnail,
+    } = state;
+    let badge = type_badge(entry);
+    let display_name = if entry.is_folder {
+        entry.name.clone()
+    } else {
+        name_without_type(&entry.name)
+    };
+    let size_text = (!entry.is_folder).then(|| SharedString::from(format_size(entry.size)));
+    let badge_for_meta = badge.clone();
+    let has_thumbnail = thumbnail.is_some();
+    let media_bg = if entry.is_folder {
+        gpui::transparent_black()
+    } else if has_thumbnail {
+        theme.modal
+    } else {
+        preview_veil(theme)
+    };
+
+    div()
+        .id(SharedString::from(format!("grid-card-{position}")))
+        .h(px(GRID_ROW_HEIGHT - 12.))
+        .flex_1()
+        .min_w(px(0.))
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .bg(if selected || cursor {
+            theme.selected
+        } else {
+            gpui::transparent_black()
+        })
+        .hover(move |this| {
+            this.bg(if selected {
+                theme.selected
+            } else {
+                preview_veil(theme)
+            })
+        })
+        .cursor_pointer()
+        .child(
+            div()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .overflow_hidden()
+                .child(checkbox)
+                .child(div().flex_1())
+                .child(actions),
+        )
+        .child(
+            div()
+                .h(px(GRID_MEDIA_HEIGHT))
+                .w_full()
+                .p_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .bg(media_bg)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .overflow_hidden()
+                        .bg(if has_thumbnail {
+                            preview_veil(theme)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .child(match thumbnail {
+                            Some(image) => div()
+                                .h_full()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .overflow_hidden()
+                                .child(
+                                    gpui::img(image)
+                                        .max_w_full()
+                                        .max_h(px(GRID_MEDIA_HEIGHT - 12.))
+                                        .object_fit(ObjectFit::Contain)
+                                        .rounded_md()
+                                        .transition_opacity_and_offset(
+                                            SharedString::from(format!(
+                                                "grid-thumb-in-{position}-{}",
+                                                animation_key_hash(&entry.key)
+                                            )),
+                                            smooth_transition(MOTION_PANEL_MS),
+                                            0.0,
+                                            1.0,
+                                            motion_offset(0.0, 2.0),
+                                            motion_offset(0.0, 0.0),
+                                        ),
+                                )
+                                .into_any_element(),
+                            None if entry.is_folder => {
+                                sized_icon("folder", 46., theme.accent).into_any_element()
+                            }
+                            None => sized_icon("file", 42., theme.text_faint).into_any_element(),
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .h(px(22.))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .text_sm()
+                .child(ellipsis_text(
+                    SharedString::from(format!(
+                        "grid-name-{position}-{}",
+                        animation_key_hash(&entry.key)
+                    )),
+                    display_name.clone(),
+                    28,
+                    theme.text,
+                )),
+        )
+        .when_some(size_text, move |this, size| {
+            let meta = div()
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .when_some(badge_for_meta, |this, badge| {
+                    this.child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(theme.hover)
+                            .text_color(theme.text_muted)
+                            .child(badge),
+                    )
+                })
+                .child(div().child(size));
+
+            this.child(meta)
+        })
+}
+
+fn grid_row_count(items: usize) -> usize {
+    items.div_ceil(GRID_COLUMNS)
 }
 
 // ------------------------------------------------------------------- helpers
@@ -10456,10 +12863,8 @@ const SKELETON_ROWS: usize = 48;
 
 /// A placeholder bar, standing in for text that has not arrived.
 ///
-/// Static rather than shimmering. An animated placeholder needs a repaint every
-/// frame for as long as the wait lasts; the app already runs one such loop for
-/// transfer progress, and starting a second one so that a half-second listing
-/// can glimmer is not a trade worth making. The shape alone says "not yet".
+/// Static rather than shimmering. The rows may fade in once, but they do not
+/// keep repainting for as long as the wait lasts.
 fn skeleton_bar(width: f32, theme: Theme) -> impl IntoElement {
     div().h(px(8.)).w(px(width)).rounded_sm().bg(theme.hover)
 }
@@ -10492,21 +12897,47 @@ fn skeleton_rows(theme: Theme) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap_2()
-                // The same three slots `object_row` uses, at the same widths.
+                // The same slots `object_row` uses, at the same widths, so the
+                // real rows land without the columns sliding sideways.
                 .child(
                     div()
-                        .w(px(22.))
+                        .w(px(ROW_NUMBER_WIDTH))
+                        .flex_shrink_0()
+                        .child(skeleton_bar(14., theme)),
+                )
+                .child(
+                    div()
+                        .w(px(CHECK_WIDTH))
+                        .flex_shrink_0()
                         .flex()
+                        .items_center()
                         .child(div().size(px(15.)).rounded_sm().bg(theme.hover)),
                 )
                 .child(
                     div()
+                        .w(px(22.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .child(div().size(px(16.)).rounded_sm().bg(theme.hover)),
+                )
+                .child(
+                    div()
                         .flex_1()
+                        .min_w(px(NAME_MIN_WIDTH))
                         .child(skeleton_bar(WIDTHS[row % WIDTHS.len()], theme)),
                 )
+                .child(div().w(px(TYPE_WIDTH)).flex_shrink_0())
                 .child(div().w(px(84.)).child(skeleton_bar(38., theme)))
                 .child(div().w(px(132.)).child(skeleton_bar(94., theme)))
+                .child(div().w(px(ACTIONS_WIDTH)).flex_shrink_0())
         }))
+        .transition_opacity(
+            "listing-skeleton",
+            smooth_transition(MOTION_MODAL_MS),
+            0.55,
+            1.0,
+        )
 }
 
 /// Placeholder bucket names, for the sidebar while a connection is being made.
@@ -10558,21 +12989,12 @@ fn skeleton_details(theme: Theme) -> impl IntoElement {
                 })
                 .collect::<Vec<_>>(),
         )
-}
-
-/// A one-line note under a list that is still growing.
-fn loading_strip(label: &'static str, theme: Theme) -> impl IntoElement {
-    div()
-        .h(px(HEADER_HEIGHT))
-        .w_full()
-        .px_3()
-        .flex()
-        .items_center()
-        .border_t_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.text_faint)
-        .child(label)
+        .transition_opacity(
+            "details-skeleton",
+            smooth_transition(MOTION_MODAL_MS),
+            0.55,
+            1.0,
+        )
 }
 
 /// Which end of the viewport to align a row against when scrolling it into
@@ -10654,7 +13076,9 @@ fn bandwidth_label(limit: u64) -> String {
 /// The next preset after `current`. An unrecognised limit (set by something
 /// other than this button) falls through to the first preset.
 fn next_bandwidth_limit(current: u64) -> u64 {
-    let at = BANDWIDTH_PRESETS.iter().position(|&preset| preset == current);
+    let at = BANDWIDTH_PRESETS
+        .iter()
+        .position(|&preset| preset == current);
     match at {
         Some(ix) => BANDWIDTH_PRESETS[(ix + 1) % BANDWIDTH_PRESETS.len()],
         None => BANDWIDTH_PRESETS[0],
@@ -10880,7 +13304,10 @@ enum QueueRow {
     Heading(QueueSection),
     Folder(FolderRow),
     /// `child` marks a file drawn under an open folder row.
-    Job { job: Job, child: bool },
+    Job {
+        job: Job,
+        child: bool,
+    },
 }
 
 /// Lays the queue out the way the drawer draws it: a heading over each
@@ -11181,11 +13608,10 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
     }
 }
 
-
-/// Objects above this are listed with an icon instead of a thumbnail. A row is
-/// 22 pixels tall; fetching megabytes to fill it is not a trade worth making,
-/// and the bytes are billed.
-const THUMBNAIL_LIMIT: i64 = 512 * 1024;
+/// Objects above this are listed with an icon instead of a thumbnail. Fetching
+/// a few visible megabytes is worth it for an image grid; fetching original
+/// camera files just to draw a tile is not.
+const THUMBNAIL_LIMIT: i64 = 2 * 1024 * 1024;
 
 /// What a preview should try to render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11199,11 +13625,9 @@ enum PreviewKind {
     /// Everything else.
     ///
     /// Images and text are the whole of what this previews, deliberately.
-    /// Playing a video means a decoder, a clock and an audio path on top of
-    /// `gpui::surface`; drawing a PDF means bundling a rasteriser — a large
-    /// native library, signed and shipped, for one panel. Every one of those
-    /// files already has a viewer on the machine, so `None` is not a dead end
-    /// here: it is the handoff.
+    /// Drawing a PDF or video means bundling native playback/rasterising
+    /// surfaces for one panel. Those files already have a viewer on the
+    /// machine, so `None` is not a dead end here: it is the handoff.
     None,
 }
 
@@ -11224,19 +13648,32 @@ pub struct Table {
 
 /// Decides from the content type first and the extension second. The type is
 /// what the object claims to be; the extension is a fallback for the many
-/// objects uploaded as `application/octet-stream`.
+/// objects uploaded as `application/octet-stream`. HTML is the exception:
+/// it runs scripts and pulls subresources, so hand it to the system browser.
 fn preview_kind(key: &str, content_type: Option<&str>) -> PreviewKind {
+    if html_extension(key) {
+        return PreviewKind::None;
+    }
     if let Some(mime) = content_type {
         let mime = mime.split(';').next().unwrap_or(mime).trim();
+        if html_mime(mime) {
+            return PreviewKind::None;
+        }
         if image_format_for_mime(mime).is_some() {
             return PreviewKind::Image;
+        }
+        if mime.starts_with("video/") {
+            return PreviewKind::None;
         }
         if mime == "text/csv" || mime == "text/tab-separated-values" {
             return PreviewKind::Table(if mime.ends_with("csv") { ',' } else { '\t' });
         }
         // Structured text is still text: JSON and XML are worth reading inline.
         if mime.starts_with("text/")
-            || matches!(mime, "application/json" | "application/xml" | "application/yaml")
+            || matches!(
+                mime,
+                "application/json" | "application/xml" | "application/yaml"
+            )
         {
             return PreviewKind::Text;
         }
@@ -11250,12 +13687,36 @@ fn preview_kind(key: &str, content_type: Option<&str>) -> PreviewKind {
     let extension = key.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => PreviewKind::Image,
+        "mp4" | "m4v" | "mov" | "webm" | "avi" | "mkv" => PreviewKind::None,
         "csv" => PreviewKind::Table(','),
         "tsv" => PreviewKind::Table('\t'),
         "txt" | "md" | "json" | "xml" | "yaml" | "yml" | "toml" | "log" | "rs" | "py" | "js"
-        | "ts" | "html" | "css" | "sh" | "sql" => PreviewKind::Text,
+        | "ts" | "css" | "sh" | "sql" => PreviewKind::Text,
         _ => PreviewKind::None,
     }
+}
+
+fn html_opens_externally(key: &str, content_type: Option<&str>) -> bool {
+    html_extension(key)
+        || content_type
+            .and_then(|mime| mime.split(';').next())
+            .map(str::trim)
+            .is_some_and(html_mime)
+}
+
+fn html_extension(key: &str) -> bool {
+    matches!(
+        key.rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "html" | "htm"
+    )
+}
+
+fn html_mime(mime: &str) -> bool {
+    mime.eq_ignore_ascii_case("text/html") || mime.eq_ignore_ascii_case("application/xhtml+xml")
 }
 
 /// Maps a MIME type to the format gpui needs to decode the bytes.
@@ -11273,7 +13734,13 @@ fn image_format_for_mime(mime: &str) -> Option<gpui::ImageFormat> {
 
 /// The format implied by a filename, for objects whose content type is unhelpful.
 fn image_format_for_key(key: &str) -> Option<gpui::ImageFormat> {
-    match key.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match key
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "png" => Some(gpui::ImageFormat::Png),
         "jpg" | "jpeg" => Some(gpui::ImageFormat::Jpeg),
         "gif" => Some(gpui::ImageFormat::Gif),
@@ -11515,18 +13982,102 @@ const COMPLETE_MAX_KEYS: usize = 100_000;
 fn row_action(
     id: impl Into<gpui::ElementId>,
     name: &'static str,
+    label: &'static str,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .size(px(20.))
+        .size(px(22.))
         .flex()
         .items_center()
         .justify_center()
         .rounded_sm()
         .cursor_pointer()
         .hover(|this| this.bg(theme.selected))
-        .child(sized_icon(name, 13., theme.text_faint))
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .child(sized_icon(name, 14., theme.text_muted))
+}
+
+fn object_context_menu(
+    menu: PopupMenu,
+    single: bool,
+    can_paste: bool,
+    is_folder: bool,
+    acl_supported: bool,
+) -> PopupMenu {
+    // Items the row cannot do are left out rather than shown greyed: a menu of
+    // mostly-dead entries is harder to read than a short live one.
+    let menu = menu
+        .menu_with_icon("Chép", menu_icon("copy"), Box::new(ActionCopy))
+        .menu_with_icon("Cắt", menu_icon("cut"), Box::new(ActionCut))
+        .menu_with_icon_and_disabled("Dán", menu_icon("paste"), Box::new(ActionPaste), !can_paste)
+        .separator();
+
+    let menu = if single {
+        menu.menu_with_icon("Đổi tên", menu_icon("rename"), Box::new(ActionRename))
+            .menu_with_icon_and_disabled(
+                "Nhân bản",
+                menu_icon("duplicate"),
+                Box::new(ActionDuplicate),
+                is_folder,
+            )
+    } else {
+        menu
+    };
+
+    // A folder has no metadata of its own and cannot be shared as a link, so
+    // those never appear on one.
+    let menu = if is_folder {
+        let menu = menu.menu_with_icon(
+            "Mở trong tab mới",
+            menu_icon("external"),
+            Box::new(ActionOpenInTab),
+        );
+        // Only where the provider has ACLs at all. On a bucket with them
+        // switched off — the default since 2023 — these two can only ever fail.
+        if acl_supported {
+            menu.menu_with_icon(
+                "Đặt riêng tư cho cả thư mục",
+                menu_icon("eye"),
+                Box::new(ActionAclPrivate),
+            )
+            .menu_with_icon(
+                "Đặt ai cũng đọc được cho cả thư mục",
+                menu_icon("eye"),
+                Box::new(ActionAclPublic),
+            )
+        } else {
+            menu
+        }
+    } else {
+        menu.menu_with_icon("Xem trước", menu_icon("eye"), Box::new(ActionPreview))
+            .menu_with_icon(
+                "Mở bằng app",
+                menu_icon("external"),
+                Box::new(ActionOpenExternally),
+            )
+            .menu_with_icon("Chia sẻ", menu_icon("link"), Box::new(ActionShare))
+            .menu_with_icon("Chi tiết", menu_icon("info"), Box::new(ActionInspect))
+            .menu_with_icon(
+                "Sửa header",
+                menu_icon("rename"),
+                Box::new(ActionEditHeaders),
+            )
+    };
+
+    menu.menu_with_icon("Tải xuống", menu_icon("download"), Box::new(ActionDownload))
+        .separator()
+        // Their own group, away from "Chép": that one puts objects on the
+        // clipboard for a paste, these two put text on it for somewhere else
+        // entirely.
+        .menu_with_icon(
+            "Chép đường dẫn s3://",
+            menu_icon("path"),
+            Box::new(ActionCopyPath),
+        )
+        .menu_with_icon("Chép key", menu_icon("copy"), Box::new(ActionCopyKey))
+        .separator()
+        .menu_with_icon("Xoá", menu_icon("trash"), Box::new(ActionDelete))
 }
 
 /// The palette to paint: the setting when it names one, the system otherwise.
@@ -11574,12 +14125,7 @@ fn settings_group(title: &'static str, theme: Theme) -> impl IntoElement {
         .flex()
         .items_center()
         .gap_2()
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.text_faint)
-                .child(title),
-        )
+        .child(div().text_xs().text_color(theme.text_faint).child(title))
         .child(div().flex_1().h(px(1.)).bg(theme.border))
 }
 
@@ -11603,9 +14149,9 @@ fn setting_row(
                 .flex()
                 .flex_col()
                 .child(div().text_xs().text_color(theme.text).child(label))
-                .children(note.map(|note| {
-                    div().text_xs().text_color(theme.text_faint).child(note)
-                })),
+                .children(
+                    note.map(|note| div().text_xs().text_color(theme.text_faint).child(note)),
+                ),
         )
         // Content-sized, and starting at one x for every row. A `flex_1` child
         // stretched every button to the full width of the column, which made
@@ -11613,13 +14159,7 @@ fn setting_row(
         // things to press. Left-aligned rather than right, so the controls form
         // a column the eye can run down — the same way macOS lays out its own
         // settings, and the reason the label column has a fixed width at all.
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .child(control),
-        )
+        .child(div().flex_1().min_w(px(0.)).flex().child(control))
 }
 
 /// One option among a few. A row of these rather than a dropdown: with three or
@@ -11639,12 +14179,19 @@ fn choice_chip(
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(if selected { theme.selected } else { theme.hover })
-        .text_color(if selected { theme.text } else { theme.text_muted })
+        .bg(if selected {
+            theme.selected
+        } else {
+            theme.hover
+        })
+        .text_color(if selected {
+            theme.text
+        } else {
+            theme.text_muted
+        })
         .hover(|this| this.bg(theme.selected))
         .child(label)
 }
-
 
 /// Whether a preview of an object that size holds all of it.
 ///
@@ -11699,7 +14246,11 @@ fn check_box(checked: bool, theme: Theme) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .border_color(if checked { theme.accent } else { theme.border_strong })
+        .border_color(if checked {
+            theme.accent
+        } else {
+            theme.border_strong
+        })
         .when(checked, |this| this.bg(theme.accent))
         .when(checked, |this| {
             this.child(sized_icon("check", 10., theme.text_on_accent))
@@ -11730,6 +14281,18 @@ fn type_badge_of(name: &str) -> Option<SharedString> {
     Some(extension.to_uppercase().into())
 }
 
+fn name_without_type(name: &str) -> String {
+    let Some((stem, _)) = name.rsplit_once('.') else {
+        return name.to_string();
+    };
+
+    if stem.is_empty() || type_badge_of(name).is_none() {
+        name.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
 /// Which tab a number key selects.
 ///
 /// `9` means the last one rather than the ninth: with three tabs open, ⌘9 has to
@@ -11754,17 +14317,68 @@ fn flatten(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn wrapped_text(text: &str, max_chars: usize, color: gpui::Hsla) -> impl IntoElement {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FailureCard {
+    summary: SharedString,
+    detail: String,
+    fix: Option<Fix>,
+    at: i64,
+    count: usize,
+}
+
+fn failure_cards(failures: &[Failure]) -> Vec<FailureCard> {
+    let mut cards: Vec<FailureCard> = Vec::new();
+
+    for failure in failures.iter().rev() {
+        let detail = failure.detail.to_string();
+        if let Some(card) = cards.iter_mut().find(|card| {
+            card.summary.as_ref() == failure.summary.as_ref()
+                && card.detail == detail
+                && card.fix == failure.fix
+        }) {
+            card.count += 1;
+            continue;
+        }
+
+        cards.push(FailureCard {
+            summary: failure.summary.clone(),
+            detail,
+            fix: failure.fix,
+            at: failure.at,
+            count: 1,
+        });
+    }
+
+    cards
+}
+
+fn ellipsis_text(
+    id: impl Into<gpui::ElementId>,
+    text: impl Into<String>,
+    max_chars: usize,
+    color: gpui::Hsla,
+) -> gpui::Stateful<gpui::Div> {
+    let full = text.into();
+    let label = elide_middle(&full, max_chars);
+    let tooltip = full.clone();
+
     div()
-        .flex()
-        .flex_col()
+        .id(id)
+        .min_w(px(0.))
+        .overflow_hidden()
+        .whitespace_nowrap()
         .text_color(color)
-        .children(
-            wrap_words(text, max_chars)
-                .into_iter()
-                .map(SharedString::from)
-                .map(|line| div().child(line)),
-        )
+        .child(SharedString::from(label))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+}
+
+fn wrapped_text(text: &str, max_chars: usize, color: gpui::Hsla) -> impl IntoElement {
+    div().flex().flex_col().text_color(color).children(
+        wrap_words(text, max_chars)
+            .into_iter()
+            .map(SharedString::from)
+            .map(|line| div().child(line)),
+    )
 }
 
 /// Splits a bucket off the end of an endpoint URL.
@@ -11808,12 +14422,13 @@ fn validate_profile(
     access_key: &str,
     secret_key: &str,
     taken: &[&str],
+    secret_optional: bool,
 ) -> Option<&'static str> {
     if name.is_empty() {
         Some("Cần tên profile")
     } else if access_key.is_empty() {
         Some("Cần access key")
-    } else if secret_key.is_empty() {
+    } else if secret_key.is_empty() && !secret_optional {
         Some("Cần secret key")
     } else if taken.contains(&name) {
         // Names are how profiles are told apart in the sidebar, so a duplicate
@@ -11821,6 +14436,14 @@ fn validate_profile(
         Some("Đã có profile trùng tên")
     } else {
         None
+    }
+}
+
+fn profile_probe_bucket_ok(bucket: &str, prefix: &str, entries: usize) -> String {
+    if prefix.is_empty() {
+        format!("Kết nối được tới {bucket}, thấy {entries} mục trang đầu")
+    } else {
+        format!("Kết nối được tới s3://{bucket}/{prefix}, thấy {entries} mục trang đầu")
     }
 }
 
@@ -11983,11 +14606,15 @@ fn fold(text: &str) -> String {
         .map(|c| match c {
             'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ'
             | 'ẩ' | 'ẫ' | 'ậ' => 'a',
-            'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => 'e',
+            'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => {
+                'e'
+            }
             'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' => 'i',
             'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ'
             | 'ở' | 'ỡ' | 'ợ' => 'o',
-            'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => 'u',
+            'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => {
+                'u'
+            }
             'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' => 'y',
             'đ' => 'd',
             other => other,
@@ -12011,8 +14638,7 @@ fn delete_detail(doomed: &[Entry], versioned: bool) -> String {
     let folders = doomed.iter().filter(|entry| entry.is_folder).count();
 
     let mut detail = if folders > 0 {
-        let noun = if folders == 1 { "thư mục" } else { "thư mục" };
-        format!("Gồm {folders} {noun}, kể cả nội dung bên trong. ")
+        format!("Gồm {folders} thư mục, kể cả nội dung bên trong. ")
     } else {
         String::new()
     };
@@ -12201,11 +14827,14 @@ mod tests {
             filter_input: None,
             selection: HashSet::new(),
             cursor: None,
+            hovered_row: None,
             anchor: None,
+            layout: LayoutMode::List,
             scroll: UniformListScrollHandle::new(),
             status: "test".into(),
             failures: Vec::new(),
             failures_open: false,
+            perf: PerfStats::default(),
             transfers: TransferEngine::in_memory().expect("in-memory queue"),
             drawer_open: false,
             expanded_folders: HashSet::new(),
@@ -12235,6 +14864,7 @@ mod tests {
             palette_scroll: UniformListScrollHandle::new(),
             share: None,
             inspector: None,
+            acl_popup_open: false,
             bucket_versioned: false,
             capabilities: None,
             caps_cache: CapabilityCache::default(),
@@ -12350,7 +14980,10 @@ mod tests {
         });
 
         entity.update(cx, |browser, cx| {
-            assert_eq!(row_names(browser), vec!["alpha.txt", "beta.txt", "gamma.txt"]);
+            assert_eq!(
+                row_names(browser),
+                vec!["alpha.txt", "beta.txt", "gamma.txt"]
+            );
             // Nothing under the cursor yet: the first press has to land
             // somewhere rather than move from a position we do not have.
             assert_eq!(browser.cursor_position(), None);
@@ -12379,12 +15012,8 @@ mod tests {
 
     #[gpui::test]
     fn the_first_press_upwards_starts_at_the_bottom(cx: &mut gpui::TestAppContext) {
-        let entity = cx.new(|cx| {
-            offline(
-                vec![entry("a.txt", false, 1), entry("b.txt", false, 2)],
-                cx,
-            )
-        });
+        let entity =
+            cx.new(|cx| offline(vec![entry("a.txt", false, 1), entry("b.txt", false, 2)], cx));
 
         entity.update(cx, |browser, cx| {
             // Starting at the top for an upward press would mean the key did
@@ -12458,9 +15087,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_cursor_stays_on_its_file_when_the_rows_are_renumbered(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn the_cursor_stays_on_its_file_when_the_rows_are_renumbered(cx: &mut gpui::TestAppContext) {
         let entity = cx.new(|cx| {
             offline(
                 vec![
@@ -12498,9 +15125,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn clicking_moves_the_cursor_so_arrows_carry_on_from_there(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn clicking_moves_the_cursor_so_arrows_carry_on_from_there(cx: &mut gpui::TestAppContext) {
         let entity = cx.new(|cx| {
             offline(
                 vec![
@@ -12723,7 +15348,10 @@ mod tests {
             // Typed without diacritics, which is how Vietnamese gets typed at a
             // keyboard more often than not.
             browser.bucket_filter = "anh".into();
-            assert_eq!(browser.visible_buckets(), vec![SharedString::from("ảnh-2026")]);
+            assert_eq!(
+                browser.visible_buckets(),
+                vec![SharedString::from("ảnh-2026")]
+            );
 
             // And with them.
             browser.bucket_filter = "Ảnh".into();
@@ -12793,7 +15421,6 @@ mod tests {
         assert!(line.starts_with("0 kết quả"), "{line}");
     }
 
-
     #[test]
     fn flattening_makes_one_paragraph_of_a_cause_chain() {
         // What `anyhow` prints: a message, then indented `Caused by:` lines.
@@ -12807,6 +15434,39 @@ mod tests {
         // Already one line: nothing to do, and no trailing space either.
         assert_eq!(flatten("một dòng"), "một dòng");
         assert_eq!(flatten("  thừa   khoảng trắng  "), "thừa khoảng trắng");
+    }
+
+    #[test]
+    fn repeated_failures_are_grouped_newest_first() {
+        let failures = vec![
+            Failure {
+                summary: "Sai khoá".into(),
+                detail: "SignatureDoesNotMatch".into(),
+                fix: Some(Fix::EditProfile),
+                at: 1,
+            },
+            Failure {
+                summary: "Endpoint chết".into(),
+                detail: "Connection refused".into(),
+                fix: Some(Fix::Retry),
+                at: 2,
+            },
+            Failure {
+                summary: "Sai khoá".into(),
+                detail: "SignatureDoesNotMatch".into(),
+                fix: Some(Fix::EditProfile),
+                at: 3,
+            },
+        ];
+
+        let cards = failure_cards(&failures);
+
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].summary.as_ref(), "Sai khoá");
+        assert_eq!(cards[0].count, 2);
+        assert_eq!(cards[0].at, 3);
+        assert_eq!(cards[1].summary.as_ref(), "Endpoint chết");
+        assert_eq!(cards[1].count, 1);
     }
 
     #[test]
@@ -12915,31 +15575,47 @@ mod tests {
     #[test]
     fn profile_validation_catches_every_way_the_form_can_be_wrong() {
         // The happy path.
-        assert_eq!(validate_profile("R2", "AKIA", "secret", &[]), None);
+        assert_eq!(validate_profile("R2", "AKIA", "secret", &[], false), None);
 
         // Each required field, reported specifically rather than as one vague
         // "invalid" — the point of the message is to say which box to fill.
         assert_eq!(
-            validate_profile("", "AKIA", "secret", &[]),
+            validate_profile("", "AKIA", "secret", &[], false),
             Some("Cần tên profile")
         );
         assert_eq!(
-            validate_profile("R2", "", "secret", &[]),
+            validate_profile("R2", "", "secret", &[], false),
             Some("Cần access key")
         );
         assert_eq!(
-            validate_profile("R2", "AKIA", "", &[]),
+            validate_profile("R2", "AKIA", "", &[], false),
             Some("Cần secret key")
         );
+        assert_eq!(validate_profile("R2", "AKIA", "", &[], true), None);
 
         // Duplicate names make the sidebar unreadable even though ids stay
         // unique underneath.
         assert_eq!(
-            validate_profile("R2", "AKIA", "secret", &["R2"]),
+            validate_profile("R2", "AKIA", "secret", &["R2"], false),
             Some("Đã có profile trùng tên")
         );
         // A different name alongside an existing one is fine.
-        assert_eq!(validate_profile("B2", "AKIA", "secret", &["R2"]), None);
+        assert_eq!(
+            validate_profile("B2", "AKIA", "secret", &["R2"], false),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_probe_names_the_bucket_scope_it_actually_tested() {
+        assert_eq!(
+            profile_probe_bucket_ok("photos", "", 3),
+            "Kết nối được tới photos, thấy 3 mục trang đầu"
+        );
+        assert_eq!(
+            profile_probe_bucket_ok("photos", "2026/", 1),
+            "Kết nối được tới s3://photos/2026/, thấy 1 mục trang đầu"
+        );
     }
 
     #[test]
@@ -12956,7 +15632,10 @@ mod tests {
         let parsed =
             parse_assume_role(&format!("{arn} mfa:arn:aws:iam::123:mfa/mai 123456")).unwrap();
         assert_eq!(parsed.role_arn, arn);
-        assert_eq!(parsed.mfa_serial.as_deref(), Some("arn:aws:iam::123:mfa/mai"));
+        assert_eq!(
+            parsed.mfa_serial.as_deref(),
+            Some("arn:aws:iam::123:mfa/mai")
+        );
         assert_eq!(parsed.mfa_code.as_deref(), Some("123456"));
 
         // A serial with no code fails server-side with a message that never
@@ -13087,6 +15766,162 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn inspector_opens_on_the_first_object_in_a_multi_selection(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("reports", true, 0),
+                    entry("a.txt", false, 1),
+                    entry("b.txt", false, 2),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            browser.selection.insert("reports/".into());
+            browser.selection.insert("a.txt".into());
+            browser.selection.insert("b.txt".into());
+
+            browser.open_inspector(cx);
+
+            assert_eq!(
+                browser
+                    .inspector
+                    .as_ref()
+                    .map(|inspector| inspector.key.as_str()),
+                Some("a.txt")
+            );
+            assert_eq!(browser.selected_object_keys(), vec!["a.txt", "b.txt"]);
+        });
+    }
+
+    #[gpui::test]
+    fn open_inspector_follows_the_newly_selected_object(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| {
+            offline(
+                vec![
+                    entry("reports", true, 0),
+                    entry("a.txt", false, 1),
+                    entry("b.txt", false, 2),
+                ],
+                cx,
+            )
+        });
+
+        entity.update(cx, |browser, cx| {
+            browser.selection.insert("a.txt".into());
+            browser.cursor = Some("a.txt".into());
+            browser.open_inspector(cx);
+            assert_eq!(
+                browser
+                    .inspector
+                    .as_ref()
+                    .map(|inspector| inspector.key.as_str()),
+                Some("a.txt")
+            );
+
+            browser.click_row(2, Modifiers::default(), cx);
+            assert_eq!(
+                browser
+                    .inspector
+                    .as_ref()
+                    .map(|inspector| inspector.key.as_str()),
+                Some("b.txt")
+            );
+        });
+    }
+
+    #[test]
+    fn acl_panel_names_the_multi_file_target() {
+        assert_eq!(acl_target_label(0), "Áp dụng cho object này");
+        assert_eq!(acl_target_label(1), "Áp dụng cho object này");
+        assert_eq!(acl_target_label(3), "Áp dụng cho 3 tệp đã chọn");
+    }
+
+    #[test]
+    fn acl_unavailable_copy_separates_bucket_support_from_permissions() {
+        assert_eq!(
+            acl_unavailable_copy(Some(Support::No)).map(|(summary, _)| summary),
+            Some("Bucket này đã tắt ACL")
+        );
+        assert_eq!(
+            acl_unavailable_copy(Some(Support::Forbidden)).map(|(summary, _)| summary),
+            Some("Token không có quyền ACL")
+        );
+        assert!(acl_unavailable_copy(Some(Support::Yes)).is_none());
+        assert!(acl_unavailable_copy(None).is_none());
+    }
+
+    #[test]
+    fn acl_permission_table_expands_full_control() {
+        let acl = ObjectAcl {
+            owner: "owner-1".into(),
+            grants: vec![
+                s3core::AclGrant {
+                    grantee: "owner-1".into(),
+                    permission: "FULL_CONTROL".into(),
+                    public: false,
+                },
+                s3core::AclGrant {
+                    grantee: "Mọi người".into(),
+                    permission: "READ".into(),
+                    public: true,
+                },
+            ],
+        };
+
+        let rows = acl_permission_rows(&acl);
+        assert_eq!(
+            rows.first(),
+            Some(&AclPermissionRow {
+                grantee: "owner-1".into(),
+                read: true,
+                write: true,
+                full: true,
+                public: false,
+            })
+        );
+        assert!(rows.iter().any(|row| row.grantee == "Mọi người"
+            && row.read
+            && !row.write
+            && !row.full
+            && row.public));
+    }
+
+    #[gpui::test]
+    fn acl_actions_do_not_start_when_bucket_has_acls_disabled(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| offline(vec![entry("a.txt", false, 1)], cx));
+
+        entity.update(cx, |browser, cx| {
+            browser.capabilities = Some(Capabilities {
+                versioning: Support::Yes,
+                tagging: Support::Yes,
+                lifecycle: Support::Yes,
+                object_lock: Support::Yes,
+                acl: Support::No,
+            });
+            browser.selection.insert("a.txt".into());
+
+            browser.set_acl("public-read", cx);
+
+            assert!(browser.bulk.is_none());
+            assert_eq!(browser.failures.len(), 1);
+            assert_eq!(browser.failures[0].summary, "Bucket này đã tắt ACL");
+        });
+    }
+
+    #[test]
+    fn preview_geometry_stays_fixed() {
+        assert_eq!(PREVIEW_WIDTH, 980.);
+        assert_eq!(PREVIEW_HEIGHT, 560.);
+        assert_eq!(PREVIEW_SIDE_WIDTH, 276.);
+        assert_eq!(PREVIEW_BODY_HEIGHT, PREVIEW_HEIGHT - PREVIEW_TITLE_HEIGHT);
+        let body_height = std::hint::black_box(PREVIEW_BODY_HEIGHT);
+        assert!(body_height > 500.);
+    }
+
     #[test]
     fn a_long_field_label_widens_the_column_instead_of_wrapping() {
         // `Content-Disposition` wrapped onto two lines at the old fixed width
@@ -13102,12 +15937,8 @@ mod tests {
 
     #[gpui::test]
     fn switching_tabs_puts_everything_back_where_it_was(cx: &mut gpui::TestAppContext) {
-        let entity = cx.new(|cx| {
-            offline(
-                vec![entry("a.txt", false, 1), entry("b.txt", false, 2)],
-                cx,
-            )
-        });
+        let entity =
+            cx.new(|cx| offline(vec![entry("a.txt", false, 1), entry("b.txt", false, 2)], cx));
 
         entity.update(cx, |browser, _| {
             browser.prefix = "photos/2026/".into();
@@ -13228,7 +16059,10 @@ mod tests {
         );
 
         // And the bare form, for code that already knows the bucket.
-        assert_eq!(location_text("demo", &keys, false), "reports/q1.txt\nphotos/");
+        assert_eq!(
+            location_text("demo", &keys, false),
+            "reports/q1.txt\nphotos/"
+        );
 
         // One key is one line with nothing appended.
         assert_eq!(
@@ -13239,8 +16073,10 @@ mod tests {
 
     #[test]
     fn the_type_chip_shows_an_extension_and_nothing_else() {
-        assert_eq!(type_badge(&entry("anh.png", false, 1)).map(|b| b.to_string()),
-            Some("PNG".to_string()));
+        assert_eq!(
+            type_badge(&entry("anh.png", false, 1)).map(|b| b.to_string()),
+            Some("PNG".to_string())
+        );
         assert_eq!(
             type_badge(&entry("bang.csv", false, 1)).map(|b| b.to_string()),
             Some("CSV".to_string())
@@ -13254,8 +16090,10 @@ mod tests {
         // `BACKUP2026` here would be inventing a type nobody has.
         assert_eq!(type_badge(&entry("archive.backup2026", false, 1)), None);
         // Nor is punctuation.
-        assert_eq!(type_badge(&entry("a.tar.gz", false, 1)).map(|b| b.to_string()),
-            Some("GZ".to_string()));
+        assert_eq!(
+            type_badge(&entry("a.tar.gz", false, 1)).map(|b| b.to_string()),
+            Some("GZ".to_string())
+        );
         assert_eq!(type_badge(&entry("weird.a-b", false, 1)), None);
     }
 
@@ -13287,14 +16125,16 @@ mod tests {
 
     #[gpui::test]
     fn a_sort_over_part_of_a_prefix_says_so(cx: &mut gpui::TestAppContext) {
-        let entity = cx.new(|cx| {
-            offline(vec![entry("a.txt", false, 1), entry("b.txt", false, 2)], cx)
-        });
+        let entity =
+            cx.new(|cx| offline(vec![entry("a.txt", false, 1), entry("b.txt", false, 2)], cx));
 
         entity.update(cx, |browser, _| {
             // Everything here: any sort is exact, so the line has nothing to
             // add over the count in the footer under the list.
-            browser.sort = Sort { key: SortKey::Size, ascending: true };
+            browser.sort = Sort {
+                key: SortKey::Size,
+                ascending: true,
+            };
             assert_eq!(browser.listing_summary(), "");
 
             // More pages outstanding. Sorting by size now answers "the largest
@@ -13302,14 +16142,19 @@ mod tests {
             // nothing at all about that.
             browser.continuation = Some("token".into());
             assert!(
-                browser.listing_summary().contains("sắp xếp trên phần đã tải"),
+                browser
+                    .listing_summary()
+                    .contains("sắp xếp trên phần đã tải"),
                 "{}",
                 browser.listing_summary()
             );
 
             // Back to the order S3 returns, and there is nothing to warn about:
             // the pages arrive already in this order.
-            browser.sort = Sort { key: SortKey::Name, ascending: true };
+            browser.sort = Sort {
+                key: SortKey::Name,
+                ascending: true,
+            };
             assert_eq!(browser.listing_summary(), "");
         });
     }
@@ -13378,10 +16223,16 @@ mod tests {
     fn row_endings_and_the_last_line_are_both_handled() {
         // CRLF is what a Windows export produces, and a stray `\r` at the end of
         // every field would show up in every cell.
-        assert_eq!(parse_rows("a,b\r\nc,d\r\n", ','), vec![vec!["a", "b"], vec!["c", "d"]]);
+        assert_eq!(
+            parse_rows("a,b\r\nc,d\r\n", ','),
+            vec![vec!["a", "b"], vec!["c", "d"]]
+        );
 
         // A file that ends without a newline still has a last row...
-        assert_eq!(parse_rows("a,b\nc,d", ','), vec![vec!["a", "b"], vec!["c", "d"]]);
+        assert_eq!(
+            parse_rows("a,b\nc,d", ','),
+            vec![vec!["a", "b"], vec!["c", "d"]]
+        );
         // ...and one that ends with a newline does not gain an empty one.
         assert_eq!(parse_rows("a,b\n", ','), vec![vec!["a", "b"]]);
 
@@ -13437,17 +16288,21 @@ mod tests {
     }
 
     #[test]
-    fn only_images_and_text_are_drawn_here() {
-        // Deliberately the whole of it. A video would mean a decoder, a clock
-        // and an audio path; a PDF a rasteriser bundled and signed. Everything
-        // outside those two lands on `None`, which is not a dead end — it is
-        // the panel that hands the file to the app on the machine.
+    fn only_supported_preview_kinds_are_drawn_here() {
+        // Deliberately the whole of it. A PDF would mean a rasteriser bundled
+        // and signed, and video means native playback surfaces. Everything
+        // outside images and readable text lands on
+        // `None`, which is not a dead end — it is the panel that hands the file
+        // to the app on the machine.
         for name in [
-            "phim.mp4",
             "bai-hat.mp3",
             "hop-dong.pdf",
+            "phim.mp4",
+            "clip.MOV",
             "luu-tru.zip",
             "so-lieu.xlsx",
+            "index.html",
+            "index.htm",
             "khong-duoi",
         ] {
             assert_eq!(preview_kind(name, None), PreviewKind::None, "{name}");
@@ -13459,7 +16314,10 @@ mod tests {
 
         // And what the app *can* draw still gets drawn.
         assert!(matches!(preview_kind("anh.png", None), PreviewKind::Image));
-        assert!(matches!(preview_kind("ghi-chu.txt", None), PreviewKind::Text));
+        assert!(matches!(
+            preview_kind("ghi-chu.txt", None),
+            PreviewKind::Text
+        ));
     }
 
     #[test]
@@ -13505,18 +16363,32 @@ mod tests {
         let (collapsed, shown) = visible_crumbs(crumbs(&["a", "b", "c", "d"]), 3);
         assert!(collapsed);
         assert_eq!(
-            shown.iter().map(|(name, _)| name.as_ref()).collect::<Vec<_>>(),
+            shown
+                .iter()
+                .map(|(name, _)| name.as_ref())
+                .collect::<Vec<_>>(),
             ["b", "c", "d"]
         );
 
         // The real case: seven levels, and the last three are still the last
         // three. The prefix each one carries stays correct, or clicking a crumb
         // would navigate somewhere that is not what it says.
-        let deep = crumbs(&["du-an", "khach-hang", "2026", "quy-3", "thang-8", "hop-dong", "ban-nhap"]);
+        let deep = crumbs(&[
+            "du-an",
+            "khach-hang",
+            "2026",
+            "quy-3",
+            "thang-8",
+            "hop-dong",
+            "ban-nhap",
+        ]);
         let (collapsed, shown) = visible_crumbs(deep, 3);
         assert!(collapsed);
         assert_eq!(
-            shown.iter().map(|(name, _)| name.as_ref()).collect::<Vec<_>>(),
+            shown
+                .iter()
+                .map(|(name, _)| name.as_ref())
+                .collect::<Vec<_>>(),
             ["thang-8", "hop-dong", "ban-nhap"]
         );
         assert_eq!(
@@ -13548,6 +16420,77 @@ mod tests {
     }
 
     #[test]
+    fn grid_file_names_do_not_repeat_the_extension() {
+        assert_eq!(name_without_type("photo.final.png"), "photo.final");
+        assert_eq!(name_without_type("anh.WEBP"), "anh");
+        assert_eq!(name_without_type("README"), "README");
+        assert_eq!(name_without_type(".gitignore"), ".gitignore");
+        assert_eq!(
+            name_without_type("sao-luu.backup2026"),
+            "sao-luu.backup2026"
+        );
+    }
+
+    #[test]
+    fn grid_rows_cover_the_last_partial_line() {
+        assert_eq!(grid_row_count(0), 0);
+        assert_eq!(grid_row_count(1), 1);
+        assert_eq!(grid_row_count(GRID_COLUMNS), 1);
+        assert_eq!(grid_row_count(GRID_COLUMNS + 1), 2);
+    }
+
+    #[test]
+    fn grid_reveal_staggers_from_the_end_of_the_visible_range() {
+        assert_eq!(stagger_from_end(11, 12, 17), 0);
+        assert_eq!(stagger_from_end(10, 12, 17), MOTION_STAGGER_MS);
+        assert_eq!(stagger_from_end(0, 12, 17), 11 * MOTION_STAGGER_MS);
+        assert_eq!(stagger_from_end(0, 40, 17), 17 * MOTION_STAGGER_MS);
+    }
+
+    #[gpui::test]
+    fn scoped_bucket_shortcuts_stay_on_the_active_profile(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| offline(Vec::new(), cx));
+        entity.update(cx, |browser, _| {
+            browser.profiles.push(StoredProfile {
+                id: "p1".into(),
+                name: "P1".into(),
+                endpoint: None,
+                region: "us-east-1".into(),
+                path_style: false,
+                relaxed_checksums: false,
+                access_key: "key".into(),
+            });
+            browser.active_profile = Some(0);
+            browser.buckets = vec!["listed".into()];
+            browser.places.visit(Place {
+                profile: "p1".into(),
+                bucket: "listed".into(),
+                prefix: String::new(),
+                at: 1,
+            });
+            browser.places.visit(Place {
+                profile: "p1".into(),
+                bucket: "direct-only".into(),
+                prefix: String::new(),
+                at: 2,
+            });
+            browser.places.visit(Place {
+                profile: "p2".into(),
+                bucket: "wrong-profile".into(),
+                prefix: String::new(),
+                at: 3,
+            });
+
+            let buckets: Vec<_> = browser
+                .known_bucket_shortcuts()
+                .into_iter()
+                .map(|bucket| bucket.to_string())
+                .collect();
+            assert_eq!(buckets, vec!["listed", "direct-only"]);
+        });
+    }
+
+    #[test]
     fn csv_and_tsv_preview_as_tables_not_as_text() {
         // Shown as raw text a CSV is readable and not usable: the columns only
         // line up by accident.
@@ -13570,21 +16513,50 @@ mod tests {
     #[test]
     fn preview_kind_trusts_the_content_type_over_the_extension() {
         // A declared type wins: an image served as .dat is still an image.
-        assert_eq!(preview_kind("blob.dat", Some("image/png")), PreviewKind::Image);
-        assert_eq!(preview_kind("notes.png", Some("text/plain")), PreviewKind::Text);
+        assert_eq!(
+            preview_kind("blob.dat", Some("image/png")),
+            PreviewKind::Image
+        );
+        assert_eq!(
+            preview_kind("notes.png", Some("text/plain")),
+            PreviewKind::Text
+        );
 
         // Charset parameters must not defeat the match.
         assert_eq!(
             preview_kind("a.bin", Some("text/plain; charset=utf-8")),
             PreviewKind::Text
         );
+        assert_eq!(
+            preview_kind("index.bin", Some("text/html; charset=utf-8")),
+            PreviewKind::None
+        );
+        assert_eq!(
+            preview_kind("index.bin", Some("application/xhtml+xml")),
+            PreviewKind::None
+        );
+        assert!(html_opens_externally("index.HTML", None));
+        assert!(html_opens_externally(
+            "index.bin",
+            Some("text/html; charset=utf-8")
+        ));
+        assert_eq!(
+            preview_kind("clip.bin", Some("video/mp4")),
+            PreviewKind::None
+        );
 
         // Structured text is worth reading inline.
-        assert_eq!(preview_kind("a.bin", Some("application/json")), PreviewKind::Text);
+        assert_eq!(
+            preview_kind("a.bin", Some("application/json")),
+            PreviewKind::Text
+        );
 
         // A specific non-text type is a real answer — the extension must not
         // override it into something we would then fail to render.
-        assert_eq!(preview_kind("report.txt", Some("application/pdf")), PreviewKind::None);
+        assert_eq!(
+            preview_kind("report.txt", Some("application/pdf")),
+            PreviewKind::None
+        );
 
         // octet-stream says nothing, so fall through to the extension. This is
         // the common case: most uploads carry no useful type at all.
@@ -13625,10 +16597,7 @@ mod tests {
 
     #[test]
     fn tags_split_on_the_first_equals_only() {
-        assert_eq!(
-            parse_tag("env=prod"),
-            Some(("env".into(), "prod".into()))
-        );
+        assert_eq!(parse_tag("env=prod"), Some(("env".into(), "prod".into())));
 
         // A value may contain `=`; splitting on the last one would mangle it.
         assert_eq!(
@@ -13653,7 +16622,10 @@ mod tests {
 
     #[test]
     fn delete_dialog_names_a_single_victim_but_counts_a_crowd() {
-        assert_eq!(delete_title(&[entry("a/report.txt", false, 0)]), "Xoá report.txt?");
+        assert_eq!(
+            delete_title(&[entry("a/report.txt", false, 0)]),
+            "Xoá report.txt?"
+        );
         assert_eq!(delete_title(&[entry("a/logs", true, 0)]), "Xoá logs?");
         assert_eq!(
             delete_title(&[entry("a.txt", false, 0), entry("b.txt", false, 0)]),
@@ -13702,10 +16674,7 @@ mod tests {
 
         // A folder must keep its trailing slash — without it the prefix turns
         // into a zero-byte object and the folder's contents are orphaned.
-        assert_eq!(
-            renamed_key("a/b/old/", "new").as_deref(),
-            Some("a/b/new/")
-        );
+        assert_eq!(renamed_key("a/b/old/", "new").as_deref(), Some("a/b/new/"));
         assert_eq!(renamed_key("old/", "new").as_deref(), Some("new/"));
 
         // Names that would move the entry elsewhere, or nowhere, are refused.

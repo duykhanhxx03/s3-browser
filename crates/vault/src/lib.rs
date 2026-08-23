@@ -145,7 +145,6 @@ impl Provider {
             _ => "us-east-1",
         }
     }
-
 }
 
 /// A location worth getting back to.
@@ -177,9 +176,7 @@ pub struct Place {
 /// becomes a second row, until the list holds one prefix twelve times.
 impl PartialEq for Place {
     fn eq(&self, other: &Self) -> bool {
-        self.profile == other.profile
-            && self.bucket == other.bucket
-            && self.prefix == other.prefix
+        self.profile == other.profile && self.bucket == other.bucket && self.prefix == other.prefix
     }
 }
 
@@ -231,7 +228,11 @@ impl Places {
 
     /// Pins or unpins. Returns whether it is pinned afterwards.
     pub fn toggle_favorite(&mut self, place: Place) -> bool {
-        if let Some(index) = self.favorites.iter().position(|existing| existing == &place) {
+        if let Some(index) = self
+            .favorites
+            .iter()
+            .position(|existing| existing == &place)
+        {
             self.favorites.remove(index);
             false
         } else {
@@ -281,8 +282,7 @@ impl PlaceStore {
 
     pub fn save(&self, places: &Places) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(places)?;
         fs::write(&self.path, text).with_context(|| format!("writing {}", self.path.display()))
@@ -324,8 +324,7 @@ impl ProfileStore {
 
     pub fn save(&self, profiles: &[StoredProfile]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(profiles)?;
         fs::write(&self.path, text).with_context(|| format!("writing {}", self.path.display()))
@@ -478,7 +477,10 @@ mod tests {
 
         // In development it is the point of the thing: no Keychain prompt on
         // every rebuild.
-        assert_eq!(resolve_dev_secret(secret(), true).as_deref(), Some("minioadmin"));
+        assert_eq!(
+            resolve_dev_secret(secret(), true).as_deref(),
+            Some("minioadmin")
+        );
 
         // In a shipped binary it must not exist at all. A credential taken from
         // the environment defeats the credential store: whoever can set a
@@ -542,8 +544,14 @@ mod tests {
         // the old entry — the list would fill with one prefix over and over
         // until nothing older was left in it, which is the one thing it is for.
         let mut places = Places::default();
-        places.visit(Place { at: 100, ..place("a", "x/") });
-        places.visit(Place { at: 900, ..place("a", "x/") });
+        places.visit(Place {
+            at: 100,
+            ..place("a", "x/")
+        });
+        places.visit(Place {
+            at: 900,
+            ..place("a", "x/")
+        });
         assert_eq!(places.recent.len(), 1);
         // And the newer visit is the one kept, so the page shows when you were
         // last there rather than when you first were.
@@ -551,8 +559,14 @@ mod tests {
 
         // Pinning looks a place up by identity too, so a pin made at one moment
         // still matches the same place visited at another.
-        assert!(places.toggle_favorite(Place { at: 100, ..place("a", "x/") }));
-        assert!(places.is_favorite(&Place { at: 5_000, ..place("a", "x/") }));
+        assert!(places.toggle_favorite(Place {
+            at: 100,
+            ..place("a", "x/")
+        }));
+        assert!(places.is_favorite(&Place {
+            at: 5_000,
+            ..place("a", "x/")
+        }));
     }
 
     #[test]
@@ -632,7 +646,9 @@ mod tests {
         // permissions error, which sends people to check the wrong thing.
         assert!(Provider::R2.endpoint_template().contains("ACCOUNT_ID"));
         assert!(Provider::Aws.endpoint_template().is_empty());
-        assert!(Provider::Compatible.endpoint_template().contains("example.com"));
+        assert!(Provider::Compatible
+            .endpoint_template()
+            .contains("example.com"));
     }
 
     #[test]
@@ -652,7 +668,8 @@ mod tests {
         assert!(minio.path_style, "self-hosted stores need path-style");
         assert!(minio.relaxed_checksums);
 
-        let r2 = profile("r", Some("https://acc.r2.cloudflarestorage.com")).with_provider_defaults();
+        let r2 =
+            profile("r", Some("https://acc.r2.cloudflarestorage.com")).with_provider_defaults();
         assert_eq!(r2.region, "auto", "R2 uses the 'auto' region");
         assert!(!r2.path_style);
         assert!(r2.relaxed_checksums);

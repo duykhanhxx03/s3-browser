@@ -122,7 +122,6 @@ impl Theme {
             },
         }
     }
-
 }
 
 #[cfg(test)]

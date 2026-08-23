@@ -25,7 +25,10 @@ pub fn install() {
         // Writing must not itself panic, or the process dies inside its own
         // crash handler and the user gets nothing at all.
         if let Some(path) = report_path() {
-            let report = format_report(info, &std::backtrace::Backtrace::force_capture().to_string());
+            let report = format_report(
+                info,
+                &std::backtrace::Backtrace::force_capture().to_string(),
+            );
             _ = write_report(&path, &report);
         }
         previous(info);

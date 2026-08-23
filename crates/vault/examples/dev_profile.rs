@@ -14,7 +14,10 @@ fn main() -> anyhow::Result<()> {
     // a profile that could never be connected.
     vault::set_secret_key("dev-profile-probe", "probe")?;
     let read_back = vault::secret_key("dev-profile-probe")?;
-    anyhow::ensure!(read_back == "probe", "credential store returned wrong value");
+    anyhow::ensure!(
+        read_back == "probe",
+        "credential store returned wrong value"
+    );
     vault::delete_secret_key("dev-profile-probe")?;
     println!("credential store OK (write, read, delete)");
 
@@ -22,7 +25,10 @@ fn main() -> anyhow::Result<()> {
     let mut profiles = store.load()?;
 
     if let Some(existing) = profiles.iter().find(|p| p.name == "MinIO local") {
-        println!("profile already present: {} ({})", existing.name, existing.id);
+        println!(
+            "profile already present: {} ({})",
+            existing.name, existing.id
+        );
         return Ok(());
     }
 

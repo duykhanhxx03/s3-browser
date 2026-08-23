@@ -120,8 +120,7 @@ mod tests {
     /// between two tests using the same fixture, and since tests run in
     /// parallel one deleted the file the other was still reading.
     fn temp_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("s3b-checksum-{}-{tag}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("s3b-checksum-{}-{tag}", std::process::id()));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -188,7 +187,10 @@ mod tests {
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&big);
-        assert_eq!(crc32_of_file(&path).unwrap(), crc32_base64_of(hasher.finalize()));
+        assert_eq!(
+            crc32_of_file(&path).unwrap(),
+            crc32_base64_of(hasher.finalize())
+        );
 
         _ = std::fs::remove_file(&path);
     }

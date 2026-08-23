@@ -28,12 +28,7 @@ enum Outcome {
     Canceled,
 }
 
-pub(crate) async fn run(
-    engine: TransferEngine,
-    id: i64,
-    client: S3Client,
-    control: Arc<AtomicU8>,
-) {
+pub(crate) async fn run(engine: TransferEngine, id: i64, client: S3Client, control: Arc<AtomicU8>) {
     let Some(job) = engine.job(id) else { return };
     engine.set_state(id, JobState::Running);
 
@@ -397,9 +392,10 @@ async fn verify_download(client: &S3Client, job: &Job) -> Result<()> {
     };
 
     let path = job.local.clone();
-    let verification = tokio::task::spawn_blocking(move || checksum::verify(&path, Some(&expected)))
-        .await
-        .context("tác vụ kiểm checksum không hoàn tất")??;
+    let verification =
+        tokio::task::spawn_blocking(move || checksum::verify(&path, Some(&expected)))
+            .await
+            .context("tác vụ kiểm checksum không hoàn tất")??;
 
     if verification == checksum::Verification::Mismatch {
         anyhow::bail!(

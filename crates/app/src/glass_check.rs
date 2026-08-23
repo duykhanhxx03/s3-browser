@@ -44,7 +44,11 @@ pub fn inspect(mtm: MainThreadMarker) -> Report {
     // A blurred window must be non-opaque, otherwise AppKit never composites
     // anything from behind it.
     let opaque = window.isOpaque();
-    check(!opaque, "window is non-opaque", format!("isOpaque={opaque}"));
+    check(
+        !opaque,
+        "window is non-opaque",
+        format!("isOpaque={opaque}"),
+    );
 
     // gpui uses alpha 0.0001 rather than clearColor so the window keeps its shadow.
     let alpha = window.backgroundColor().alphaComponent();

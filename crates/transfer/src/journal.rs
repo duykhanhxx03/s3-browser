@@ -135,18 +135,20 @@ impl Journal {
     pub fn upload_id(&self, id: i64) -> Result<Option<String>> {
         let connection = self.connection.lock().unwrap();
         Ok(connection
-            .query_row("SELECT upload_id FROM jobs WHERE id = ?1", params![id], |row| {
-                row.get::<_, Option<String>>(0)
-            })
+            .query_row(
+                "SELECT upload_id FROM jobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
             .optional()?
             .flatten())
     }
 
     pub fn set_etag(&self, id: i64, etag: Option<&str>) -> Result<()> {
-        self.connection.lock().unwrap().execute(
-            "UPDATE jobs SET etag = ?2 WHERE id = ?1",
-            params![id, etag],
-        )?;
+        self.connection
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET etag = ?2 WHERE id = ?1", params![id, etag])?;
         Ok(())
     }
 
@@ -312,7 +314,10 @@ mod tests {
         let id = journal.insert(&job()).unwrap();
 
         journal.set_upload_id(id, "upload-123").unwrap();
-        assert_eq!(journal.upload_id(id).unwrap().as_deref(), Some("upload-123"));
+        assert_eq!(
+            journal.upload_id(id).unwrap().as_deref(),
+            Some("upload-123")
+        );
 
         for number in [2, 1] {
             journal
