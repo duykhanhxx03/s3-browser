@@ -66,7 +66,7 @@ themes following the system, and crash reports written to disk.
 | Signed builds | None. macOS Gatekeeper rejects the unsigned `.app`; Developer ID signing and notarisation need a paid Apple Developer account. See [docs/PACKAGING.md](docs/PACKAGING.md). |
 | CI and releases | None yet. Every build here is a local build. |
 | Windows | Cross-compiled from macOS and verified only by inspecting the executable — never run on Windows. |
-| Linux | Compiles, but has not been exercised on a Linux desktop. Window blur is unavailable outside KDE, so the theme falls back to solid. |
+| Linux | Cross-compiled from macOS and verified only by inspecting the binary — never run on a Linux desktop. The build targets glibc 2.35, so it runs on Ubuntu 22.04 and newer. Window blur is unavailable outside KDE, so the theme falls back to solid. |
 | AWS SSO | The device flow talks to real AWS endpoints and cannot be simulated with MinIO. Only its pure logic is unit tested; treat it as unverified. |
 | ACL writes | Exercised against MinIO, which refuses `PutObjectAcl`. The write path has not run against an ACL-enabled AWS bucket. |
 | Auto-update | Not implemented. |
@@ -92,9 +92,12 @@ cargo build --release -p s3browser
 
 The binary lands in `target/release/s3browser`.
 
-Cross-compiling the Windows executable from macOS is possible and documented
-in [docs/PACKAGING.md](docs/PACKAGING.md), along with the three `vendor/gpui`
-patches it requires and why `-C target-feature=+crt-static` is not optional.
+Cross-compiling both the Windows executable and the Linux binary from macOS
+works and is documented in [docs/PACKAGING.md](docs/PACKAGING.md) — including
+the three `vendor/gpui` patches Windows requires, why
+`-C target-feature=+crt-static` is not optional there, and why one Linux
+binary built against glibc 2.35 covers Ubuntu 22.04, 24.04 and 26.04 rather
+than needing one build per release.
 
 Packaging a macOS `.app` and `.dmg`, and everything known about signing and
 notarisation, is in the same document.

@@ -262,3 +262,119 @@ trúc file: đúng `PE32+ (GUI)`, đúng bảng import, manifest và HLSL nằm 
 binary, không còn đường dẫn của máy build. Việc renderer DirectX có dựng nổi
 device thật, glass Acrylic có bật, Credential Manager có nhận khoá hay không —
 tất cả đều phải chạy thật trên Windows mới biết.
+
+# Dựng bản Linux từ máy macOS
+
+Cũng chạy được, và ít vướng hơn Windows nhiều: không phải vá gpui dòng nào.
+
+## Đồ nghề
+
+```bash
+brew install zig
+cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-gnu
+```
+
+`zig` đóng vai trình biên dịch C chéo và linker; nó mang sẵn header cùng stub
+glibc cho mọi phiên bản, nên `aws-lc-sys`, `rusqlite` bundled và freetype đều
+tự dựng được từ nguồn mà không cần cài gì thêm.
+
+## Ba thư viện phải đi xin
+
+`freetype` và `fontconfig` không thành vấn đề — chúng tự dựng từ nguồn. Nhưng
+bước link đòi ba thư viện dùng chung của Linux mà không có bản nhúng:
+
+```
+error: unable to find dynamic system library 'xcb'
+error: unable to find dynamic system library 'xkbcommon'
+error: unable to find dynamic system library 'xkbcommon-x11'
+```
+
+Lấy thẳng từ gói `.deb` của Ubuntu, không cần Docker. Cần cả gói runtime lẫn
+gói `-dev`: gói `-dev` mới có symlink `.so` trần mà linker tìm, còn gói runtime
+mang `.so.N` thật. Kèm theo `libXau`, `libXdmcp`, `libbsd` và `libxcb-xkb` vì
+`libxcb.so.1` và `libxkbcommon-x11.so.0` khai chúng trong `DT_NEEDED`, và
+`ld.lld` đi giải quyết luôn cả những phụ thuộc bắc cầu đó.
+
+```bash
+SR=/tmp/ubuntu-sysroot; mkdir -p "$SR/debs"; cd "$SR/debs"
+B=http://archive.ubuntu.com/ubuntu/pool/main
+for u in \
+  libx/libxcb/libxcb1_1.14-3ubuntu3_amd64.deb \
+  libx/libxcb/libxcb1-dev_1.14-3ubuntu3_amd64.deb \
+  libx/libxcb/libxcb-xkb1_1.14-3ubuntu3_amd64.deb \
+  libx/libxkbcommon/libxkbcommon0_1.4.0-1_amd64.deb \
+  libx/libxkbcommon/libxkbcommon-dev_1.4.0-1_amd64.deb \
+  libx/libxkbcommon/libxkbcommon-x11-0_1.4.0-1_amd64.deb \
+  libx/libxkbcommon/libxkbcommon-x11-dev_1.4.0-1_amd64.deb \
+  libx/libxau/libxau6_1.0.9-1build5_amd64.deb \
+  libx/libxdmcp/libxdmcp6_1.1.3-0ubuntu6_amd64.deb \
+  libb/libbsd/libbsd0_0.11.5-1_amd64.deb ; do curl -sSfLO "$B/$u"; done
+for f in *.deb; do ar x "$f"; tar -xf data.tar.* -C "$SR"; rm -f data.tar.*; done
+```
+
+Đây là phiên bản của Ubuntu 22.04. Cố ý chọn bản **cũ nhất còn muốn hỗ trợ**,
+lý do ở mục dưới.
+
+## Lệnh dựng
+
+```bash
+SR=/tmp/ubuntu-sysroot
+RUSTFLAGS="-L native=$SR/usr/lib/x86_64-linux-gnu" \
+  cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.35 -p s3browser
+```
+
+Kết quả ở `target/x86_64-unknown-linux-gnu/release/s3browser`, khoảng 52 MB.
+
+### Cái đuôi `.2.35` không bỏ được
+
+Bỏ nó ra thì zig dựng theo glibc mặc định của nó, và bước link chết:
+
+```
+ld.lld: error: undefined reference: fstat64@GLIBC_2.33
+>>> referenced by .../libxkbcommon.so (disallowed by --no-allow-shlib-undefined)
+```
+
+Không phải mã mình gọi `fstat64` — mà `libxkbcommon.so` của Ubuntu 22.04 gọi
+nó, và stub glibc mà zig dựng sẵn lại cũ hơn chỗ symbol đó ra đời. Con số phải
+khớp với bản Ubuntu mà mấy file `.so` kia lấy từ đó.
+
+## Một bản chạy cho 22.04, 24.04 và 26.04
+
+Đừng dựng ba lần. glibc **tương thích ngược**: binary dựng cho một phiên bản
+chạy được trên mọi phiên bản mới hơn, không có chiều ngược lại. Nên bản dựng
+với `.2.35` chạy trên cả ba, còn bản dựng với `.2.39` sẽ **hỏng trên 22.04** mà
+chẳng được gì.
+
+| Ubuntu | glibc |
+|---|---|
+| 22.04 | 2.35 |
+| 24.04 | 2.39 |
+| 26.04 | 2.43 |
+
+Kiểm lại sàn thật của một binary — con số cao nhất hiện ra chính là phiên bản
+Ubuntu tối thiểu nó chạy được:
+
+```bash
+llvm-readelf --dyn-syms target/x86_64-unknown-linux-gnu/release/s3browser \
+  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -u -V | tail -1
+```
+
+Và danh sách thư viện máy người dùng phải có — nên ngắn, và mọi bản Ubuntu
+desktop đều có sẵn:
+
+```bash
+llvm-readelf -d target/x86_64-unknown-linux-gnu/release/s3browser | grep NEEDED
+```
+
+```
+libxcb.so.1   libxkbcommon.so.0   libxkbcommon-x11.so.0   libm.so.6   libc.so.6
+```
+
+## Chưa kiểm chứng
+
+Binary này **chưa từng chạy trên Linux**. Những gì kiểm được từ macOS chỉ là
+cấu trúc file: đúng ELF 64-bit x86-64, sàn glibc đúng như chủ đích, danh sách
+`DT_NEEDED` không có gì lạ. Renderer Vulkan của blade có dựng nổi device
+không, Secret Service có nhận khoá không, cửa sổ dưới Wayland ra sao — phải
+chạy thật trên máy Linux mới biết.
