@@ -82,6 +82,14 @@ pub struct Settings {
     /// Bytes per second, zero for unlimited.
     pub bandwidth_limit: u64,
     pub job_concurrency: usize,
+    /// Whether to ask GitHub for a newer release on launch.
+    ///
+    /// On by default, and a real setting rather than a constant: a check is a
+    /// network request to a third party that the user did not initiate, and
+    /// someone on a metered link or an air-gapped machine is entitled to turn
+    /// it off. Turning it off does not disable the manual command - asking on
+    /// purpose is a different act from being asked on every launch.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -92,6 +100,7 @@ impl Default for Settings {
             preview_limit_mb: 8,
             bandwidth_limit: 0,
             job_concurrency: 2,
+            check_updates: true,
         }
     }
 }
@@ -202,6 +211,9 @@ mod tests {
             preview_limit_mb: 32,
             bandwidth_limit: 5_000_000,
             job_concurrency: 4,
+            // Not the default, so the round trip below proves the field is
+            // written and read rather than quietly falling back both times.
+            check_updates: false,
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
@@ -217,6 +229,7 @@ mod tests {
             loaded.preview_limit_mb,
             Settings::default().preview_limit_mb
         );
+        assert_eq!(loaded.check_updates, Settings::default().check_updates);
 
         _ = std::fs::remove_dir_all(&dir);
     }

@@ -18,6 +18,7 @@ mod glass_check;
 mod platform;
 mod settings;
 mod theme;
+mod update;
 
 use std::time::Duration;
 

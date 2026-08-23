@@ -118,8 +118,14 @@ impl Chrome {
 }
 
 /// Titlebar setup. On macOS the traffic lights stay native and are nudged to
-/// line up with our own toolbar; elsewhere GPUI ignores the position and the
-/// window keeps its system controls.
+/// line up with our own toolbar.
+///
+/// `appears_transparent` is not cosmetic off macOS: on Windows GPUI reads it as
+/// "hide the system caption", so the window loses its close, minimise and
+/// maximise buttons unless the application draws its own. It does - the top row
+/// is a `TitleBar` from gpui-component, which carries them. Linux ignores this
+/// field and decides by protocol instead, and GNOME offers none, so the same
+/// drawn controls are the only ones there too.
 pub fn titlebar_options() -> Option<TitlebarOptions> {
     Some(TitlebarOptions {
         title: Some("s3browser".into()),

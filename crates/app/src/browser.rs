@@ -18,6 +18,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tooltip::Tooltip;
+use gpui_component::TitleBar;
 use gpui_tokio::Tokio;
 use s3core::{
     capability::{Capabilities, CapabilityCache, Support},
@@ -1065,6 +1066,11 @@ pub struct Browser {
     /// The handoff fetch's own slot. It used to share `op_task`, which meant any
     /// other operation cancelled the download and left nothing to say so.
     open_task: Option<Task<()>>,
+    /// A release newer than this build, once a check has found one.
+    update: Option<crate::update::Update>,
+    /// Holds the check in flight so a second one replaces it rather than
+    /// racing it, and so a check outlives neither the window nor its own view.
+    update_task: Option<Task<()>>,
     /// Capability probing gets its own slot: it runs alongside whatever the user
     /// is doing, and sharing `op_task` meant opening the inspector cancelled it.
     caps_task: Option<Task<()>>,
@@ -1330,6 +1336,8 @@ impl Browser {
             paging_task: None,
             op_task: None,
             open_task: None,
+            update: None,
+            update_task: None,
             caps_task: None,
             thumb_task: None,
             tick_task: None,
@@ -1344,6 +1352,12 @@ impl Browser {
 
         if !this.profiles.is_empty() {
             this.connect(0, cx);
+        }
+        // Not awaited and not announced: the window is already on screen, and a
+        // launch that waits on GitHub is a launch that hangs whenever GitHub is
+        // slow. Nothing appears unless there is genuinely something newer.
+        if this.settings.check_updates {
+            this.check_for_update(false, cx);
         }
         this
     }
@@ -4005,6 +4019,7 @@ impl Browser {
                 cx.notify();
             }
             Command::About => self.open_about(cx),
+            Command::CheckUpdate => self.check_for_update(true, cx),
             Command::CopyPath => self.copy_location(true, cx),
             Command::CopyKey => self.copy_location(false, cx),
             Command::AclFolderPrivate => self.set_acl_recursive("private", cx),
@@ -4750,22 +4765,146 @@ impl Browser {
 
         self.open_task = Some(cx.spawn(async move |this, cx| {
             let outcome = fetching.await;
+            // The chip goes away in its own short borrow, before the handoff.
             _ = this.update(cx, |this, cx| {
                 this.opening = None;
-                match outcome {
-                    Ok(Ok(path)) => match opener::open(&path) {
-                        Ok(()) => this.status = format!("Đã mở {}", path.display()).into(),
-                        Err(error) => this.report(format!("Không mở được: {error}")),
-                    },
-                    Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
-                }
                 cx.notify();
             });
+            match outcome {
+                // Deliberately outside the update above: see
+                // `hand_to_the_system`.
+                Ok(Ok(path)) => {
+                    let shown = path.display().to_string();
+                    Self::hand_to_the_system(
+                        path.into_os_string(),
+                        format!("Đã mở {shown}"),
+                        this,
+                        cx,
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => {
+                    _ = this.update(cx, |this, cx| {
+                        this.report(format!("{error:?}"));
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    _ = this.update(cx, |this, cx| {
+                        this.report(format!("Task lỗi: {error}"));
+                        cx.notify();
+                    });
+                }
+            }
         }));
         // The chip's bar is redrawn by the same loop the transfer queue uses.
         self.start_ticking(cx);
         cx.notify();
+    }
+
+    /// Hands a path to the operating system with nothing of ours borrowed.
+    ///
+    /// On Windows `opener` ends up in `ShellExecuteW`, which pumps the message
+    /// loop while it works: Windows re-enters our own window procedure before
+    /// the call returns. Reached from inside a listener or an `update`, that
+    /// second entry finds the view already mutably borrowed and panics - and
+    /// the panic surfaces inside a procedure that cannot unwind, so the
+    /// process aborts outright instead of reporting anything. The crash report
+    /// for it reads `panic in a function that cannot unwind`, with
+    /// `ShellExecuteW` and `CallWindowProcW` both on the stack.
+    ///
+    /// Spawning keeps the call on the same thread - the shell wants a thread
+    /// with a message loop - but moves it past the end of the current borrow.
+    fn open_path_externally(
+        &self,
+        path: std::path::PathBuf,
+        success: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.hand_off(path.into_os_string(), success, cx);
+    }
+
+    /// The same escape from the borrow, for a URL rather than a file.
+    fn open_url_externally(&self, url: String, cx: &mut Context<Self>) {
+        self.hand_off(url.into(), None, cx);
+    }
+
+    fn hand_off(
+        &self,
+        target: std::ffi::OsString,
+        success: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            Self::hand_to_the_system(target, success.unwrap_or_default(), this, cx).await;
+        })
+        .detach();
+    }
+
+    /// The half of [`Self::open_path_externally`] that already has no borrow held.
+    async fn hand_to_the_system(
+        target: std::ffi::OsString,
+        success: String,
+        this: gpui::WeakEntity<Self>,
+        cx: &mut gpui::AsyncApp,
+    ) {
+        let result = opener::open(&target);
+        _ = this.update(cx, |this, cx| {
+            match result {
+                Ok(()) => {
+                    if !success.is_empty() {
+                        this.status = success.into();
+                    }
+                }
+                Err(error) => this.report(format!("Không mở được: {error}")),
+            }
+            cx.notify();
+        });
+    }
+
+    /// Asks GitHub whether a release newer than this build exists.
+    ///
+    /// `announce` separates the two ways this is reached. From the palette the
+    /// user asked, and is owed an answer either way - including "already the
+    /// newest", which is the answer they were probably hoping for and which a
+    /// silent check never gives. On launch nobody asked, so a failure stays
+    /// quiet: being offline, behind a proxy, or rate-limited by GitHub is not
+    /// the user's fault and not worth an error card over a request they never
+    /// made.
+    fn check_for_update(&mut self, announce: bool, cx: &mut Context<Self>) {
+        let http = cx.http_client();
+        let current = env!("CARGO_PKG_VERSION");
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let found = crate::update::check(http, current).await;
+            _ = this.update(cx, |this, cx| {
+                match found {
+                    Ok(Some(update)) => {
+                        this.status =
+                            SharedString::from(format!("Có bản {} trên GitHub", update.version));
+                        this.update = Some(update);
+                    }
+                    Ok(None) => {
+                        // Cleared, not left alone: a check that now says no is
+                        // the newer answer, and a button offering a version
+                        // that has been pulled is worse than no button.
+                        this.update = None;
+                        if announce {
+                            this.status = SharedString::from(format!(
+                                "Đang chạy bản mới nhất ({current})"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if announce {
+                            this.report(format!(
+                                "Không kiểm tra được bản cập nhật: {error:?}"
+                            ));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// Stops a handoff fetch and takes its chip away.
@@ -6080,15 +6219,24 @@ impl Browser {
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Chưa chọn profile".to_string());
 
-        div()
+        // A `TitleBar` rather than a plain row, because on Windows and Linux
+        // this row *is* the title bar and nothing else draws one. Windows hides
+        // the system caption whenever `appears_transparent` is set, and GNOME's
+        // compositor implements no server-side decoration protocol at all, so a
+        // window whose application draws no controls has no way to be closed,
+        // minimised or moved. This component carries the three buttons, the
+        // drag region and the right-click window menu, and reports each one to
+        // the platform through `WindowControlArea` so hit-testing outside our
+        // own paint still works. On macOS it renders no buttons: the native
+        // traffic lights are still there, floating over the transparent
+        // titlebar.
+        TitleBar::new()
             .h(px(TOOLBAR_HEIGHT))
-            .flex()
             .items_center()
             .gap_2()
             .pl(px(platform::toolbar_leading_inset()))
             .pr_2()
             .bg(theme.panel)
-            .border_b_1()
             .border_color(theme.border)
             .when_some(self.path_input.clone(), |this, input| {
                 this.child(div().flex_1().min_w(px(0.)).child(
@@ -7740,6 +7888,27 @@ impl Browser {
                                 })),
                             theme,
                         ))
+                        .child(setting_row(
+                            "Kiểm tra bản mới",
+                            Some("Hỏi GitHub lúc mở app"),
+                            div()
+                                .flex()
+                                .gap_1()
+                                .children([true, false].into_iter().map(|on| {
+                                    choice_chip(
+                                        SharedString::from(format!("check-updates-{on}")),
+                                        if on { "Bật".into() } else { "Tắt".into() },
+                                        settings.check_updates == on,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            this.update_settings(|s| s.check_updates = on, cx)
+                                        },
+                                    ))
+                                })),
+                            theme,
+                        ))
                         .child(settings_group("TRUYỀN TẢI", theme))
                         .child(setting_row(
                             "Băng thông",
@@ -7845,10 +8014,7 @@ impl Browser {
                                 )
                                 .on_click(cx.listener(
                                     move |this, _event, _window, cx| {
-                                        if let Err(error) = opener::open(&dir) {
-                                            this.report(format!("Không mở được thư mục: {error}"));
-                                        }
-                                        cx.notify();
+                                        this.open_path_externally(dir.clone(), None, cx);
                                     },
                                 )),
                                 theme,
@@ -7922,10 +8088,7 @@ impl Browser {
                                 dir.display()
                             ));
                         }
-                        if let Err(error) = opener::open(target) {
-                            this.report(format!("Không mở được thư mục: {error}"));
-                        }
-                        cx.notify();
+                        this.open_path_externally(target.to_path_buf(), None, cx);
                     }))
                     .into_any_element(),
                 // Not a button. One that hovers and does nothing is a promise
@@ -9759,6 +9922,31 @@ impl Browser {
                     .text_color(theme.text_faint)
                     .child(concat!("v", env!("CARGO_PKG_VERSION"))),
             )
+            // Next to the version, because that is what it is about: the row
+            // reads "v0.1.0  Có bản 0.2.0". Absent entirely when there is
+            // nothing newer - a permanent "up to date" badge is a line of
+            // furniture that is right almost always and so is never read.
+            .when_some(self.update.clone(), |this, update| {
+                let url = update.url.clone();
+                this.child(
+                    div()
+                        .id("update-available")
+                        .flex_shrink_0()
+                        .ml_1()
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(theme.accent.opacity(0.16))
+                        .text_color(theme.accent)
+                        .child(SharedString::from(format!("Có bản {}", update.version)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Mở trang phát hành trên GitHub").build(window, cx)
+                        })
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.open_url_externally(url.clone(), cx);
+                        })),
+                )
+            })
     }
 
     /// "bộ nhớ tạm", with how far behind it is when that can be worked out.
@@ -14745,6 +14933,10 @@ pub enum Command {
     /// Version and where the files are. Also at the foot of the sidebar; this
     /// is the way in for someone who lives in the palette.
     About,
+    /// Asks GitHub for a newer release now, whatever the setting says about
+    /// asking on launch: choosing to check is a different act from being
+    /// checked on.
+    CheckUpdate,
     CopyPath,
     CopyKey,
     AclFolderPrivate,
@@ -14792,6 +14984,7 @@ impl Command {
             Command::Buckets => ("Tất cả bucket", ""),
             Command::Settings => ("Cài đặt", ""),
             Command::About => ("Giới thiệu", ""),
+            Command::CheckUpdate => ("Kiểm tra bản cập nhật", ""),
             Command::CopyPath => ("Chép đường dẫn s3://", ""),
             Command::CopyKey => ("Chép key", ""),
             Command::AclFolderPrivate => ("Thư mục: đặt riêng tư", ""),
@@ -14820,7 +15013,7 @@ impl Command {
         }
     }
 
-    fn all() -> [Command; 38] {
+    fn all() -> [Command; 39] {
         [
             Command::Refresh,
             Command::GoUp,
@@ -14854,6 +15047,7 @@ impl Command {
             Command::Buckets,
             Command::Settings,
             Command::About,
+            Command::CheckUpdate,
             Command::CopyPath,
             Command::CopyKey,
             Command::AclFolderPrivate,
@@ -15150,6 +15344,8 @@ mod tests {
             paging_task: None,
             op_task: None,
             open_task: None,
+            update: None,
+            update_task: None,
             caps_task: None,
             thumb_task: None,
             tick_task: None,
@@ -15955,7 +16151,7 @@ mod tests {
         let all = Command::all();
         // A command missing from `all()` would be unreachable from the palette
         // while still looking implemented.
-        assert_eq!(all.len(), 38);
+        assert_eq!(all.len(), 39);
         for command in all {
             let (label, _) = command.label();
             assert!(!label.is_empty(), "{command:?} has no label");
