@@ -5,7 +5,7 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::Focusable as _;
@@ -150,7 +150,25 @@ const PALETTE_WIDTH: f32 = 540.;
 /// Roomier than a list row. The palette is the app's front door, not a data
 /// grid; cramped rows read as a debug menu.
 const PALETTE_ROW_HEIGHT: f32 = 38.;
+/// The file-type tile in the preview and detail headers.
+///
+/// Down from 30. In the detail panel it sits beside a single line of 12px text
+/// and a 26px close button, and at 30 it was the tallest thing in the row by
+/// half again — a large empty box next to a small label, which is most of why
+/// it read as unfinished.
+const KIND_TILE: f32 = 26.;
+/// The same tile standing in for a whole preview, when the type is one this app
+/// hands to another application rather than drawing itself.
+const KIND_TILE_LARGE: f32 = 64.;
 const PROGRESS_HEIGHT: f32 = 4.;
+/// Wide enough for a file name and a size pair, narrow enough to stay out of
+/// the way of the listing it floats over.
+const OPENING_WIDTH: f32 = 248.;
+/// How much of the object one request pulls while fetching it for another app.
+///
+/// Small enough that the bar moves on anything worth watching, large enough
+/// that a 500 MB file is not five hundred round trips.
+const OPEN_CHUNK: u64 = 4 * 1024 * 1024;
 /// Queue progress is the one motion that should feel alive. 125ms is frequent
 /// enough to avoid chunky bars without repainting the whole app every frame.
 const TRANSFER_TICK_MS: u64 = 125;
@@ -404,6 +422,23 @@ pub struct Inspection {
 /// opening the inspector and previewing in the same gesture read `head` before
 /// the HEAD request had returned, so the size came back zero and the preview
 /// gave up. The size is in the listing already; nothing needs to be asked.
+/// A file being fetched so that another application can open it.
+///
+/// The counters are shared with the fetch task rather than sent back through
+/// the entity on every chunk: the repaint loop already runs at
+/// `TRANSFER_TICK_MS` for the transfer queue, and reading two atomics from it
+/// is cheaper than waking the view a hundred times a second.
+struct Opening {
+    name: SharedString,
+    /// Where the bytes are landing, so cancelling can clean up after itself.
+    path: PathBuf,
+    /// Bytes written so far.
+    done: std::sync::Arc<AtomicU64>,
+    /// The object's size. Zero for the moment before the size is known, which
+    /// is why the bar is drawn empty rather than full at that point.
+    total: std::sync::Arc<AtomicU64>,
+}
+
 pub struct Previewing {
     key: String,
     name: SharedString,
@@ -977,6 +1012,8 @@ pub struct Browser {
     next_tab_id: u64,
     /// The preview overlay, when one is open.
     previewing: Option<Previewing>,
+    /// A file on its way down so another app can open it.
+    opening: Option<Opening>,
     screen: Screen,
     /// Whether the path box is showing where you have been.
     ///
@@ -1025,6 +1062,9 @@ pub struct Browser {
     listing_task: Option<Task<()>>,
     paging_task: Option<Task<()>>,
     op_task: Option<Task<()>>,
+    /// The handoff fetch's own slot. It used to share `op_task`, which meant any
+    /// other operation cancelled the download and left nothing to say so.
+    open_task: Option<Task<()>>,
     /// Capability probing gets its own slot: it runs alongside whatever the user
     /// is doing, and sharing `op_task` meant opening the inspector cancelled it.
     caps_task: Option<Task<()>>,
@@ -1267,6 +1307,7 @@ impl Browser {
             active_tab: 0,
             next_tab_id: 1,
             previewing: None,
+            opening: None,
             screen: Screen::default(),
             path_suggesting: false,
             path_choice: None,
@@ -1288,6 +1329,7 @@ impl Browser {
             listing_task: None,
             paging_task: None,
             op_task: None,
+            open_task: None,
             caps_task: None,
             thumb_task: None,
             tick_task: None,
@@ -4634,7 +4676,8 @@ impl Browser {
             return;
         };
         // From the listing, which has it, rather than from a HEAD that may not
-        // have happened.
+        // have happened. Zero means "not known here", not "empty object" — the
+        // fetch asks in that case rather than assuming.
         let size = self
             .entries
             .iter()
@@ -4649,23 +4692,66 @@ impl Browser {
             .unwrap_or(0)
             .max(0) as u64;
         let name = entry_name_of(&key);
+        // A per-run subdirectory keeps two objects with the same name from
+        // overwriting each other.
+        let dir = std::env::temp_dir().join(format!("s3browser-{}", std::process::id()));
+        let path = dir.join(&name);
 
-        self.status = format!("Đang tải {name} để mở…").into();
+        let done = std::sync::Arc::new(AtomicU64::new(0));
+        let total = std::sync::Arc::new(AtomicU64::new(size));
+        self.opening = Some(Opening {
+            name: SharedString::from(name),
+            path: path.clone(),
+            done: done.clone(),
+            total: total.clone(),
+        });
+        // Cleared, not set: the chip below carries this now, and a status line
+        // saying the same thing in smaller type is one of them going stale.
+        self.status = SharedString::default();
 
+        let target = path;
         let fetching = Tokio::spawn(cx, async move {
-            let bytes = client.get_range(&bucket, &key, 0..size, None).await?;
-            // A per-run subdirectory keeps two objects with the same name from
-            // overwriting each other.
-            let dir = std::env::temp_dir().join(format!("s3browser-{}", std::process::id()));
+            use std::io::Write as _;
+
+            // The old code took the listing's size on faith and fell through to
+            // `0..0` when it had none, writing an empty file that the other app
+            // then opened as a corrupt document rather than as an error.
+            let bytes_total = if size > 0 {
+                size
+            } else {
+                let head = client.head_object(&bucket, &key).await?;
+                let measured = head.size.max(0) as u64;
+                total.store(measured, Ordering::Relaxed);
+                measured
+            };
+
             std::fs::create_dir_all(&dir)?;
-            let path = dir.join(&name);
-            std::fs::write(&path, bytes)?;
-            anyhow::Ok(path)
+            let mut file = std::fs::File::create(&target)?;
+            // In chunks rather than one request, so there is something to
+            // report: a whole-object GET has exactly two observable states, and
+            // neither of them is "nearly there".
+            let mut offset = 0u64;
+            while offset < bytes_total {
+                let take = OPEN_CHUNK.min(bytes_total - offset);
+                let chunk = client
+                    .get_range(&bucket, &key, offset..offset + take, None)
+                    .await?;
+                if chunk.is_empty() {
+                    break;
+                }
+                offset += chunk.len() as u64;
+                file.write_all(&chunk)?;
+                done.store(offset, Ordering::Relaxed);
+            }
+            file.flush()?;
+            drop(file);
+            anyhow::Ok(target)
         });
 
-        self.op_task = Some(cx.spawn(async move |this, cx| {
+        self.open_task = Some(cx.spawn(async move |this, cx| {
             let outcome = fetching.await;
             _ = this.update(cx, |this, cx| {
+                this.opening = None;
                 match outcome {
                     Ok(Ok(path)) => match opener::open(&path) {
                         Ok(()) => this.status = format!("Đã mở {}", path.display()).into(),
@@ -4677,6 +4763,24 @@ impl Browser {
                 cx.notify();
             });
         }));
+        // The chip's bar is redrawn by the same loop the transfer queue uses.
+        self.start_ticking(cx);
+        cx.notify();
+    }
+
+    /// Stops a handoff fetch and takes its chip away.
+    fn cancel_open(&mut self, cx: &mut Context<Self>) {
+        let Some(opening) = self.opening.take() else {
+            return;
+        };
+        // Dropping the task aborts the request with it. The half-written file
+        // goes too: the next open of the same object would truncate it anyway,
+        // but leaving a partial file named after a real object is the sort of
+        // thing that gets opened by hand later and believed.
+        self.open_task = None;
+        _ = std::fs::remove_file(&opening.path);
+        self.status = format!("Đã huỷ tải {}", opening.name).into();
+        cx.notify();
     }
 
     /// Space opens detail first, then the preview on a second press.
@@ -5580,7 +5684,10 @@ impl Browser {
                     .await;
                 let still_working = this.update(cx, |this, cx| {
                     cx.notify();
-                    this.transfers.has_active_work()
+                    // The handoff fetch draws a progress bar too, and it is not
+                    // a queue job — without this the bar sat frozen at whatever
+                    // it read on the frame the download started.
+                    this.transfers.has_active_work() || this.opening.is_some()
                 });
                 match still_working {
                     Ok(true) => continue,
@@ -7065,7 +7172,7 @@ impl Browser {
         let previewing = self.previewing.as_ref()?;
         let theme = self.theme;
         let limit_mb = self.settings.preview_limit_bytes() / (1024 * 1024);
-        let kind: SharedString = type_badge_of(&previewing.name).unwrap_or_else(|| "TỆP".into());
+        let kind = type_badge_of(&previewing.name);
         let truncated = matches!(
             previewing.content,
             Some(Preview::Text(_)) | Some(Preview::Table(_))
@@ -7097,7 +7204,14 @@ impl Browser {
             .and_then(|inspector| inspector.head.as_ref())
             .and_then(|head| head.content_type.clone())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| kind.to_string());
+            // The extension is a poor stand-in for a content type, but it is
+            // the only thing known here before the HEAD lands, and a file with
+            // no extension has nothing to stand in with.
+            .unwrap_or_else(|| {
+                kind.as_ref()
+                    .map(SharedString::to_string)
+                    .unwrap_or_else(|| "Không rõ".into())
+            });
         let state_text: SharedString = if truncated {
             format!("Giới hạn {limit_mb} MB").into()
         } else if previewing.content.is_none() {
@@ -7196,18 +7310,7 @@ impl Browser {
                     .items_center()
                     .justify_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .size(px(64.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(theme.hover)
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child(kind.clone()),
-                    )
+                    .child(kind_tile(kind.clone(), KIND_TILE_LARGE, theme))
                     .child(div().text_color(theme.text).child(reason.clone()))
                     .into_any_element(),
             }
@@ -7367,18 +7470,7 @@ impl Browser {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .size(px(30.))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_lg()
-                                    .bg(theme.hover)
-                                    .text_color(theme.text_muted)
-                                    .child(kind.clone()),
-                            )
+                            .child(kind_tile(kind.clone(), KIND_TILE, theme))
                             .child(
                                 div()
                                     .flex_1()
@@ -9394,6 +9486,112 @@ impl Browser {
         }
     }
 
+    /// The chip that says a file is on its way down to be handed to another app.
+    ///
+    /// Floating above the status bar rather than written into it. "Mở bằng app"
+    /// is reached from the preview overlay as often as from the listing, and
+    /// that overlay's scrim covers the status bar — a line nobody can see is
+    /// not feedback. It is also the only progress in the app that is not a
+    /// queue job, so the drawer is not where anyone would look for it.
+    fn render_opening(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let opening = self.opening.as_ref()?;
+        let theme = self.theme;
+        let done = opening.done.load(Ordering::Relaxed);
+        let total = opening.total.load(Ordering::Relaxed);
+        // Empty rather than full while the size is still unknown: a bar sitting
+        // at 100% before anything has arrived is a worse lie than no bar.
+        let fraction = if total > 0 {
+            (done as f32 / total as f32).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let measure = if total > 0 {
+            format!("{} / {}", format_size(done as i64), format_size(total as i64))
+        } else {
+            format_size(done as i64)
+        };
+
+        Some(
+            div()
+                .absolute()
+                .bottom(px(HEADER_HEIGHT + 10.))
+                .right(px(14.))
+                .w(px(OPENING_WIDTH))
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .rounded_lg()
+                .bg(theme.modal)
+                .border_1()
+                .border_color(theme.border_strong)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(sized_icon("download", 12., theme.text_faint))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_xs()
+                                .text_color(theme.text)
+                                .child(opening.name.clone()),
+                        )
+                        // A fetch of a large object is a wait someone may change
+                        // their mind about, and the only other way out of it is
+                        // to start something else and hope it cancels this.
+                        .child(
+                            small_icon_button("opening-cancel".into(), "close", 10., theme)
+                                .size(px(18.))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new("Huỷ").build(window, cx)
+                                })
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.cancel_open(cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(PROGRESS_HEIGHT))
+                        .rounded_sm()
+                        .bg(theme.hover)
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(fraction))
+                                .rounded_sm()
+                                .bg(theme.accent),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .whitespace_nowrap()
+                                .child(SharedString::from(measure)),
+                        )
+                        .when(total > 0, |this| {
+                            this.child(SharedString::from(format!(
+                                "{}%",
+                                (fraction * 100.0).round() as u32
+                            )))
+                        }),
+                ),
+        )
+    }
+
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let stats = self.transfers.stats();
@@ -10023,10 +10221,12 @@ impl Browser {
         let detail_subtitle = detail_is_multi.then(|| {
             SharedString::from(format!("Đang xem: {}", elide_middle(&inspected_name, 28)))
         });
+        // Built at the render site rather than folded into one string here:
+        // the two cases are different shapes, not two values of one shape.
         let inspector_kind = if detail_is_multi {
-            SharedString::from(selected_object_count.to_string())
+            count_tile(selected_object_count, theme)
         } else {
-            type_badge_of(&inspector.key).unwrap_or_else(|| "TỆP".into())
+            kind_tile(type_badge_of(&inspector.key), KIND_TILE, theme)
         };
 
         Some(
@@ -10064,19 +10264,7 @@ impl Browser {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(
-                                    div()
-                                        .size(px(30.))
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_lg()
-                                        .bg(theme.hover)
-                                        .text_xs()
-                                        .text_color(theme.text_muted)
-                                        .child(inspector_kind),
-                                )
+                                .child(inspector_kind)
                                 .child(
                                     div()
                                         .flex_1()
@@ -11677,6 +11865,10 @@ impl Render for Browser {
             .children(self.render_about(cx))
             .children(self.render_acl_popup(cx))
             .children(self.render_path_suggestions(cx))
+            // Over the preview and the dialogs, because it is started from
+            // inside them; under the palette, which is summoned deliberately
+            // and should not have a chip sitting on its corner.
+            .children(self.render_opening(cx))
             // Last, so it paints over everything. The palette can be summoned
             // from on top of any of these — "Sửa nội dung" only makes sense
             // while a preview is open — and it used to come up *behind* the
@@ -14257,6 +14449,89 @@ fn check_box(checked: bool, theme: Theme) -> impl IntoElement {
         })
 }
 
+/// The file-type tile shown in the preview and detail headers.
+///
+/// One helper for all three places that had it, because they were three copies
+/// of the same eight lines and had already drifted apart: the detail panel set
+/// `text_xs`, the preview header set nothing, and the preview's placeholder set
+/// `text_xs` inside a box two and a half times the size.
+///
+/// A square holding the extension rather than a picture per file family: this
+/// app draws its own icon set, and there is no glyph for `webp` that tells
+/// anyone more than the word `WEBP` does.
+fn kind_tile(label: Option<SharedString>, size: f32, theme: Theme) -> gpui::Div {
+    // Everything inside scales with the box, so one tile serves both the badge
+    // beside a file name and the placeholder filling the middle of a preview
+    // without the larger one being a second implementation that drifts.
+    let scale = size / KIND_TILE;
+    let tile = div()
+        .size(px(size))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .when_else(
+            size > KIND_TILE * 1.5,
+            |this| this.rounded_xl(),
+            |this| this.rounded_md(),
+        )
+        .bg(theme.hover)
+        // A hairline, so it reads as an object sitting on the panel rather than
+        // as a hole cut into it. `hover` is a 6% wash; on a light theme it has
+        // no edge of its own at all, which is what made the old tile look like
+        // a gap the text happened to be standing in.
+        .border_1()
+        .border_color(theme.border);
+
+    match label {
+        Some(label) => tile
+            .text_size(px(kind_label_size(label.chars().count()) * scale))
+            .text_color(theme.text_muted)
+            .child(label),
+        // No extension is not a failed lookup, so it does not get a word. A
+        // plain sheet says "a file, type unknown" without claiming a type the
+        // name never carried. The fallback used to be the Vietnamese "TỆP",
+        // whose stacked diacritic was the tallest thing in the box.
+        None => tile.child(sized_icon("file", 13. * scale, theme.text_faint)),
+    }
+}
+
+/// The same slot when the panel is describing a selection rather than one file.
+///
+/// A circle, deliberately not the square above: a bare number inside a
+/// file-type tile reads as a file type called "3".
+fn count_tile(count: usize, theme: Theme) -> gpui::Div {
+    let label = count.to_string();
+    div()
+        .size(px(KIND_TILE))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme.selected)
+        .text_size(px(kind_label_size(label.chars().count())))
+        .text_color(theme.accent)
+        .child(SharedString::from(label))
+}
+
+/// How large the letters inside a [`kind_tile`] can be and still fit it.
+///
+/// Stepped rather than truncated. `SQLITE` rendered as `SQLI` looks like a
+/// drawing fault rather than an abbreviation, and the whole extension is an
+/// inch away at the end of the file name regardless — so the one thing this
+/// must not do is invent a shorter type than the file has.
+fn kind_label_size(chars: usize) -> f32 {
+    match chars {
+        0..=2 => 11.,
+        3 => 10.,
+        4 => 8.5,
+        5 => 7.5,
+        // `type_badge_of` refuses anything past six, so this is the floor.
+        _ => 7.,
+    }
+}
+
 /// The extension, as a chip beside the name.
 ///
 /// `None` for folders and for names with nothing to show: an empty chip is a
@@ -14852,6 +15127,7 @@ mod tests {
             active_tab: 0,
             next_tab_id: 1,
             previewing: None,
+            opening: None,
             screen: Screen::default(),
             path_suggesting: false,
             path_choice: None,
@@ -14873,6 +15149,7 @@ mod tests {
             listing_task: None,
             paging_task: None,
             op_task: None,
+            open_task: None,
             caps_task: None,
             thumb_task: None,
             tick_task: None,
@@ -16069,6 +16346,29 @@ mod tests {
             location_text("demo", &keys[..1], true),
             "s3://demo/reports/q1.txt"
         );
+    }
+
+    #[test]
+    fn a_type_tile_shrinks_its_letters_rather_than_cutting_them() {
+        // Three characters — png, pdf, mp4 — is the common case and gets the
+        // roomiest size that still clears the tile's edges.
+        assert_eq!(kind_label_size(3), 10.);
+        // One digit, which is what a selection count usually is, gets the
+        // largest of all rather than being drawn at extension size.
+        assert_eq!(kind_label_size(1), 11.);
+        // The reason the function exists: six characters comes out small but
+        // whole. Truncating `SQLITE` to `SQLI` would name a type the file does
+        // not have, in a tile whose entire job is to name the type.
+        assert!(kind_label_size(6) >= 7.);
+        // Never bigger for being longer, at any length including past the
+        // point `type_badge_of` stops handing anything over.
+        for length in 1..10 {
+            assert!(
+                kind_label_size(length) <= kind_label_size(length - 1),
+                "{length} chữ lại to hơn {} chữ",
+                length - 1
+            );
+        }
     }
 
     #[test]

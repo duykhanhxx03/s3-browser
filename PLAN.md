@@ -1136,3 +1136,70 @@ vuông.
 Bài học ghi lại: khi revert bằng script, thứ phân biệt hai khối phải là *nội
 dung* của chúng, không phải khoảng trắng — thụt lề là thứ dễ đảo nhất và im
 lặng nhất khi đảo.
+
+### 10.23 Tải để "Mở bằng app" có mặt trên màn hình (23/08/2026)
+
+"Mở bằng app" tải cả tệp về rồi mới giao cho ứng dụng khác, và trong lúc đó
+phản hồi duy nhất là một dòng ở thanh trạng thái. Với tệp 200 MB nghĩa là hàng
+chục giây không có gì chuyển động, không biết còn bao lâu, không có đường lùi.
+
+**Chip nổi thay vì dòng trạng thái.** "Mở bằng app" được gọi từ overlay xem
+trước cũng nhiều như từ danh sách, mà scrim của overlay đó phủ lên thanh trạng
+thái — một dòng không ai nhìn thấy thì không phải là phản hồi. Chip nằm góc
+dưới phải, trên preview và các hộp thoại, dưới palette: tên tệp, thanh 4px,
+`{đã tải} / {tổng}` và phần trăm, cộng một dấu × để huỷ.
+
+**Tải theo khối 4 MB.** Một GET cả object chỉ có đúng hai trạng thái quan sát
+được, và không cái nào là "sắp xong". Tiến độ đi qua hai `AtomicU64` chia sẻ với
+task; vòng repaint 125ms của hàng đợi được nới điều kiện để chạy tiếp khi đang
+có chip, nên không cần cơ chế vẽ lại thứ hai.
+
+**Ổ cắm task riêng.** Trước đây dùng chung `op_task`, nghĩa là bất kỳ thao tác
+nào khác cũng huỷ mất lượt tải — và sẽ để lại cái chip đứng im với không có gì
+phía sau. Cùng lý do `caps_task` và `thumb_task` từng được tách ra.
+
+**Một lỗi im lặng sửa luôn.** Kích thước lấy từ listing, `unwrap_or(0)`; khi
+object được mở từ chỗ không có listing đứng sau thì nó rơi xuống `0..0` và ghi
+ra **một tệp rỗng**, rồi giao cho ứng dụng khác — hiện ra như tài liệu hỏng chứ
+không phải như một lỗi. Giờ size bằng 0 nghĩa là "chưa biết", và task hỏi
+`HeadObject` trước.
+
+Huỷ thì xoá luôn tệp dở. Lần mở sau vẫn ghi đè, nhưng một tệp dở mang đúng tên
+một object thật là thứ về sau có người mở tay ra và tin.
+
+**Chưa biên dịch** (đang giữ đĩa trống). Mới chỉ chắc chắn cú pháp hợp lệ:
+`rustfmt` phân tích được toàn bộ file.
+
+### 10.24 Ô kiểu tệp ở panel chi tiết (23/08/2026)
+
+Góp ý "icon file type nên chỉn chu hơn" bắt đúng bốn thứ cùng lúc, và chỉ một
+trong số đó là chuyện thẩm mỹ.
+
+**Hai bản sao đã lệch nhau.** Ô ở panel chi tiết và ô ở overlay xem trước là hai
+khối giống hệt nhau chép ra — trừ việc một cái có `text_xs`, cái kia không. Cùng
+một huy hiệu, hai cỡ chữ, hai chỗ. Giờ là một `kind_tile` dùng chung.
+
+**Chữ không vừa ô.** `PNG` ở 12px trong ô 30px chạm cả hai mép; `WEBP` hay
+`SQLITE` thì tràn. Cỡ chữ giờ bậc theo độ dài (11 / 10 / 8,5 / 7,5 / 7px) —
+*bậc chứ không cắt*: `SQLITE` rút thành `SQLI` trông như lỗi vẽ, và nó đặt cho
+tệp một cái kiểu mà tệp không có, trong chính cái ô sinh ra để gọi tên kiểu.
+
+**Ô 30px cạnh một dòng chữ 12px.** Ở panel chi tiết, tệp đơn chỉ có một dòng
+tên, nên ô là thứ cao nhất hàng, cao hơn nút đóng 26px. Xuống 26px, và thêm
+một đường viền tóc: `hover` là lớp phủ 6%, ở theme sáng nó **không có cạnh
+riêng** — đó là lý do chính khiến nó đọc ra như một lỗ khoét chứ không phải một
+vật đặt trên panel.
+
+**Hai nghĩa, hai hình.** Khi panel mô tả một tập chọn thì ô đó chứa con số. Một
+con số nằm trong ô kiểu-tệp đọc ra là "kiểu tệp tên là 3". Số giờ nằm trong hình
+tròn, chữ nằm trong hình vuông.
+
+Bỏ luôn chuỗi dự phòng `TỆP`: tệp không có phần mở rộng thì không phải là tra
+cứu thất bại, nên nó không được gán chữ — nó nhận glyph tờ giấy. Dấu chồng của
+`Ệ` vốn là thứ cao nhất trong ô.
+
+Không thêm màu theo họ tệp. Cả app đang là trung tính + một màu nhấn, và bảy sắc
+độ cho bảy họ tệp là quyết định thị giác cần nhìn tận mắt trước khi chốt, không
+phải thứ đoán mò khi chưa build được.
+
+**Chưa biên dịch**, mới chắc cú pháp (`rustfmt` phân tích trọn file).
