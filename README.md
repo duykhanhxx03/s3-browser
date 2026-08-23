@@ -1,164 +1,249 @@
 # s3browser
 
-Desktop S3 client viết bằng Rust + [GPUI](https://gpui.rs), UI glass, chạy trên macOS / Windows / Linux.
-Kế hoạch đầy đủ: [PLAN.md](PLAN.md).
+A desktop S3 client written in Rust on [GPUI](https://gpui.rs), for macOS,
+Windows and Linux.
 
-**Trạng thái: M1 (Browse) đã xong.** Xem [Kết quả M1](#kết-quả-m1) · [Kết quả M0](#kết-quả-m0).
+It talks to Amazon S3 and to S3-compatible stores — Cloudflare R2, Backblaze
+B2, Wasabi, DigitalOcean Spaces, MinIO — and treats "S3-compatible" as a
+spectrum rather than a checkbox: it probes what each provider and each token
+can actually do, and hides the features that would only fail.
 
-## Chạy thử
+Credentials never live in a config file. Secret keys go to the operating
+system's credential store (Keychain, Credential Manager, Secret Service) and
+only profile metadata is stored as JSON.
+
+> **Status: usable, unreleased.** The application works and is used against
+> real providers, but there are no signed binaries, no release automation and
+> no CI. See [Status and limitations](#status-and-limitations) before
+> depending on it.
+
+## Features
+
+**Browsing.** Tabs, a clickable breadcrumb, an `s3://` path bar, list and
+grid layouts, pinned and recent places, and an all-buckets page. Listings
+page automatically as you scroll; sorting by anything other than name loads
+the rest of the prefix first, under explicit request and item caps, and says
+when it stopped short rather than presenting a partial answer as a complete
+one.
+
+**Search.** Typing filters what is loaded, for free. Pressing Enter scans the
+whole bucket — a LIST request per thousand keys, so it waits to be asked —
+with caps, a stop button, and a status line that distinguishes "finished",
+"stopped" and "hit the cap".
+
+**Transfers.** An upload/download queue with progress, pause, resume and
+cancel, journalled in SQLite so it survives a restart. Multipart uploads are
+implemented directly rather than through the AWS transfer manager, so a
+resumed job asks the server which parts it already holds instead of starting
+over. Downloads use concurrent ranged GETs pinned to an ETag, so an
+interrupted transfer cannot splice two versions of an object together.
+Bandwidth throttling and adaptive retry for 503 SlowDown are built in.
+
+**Object operations.** Rename, copy and move (server-side, switching to
+UploadPartCopy above 5 GiB), delete with a per-object fallback for stores
+without `DeleteObjects`, versioning, tags, storage class and Glacier restore,
+header editing in bulk, an ACL editor, presigned URLs, and copying `s3://`
+paths or bare keys.
+
+**Preview.** Images, text — editable and saved back — and CSV/TSV rendered as
+a table by an RFC 4180 parser. Everything else is handed to the operating
+system rather than half-rendered in the app.
+
+**Integrity.** CRC32 checksums are sent on upload and verified on download.
+The ETag is deliberately not used for this: for a multipart object it is a
+digest of digests, so comparing it against a whole-file hash fails on exactly
+the large files most worth checking.
+
+**Interface.** A command palette (`⌘K`) whose search ignores Vietnamese
+diacritics, an error log that keeps the provider's own wording alongside a
+plain-language summary, per-region loading and empty states, light and dark
+themes following the system, and crash reports written to disk.
+
+## Status and limitations
+
+| | |
+|---|---|
+| Signed builds | None. macOS Gatekeeper rejects the unsigned `.app`; Developer ID signing and notarisation need a paid Apple Developer account. See [docs/PACKAGING.md](docs/PACKAGING.md). |
+| CI and releases | None yet. Every build here is a local build. |
+| Windows | Cross-compiled from macOS and verified only by inspecting the executable — never run on Windows. |
+| Linux | Compiles, but has not been exercised on a Linux desktop. Window blur is unavailable outside KDE, so the theme falls back to solid. |
+| AWS SSO | The device flow talks to real AWS endpoints and cannot be simulated with MinIO. Only its pure logic is unit tested; treat it as unverified. |
+| ACL writes | Exercised against MinIO, which refuses `PutObjectAcl`. The write path has not run against an ACL-enabled AWS bucket. |
+| Auto-update | Not implemented. |
+
+Verification status for each area is recorded in more detail in
+[PLAN.md](PLAN.md).
+
+## Building from source
+
+Rust stable (developed against 1.97.1) plus a per-platform toolchain:
+
+| Platform | Additional requirements |
+|---|---|
+| macOS | Xcode and the **Metal Toolchain**. GPUI compiles Metal shaders at build time, and Xcode 26 ships that component separately — without it `cargo build` fails with `cannot execute tool 'metal'`. Install once with `xcodebuild -downloadComponent MetalToolchain` (688 MB). |
+| Windows | MSVC build tools (Visual Studio Build Tools). GPUI uses Direct3D 11 and DirectWrite. |
+| Linux | Wayland and X11 development libraries, plus a Vulkan loader — GPUI renders through blade-graphics there. |
 
 ```bash
-scripts/minio-dev.sh start --large    # MinIO local + dữ liệu mẫu (cần Docker)
-cargo run -p vault --example dev_profile   # tạo sẵn profile "MinIO local"
+git clone <repository-url>
+cd s3browser
+cargo build --release -p s3browser
+```
+
+The binary lands in `target/release/s3browser`.
+
+Cross-compiling the Windows executable from macOS is possible and documented
+in [docs/PACKAGING.md](docs/PACKAGING.md), along with the three `vendor/gpui`
+patches it requires and why `-C target-feature=+crt-static` is not optional.
+
+Packaging a macOS `.app` and `.dmg`, and everything known about signing and
+notarisation, is in the same document.
+
+## Getting started
+
+On first run, with no profile configured, the welcome screen offers three
+ways in: enter credentials manually, connect to a local MinIO, or sign in
+with AWS SSO.
+
+The credential form has presets for AWS, Cloudflare R2, Backblaze B2, Wasabi,
+DigitalOcean Spaces, MinIO and a generic S3-compatible option; choosing one
+fills in the endpoint and region. There is a **Test connection** button that
+saves nothing, and a reveal button for the secret key.
+
+A denied `ListBuckets` is not treated as a failed connection: a token scoped
+to a single bucket — Cloudflare's recommended setup for R2 — signs correctly,
+and you can reach the bucket by name or by typing an `s3://` path.
+
+### Trying it against MinIO
+
+```bash
+scripts/minio-dev.sh start --large           # local MinIO plus sample data (needs Docker)
+cargo run -p vault --example dev_profile     # create a "MinIO local" profile
 S3BROWSER_DEV_SECRET=minioadmin cargo run -p s3browser
 ```
 
-Lần đầu chạy mà chưa có profile nào, màn hình chào mở ba lối vào: **Nhập thủ công**,
-**MinIO trên máy** và **Đăng nhập AWS SSO**.
+`S3BROWSER_DEV_SECRET` exists so that iterating on the UI does not mean
+retyping a keychain password on every launch: the macOS Keychain grants
+access by code signature, and an unsigned debug build gets a new signature
+from every `cargo build`. It **only works in debug builds** — a release build
+that accepted keys from the environment would let anyone who can set a
+variable on the process choose the key it signs with, defeating the key store
+entirely.
 
-Form nhập credential có preset sẵn cho AWS, Cloudflare R2, Backblaze B2, Wasabi,
-DigitalOcean Spaces và MinIO — chọn một cái là điền sẵn endpoint và region. Có nút
-**Thử kết nối** để kiểm tra trước khi lưu, và nút hiện/ẩn secret key.
+## Usage
 
-`S3BROWSER_DEV_SECRET` là để khỏi phải gõ mật khẩu chuỗi khoá mỗi lần build lại.
-Keychain của macOS cấp quyền theo chữ ký mã, mà bản debug chưa ký thì mỗi lần
-`cargo build` lại là một chữ ký khác, nên lần chạy nào cũng bị hỏi mật khẩu — đủ
-phiền để người ta thôi chạy thử, và thay đổi giao diện thì đi ra mà chẳng ai nhìn.
-Biến này **chỉ có tác dụng trong bản debug**: bản phát hành mà nhận khoá từ môi
-trường thì ai đặt được biến cho tiến trình là chọn được khoá nó ký, tức là vô hiệu
-hoá luôn cái kho khoá.
+### Keyboard shortcuts
 
-### Phím tắt
+`⌘` on macOS, `Ctrl` elsewhere.
 
-`⌘`/`Ctrl` tuỳ theo hệ điều hành.
-
-| Phím | Việc |
+| Key | Action |
 |---|---|
-| `⌘F` | Đưa con trỏ vào ô lọc trên thanh công cụ (Esc để xoá và trả phím về danh sách) |
-| `Enter` trong ô lọc | Quét cả bucket tìm chuỗi đó, dừng được giữa chừng |
-| `⌘N` / `⌘⇧N` | Thư mục mới / bucket mới |
-| `⌘R` | Tải lại prefix hiện tại |
-| `⌘T` / `⌘W` | Tab mới / đóng tab |
-| `⌘1`…`⌘9` | Chuyển tab (`⌘9` là tab cuối) |
-| `⌘L` | Gõ thẳng đường dẫn `s3://bucket/prefix/` |
-| `⌘⌫` | Xoá các mục đang chọn |
-| `⌘↑` | Lên một cấp |
-| `↑` `↓` | Đổi dòng đang chọn |
-| `⇧↑` `⇧↓` | Chọn dải liên tiếp |
-| `Enter` | Mở: thư mục thì vào, tệp thì xem trước |
-| `⌫` | Lên một cấp |
-| `Space` | Xem nhanh |
-| Nhấp đúp | Vào thư mục, hoặc xem trước tệp |
-| `⌘`+nhấp | Chọn thêm |
-| `⇧`+nhấp | Chọn dải liên tiếp |
+| `⌘K` | Command palette — every command, including those without a button |
+| `⌘F` | Focus the filter box (`Esc` clears it and returns the keyboard to the list) |
+| `Enter` in the filter | Scan the whole bucket for that string; stoppable |
+| `⌘L` | Type an `s3://bucket/prefix/` path directly |
+| `⌘T` / `⌘W` | New tab / close tab |
+| `⌘1`…`⌘9` | Switch tabs (`⌘9` is the last tab) |
+| `⌘N` / `⌘⇧N` | New folder / new bucket |
+| `⌘R` | Reload the current prefix |
+| `⌘↑` / `⌫` | Go up one level |
+| `↑` `↓` | Move the cursor |
+| `⇧↑` `⇧↓` | Extend the selection |
+| `⌘A` | Select all (visible rows only) |
+| `⌘C` / `⌘X` / `⌘V` | Copy / cut / paste objects |
+| `⌘I` | Details panel |
+| `Space` | Preview |
+| `⌘D` | Download the selection |
+| `⌘⏎` | Rename |
+| `⌘⌫` | Delete the selection |
+| `⌘J` | Transfer queue |
+| `Enter` | Open: folders navigate, files preview |
+| Double click | Enter a folder, or preview a file |
+| `⌘`+click | Add to the selection |
+| `⇧`+click | Extend the selection |
 
-### Cờ dòng lệnh
+### Command-line flags
 
-| Cờ | Tác dụng |
+| Flag | Effect |
 |---|---|
-| `--open bucket/prefix/` | Mở thẳng một vị trí khi khởi động |
-| `--verify-glass` | Hỏi AppKit xem hiệu ứng glass có thật sự được gắn, in báo cáo rồi thoát (macOS) |
-| `S3BROWSER_DEBUG=1` | Bật log chẩn đoán (kết nối, số mục, phân trang) |
-| `S3BROWSER_GLASS=0/1` | Ép chế độ solid / glass, ghi đè mặc định theo platform |
-| `S3BROWSER_DEV_SECRET=…` | Khoá bí mật lấy thẳng từ môi trường, bỏ qua chuỗi khoá. Chỉ bản debug |
+| `--open bucket/prefix/` | Open a location directly at startup |
+| `--verify-glass` | Ask AppKit whether the glass effect is really attached, print a report and exit (macOS) |
 
-Cài đặt (chủ đề, giới hạn xem trước, băng thông, số luồng truyền) nằm ở
-`settings.json` cạnh `profiles.json`; nơi đã ghim và nơi vừa tới ở `places.json`.
-Nơi đã ghim nằm ở sidebar, còn 50 nơi vừa tới có trang riêng — mở bằng mục
-"Gần đây" ở đầu sidebar.
+### Environment variables
 
-```bash
-cargo test    # 132 test; test MinIO tự bỏ qua nếu chưa chạy Docker
-```
-
-## Yêu cầu môi trường
-
-Chung: Rust stable (đã thử trên 1.97.1). Docker chỉ cần khi dev/test với MinIO.
-
-| Nền tảng | Thêm |
+| Variable | Effect |
 |---|---|
-| macOS | Xcode + **Metal Toolchain**. GPUI compile shader Metal lúc build; Xcode 26 tách component này ra, thiếu nó `cargo build` báo `cannot execute tool 'metal'`. Cài một lần: `xcodebuild -downloadComponent MetalToolchain` (688 MB) |
-| Windows | Bộ build MSVC (Visual Studio Build Tools). GPUI dùng Direct3D + DirectWrite |
-| Linux | Thư viện phát triển Wayland/X11 + Vulkan loader (GPUI đã chuyển renderer sang wgpu) |
+| `S3BROWSER_DEBUG=1` | Diagnostic logging (connections, item counts, paging) |
+| `S3BROWSER_GLASS=0/1` | Force solid or glass chrome, overriding the platform default |
+| `S3BROWSER_CRASH_DIR=…` | Where crash reports are written |
+| `S3BROWSER_DEV_SECRET=…` | Take the secret key from the environment instead of the credential store. Debug builds only |
 
-## Cross-platform
+### Files on disk
 
-Mọi khác biệt nền tảng gom trong [crates/app/src/platform.rs](crates/app/src/platform.rs), không rải rác trong code UI:
+All in the platform config directory —
+`~/Library/Application Support/s3browser`, `%APPDATA%\s3browser` or
+`~/.config/s3browser`:
 
-| Điểm khác | macOS | Windows | Linux |
-|---|---|---|---|
-| Nền cửa sổ | Blur thật (NSVisualEffectView) | Blur = Acrylic | **Solid** — blur chỉ có trên KDE, nên mặc định đục cho dễ đọc; bật bằng `S3BROWSER_GLASS=1` |
-| Traffic lights | Dời vào trong, toolbar chừa 88px | Nút hệ thống, chừa 12px | Nút hệ thống, chừa 12px |
-| Font | SF Pro Text | Segoe UI Variable | Inter / Cantarell / Ubuntu / DejaVu |
-| Phím chính | `⌘` (`modifiers.platform`) | `Ctrl` | `Ctrl` |
-| Credential store | Keychain | Credential Manager | Secret Service |
-| Thư mục config | `~/Library/Application Support/s3browser` | `%APPDATA%\s3browser` | `~/.config/s3browser` |
+| File | Contents |
+|---|---|
+| `profiles.json` | Profiles, endpoints and provider quirks. No secrets |
+| `settings.json` | Theme, motion, preview limit, transfer concurrency, bandwidth |
+| `places.json` | Pinned and recent locations, scoped per profile |
+| `crashes/` | Crash reports. The About dialog names this directory |
 
-Theme không có bảng màu riêng cho từng chế độ: chỉ **nền cửa sổ** đổi giữa trong suốt (glass) và đục (solid), mọi panel phía trên đều là lớp alpha nên hiển thị đúng ở cả hai. Sáng/tối bám theo hệ thống ngay khi người dùng đổi, qua `observe_window_appearance`.
-
-Các nhánh theo nền tảng dùng `cfg!(target_os = …)` (macro runtime) chứ **không** dùng `#[cfg]`, nên
-mọi nhánh đều được biên dịch và kiểm tra kiểu trên mọi nền tảng — chỉ nhánh được chọn là khác. Nhờ
-vậy code Windows/Linux không âm thầm hỏng khi sửa trên máy Mac. Riêng `glass_check.rs` là macOS-only
-thật (dùng objc2) nên được gate bằng `#[cfg(target_os = "macos")]`.
-
-**Đã kiểm chứng tới đâu:** `cargo check -p vault --target x86_64-pc-windows-msvc` và
-`--target x86_64-unknown-linux-gnu` đều sạch — đây là crate có dependency khác nhau theo từng nền
-tảng. Chưa build được trọn `s3browser` cho hai target đó từ máy macOS vì `ring` (dependency TLS)
-cần C toolchain chéo; việc build thật cho Windows/Linux nên chạy trên CI của chính nền tảng đó.
-
-## Cấu trúc
+## Development
 
 ```
 crates/
-├── app/        # GPUI: cửa sổ, view, theme, platform, glass self-check
-├── s3core/     # Bọc aws-sdk-s3 — không phụ thuộc UI, test được không cần cửa sổ
-├── vault/      # Profile (JSON) + secret (credential store OS) + import ~/.aws
-└── gpui_tokio/ # Vendor từ Zed: cầu nối Tokio ↔ executor của GPUI
+├── app/        # GPUI: window, views, theme, platform differences, crash handler
+├── s3core/     # aws-sdk-s3 wrapper — no UI dependency, testable without a window
+├── transfer/   # Transfer queue: multipart, resume, SQLite journal, checksums
+├── vault/      # Profiles (JSON) plus secrets (OS credential store)
+└── gpui_tokio/ # Vendored from Zed: bridges Tokio to GPUI's executor
+vendor/gpui/    # gpui 0.2.2, vendored through [patch.crates-io]
 ```
 
-`s3core` và `vault` cố tình không biết gì về GPUI, nên logic S3 và quản lý profile test được bằng
-`cargo test` thường và sau này dùng lại cho CLI companion.
+`s3core`, `transfer` and `vault` deliberately know nothing about GPUI, so the
+S3 logic, the transfer engine and profile handling are testable with a plain
+`cargo test`.
 
-## Kết quả M1
+```bash
+cargo test                       # MinIO integration tests skip themselves if no server is running
+scripts/minio-dev.sh start       # start one, so they do not skip
+```
 
-Đã có: quản lý nhiều profile với secret trong credential store của OS; import `~/.aws/credentials`
-+ `config` (ghép `[profile x]`, bỏ qua profile SSO, tự đặt quirk theo endpoint); sidebar profile +
-bucket; breadcrumb bấm được từng cấp; sắp xếp theo tên/kích thước/ngày (thư mục luôn đứng trước);
-lọc theo tên; **phân trang tự động khi cuộn** (continuation token); tạo thư mục và bucket; xoá
-nhiều mục (mở rộng thư mục đệ quy, batch 1000 key); sáng/tối theo hệ thống.
+The MinIO tests distinguish three cases — no server, a server without seeded
+fixtures, and a genuine failure — and skip rather than fail for the first
+two, naming the command to run.
 
-Điểm cần biết về cách làm:
+Every platform difference lives in
+[crates/app/src/platform.rs](crates/app/src/platform.rs). Platform branches
+use the `cfg!(target_os = …)` macro rather than `#[cfg]`, so every branch is
+compiled and type-checked on every machine and the Windows and Linux paths
+cannot rot silently while work happens on a Mac. `glass_check.rs` is the one
+genuinely macOS-only module.
 
-- **Chống race khi điều hướng**: mỗi lần chuyển prefix tăng một `generation`; phản hồi về trễ của
-  prefix cũ bị bỏ qua thay vì ghi đè danh sách đang xem.
-- **Lọc không làm mất dữ liệu**: `visible` chỉ là danh sách chỉ số vào `entries`, nên xoá bộ lọc là
-  khôi phục ngay, và không phải tải lại.
-- **Nhập liệu**: gpui 0.2.2 không có ô nhập sẵn, nên bộ lọc và hai ô đặt tên dùng chung một cơ chế
-  bắt phím (`key_char` để đúng với bàn phím không phải US). Sẽ thay bằng `Input` của gpui-component.
-- **Nhấp đúp**: gpui 0.2.2 không có `on_double_click`, nhưng `ClickEvent` mang `click_count`.
+## Contributing
 
-## Kết quả M0
+Issues and pull requests are welcome.
 
-Bốn điều kiện chốt stack trong plan, cùng bằng chứng đo được:
+Two conventions worth knowing before opening a PR:
 
-| Gate | Kết quả | Bằng chứng |
-|---|---|---|
-| Glass UI | ✅ | `--verify-glass` hỏi thẳng AppKit: `isOpaque=false`, `backgroundColor.alpha=0.0001`, `FullSizeContentView`, `titlebarAppearsTransparent=true`, và **`BlurredView` (subclass `NSVisualEffectView`) có thật trong view hierarchy** |
-| List ảo hóa 100k | ✅ | Chỉ 22 phần tử được dựng trên 100.000 dòng |
-| Drop file từ Finder | ✅ | Test mô phỏng `FileDropEvent` thật, listener chạy và đổi state |
-| AWS SDK trên Tokio | ✅ | Trong tiến trình GUI: `connected: 2 buckets` → `listed 1000 entries, more=true` |
+- **Commit messages are in English** and explain *why* a change is made
+  rather than restating the diff. Where a change was verified against a real
+  provider, the message says so; where it was not, the message says that too.
+- **Do not claim more verification than was performed.** "Compiles" and
+  "works" are different statements, and this project keeps them apart on
+  purpose.
 
-### Những thứ khác với nghiên cứu ban đầu
+`PLAN.md` and the documents under `docs/` are written in Vietnamese and
+record the design reasoning behind most decisions.
 
-1. **`gpui_tokio` upstream không build được với gpui 0.2.2** — nó nhắm bản git của Zed: dùng
-   `App::background_spawn` (chưa có ở 0.2.2) và generic `AppContext` (ở 0.2.2 `Result` là associated
-   type nên không unify được). Bản vendor đã sửa: nhận `&App`, spawn qua `background_executor()`.
-2. **`ExternalPaths` không dựng được từ crate khác** ở 0.2.2 (field `pub(crate)`, không có `From`).
-   Test drop chỉ gửi được payload rỗng, đủ chứng minh routing + listener.
-3. **Metal Toolchain là dependency ẩn** (688 MB), không có trong tài liệu GPUI.
+## License
 
-## Chưa làm
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
 
-Tải lên thật khi thả file (hiện mới nhận đường dẫn), tải xuống, hàng đợi truyền tải với
-pause/resume — đó là M2. Đổi tên/di chuyển, presigned URL, versioning, ACL: M3–M4. Xem
-[PLAN.md](PLAN.md).
+The bundled Inter font is licensed under the SIL Open Font License; see
+[assets/fonts/Inter-LICENSE.txt](assets/fonts/Inter-LICENSE.txt). The
+vendored copy of GPUI in `vendor/gpui/` is Apache-2.0, copyright Zed
+Industries.
