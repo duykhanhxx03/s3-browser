@@ -9,6 +9,7 @@ use std::env;
 fn main() {
     let target = env::var("CARGO_CFG_TARGET_OS");
     println!("cargo::rustc-check-cfg=cfg(gles)");
+    println!("cargo::rustc-check-cfg=cfg(gpui_embedded_hlsl)");
 
     #[cfg(any(
         not(any(target_os = "macos", target_os = "windows")),
@@ -22,7 +23,6 @@ fn main() {
             macos::build();
         }
         Ok("windows") => {
-            #[cfg(target_os = "windows")]
             windows::build();
         }
         _ => (),
@@ -245,19 +245,26 @@ mod macos {
     }
 }
 
-#[cfg(target_os = "windows")]
 mod windows {
+    use std::{fs, path::PathBuf};
+    #[cfg(target_os = "windows")]
     use std::{
-        fs,
         io::Write,
-        path::{Path, PathBuf},
+        path::Path,
         process::{self, Command},
     };
 
     pub(super) fn build() {
-        // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
-        compile_shaders();
+        // Compile HLSL shaders. `fxc.exe` is a Windows binary, so a
+        // cross-compile cannot run it; tell the renderer to compile the
+        // shaders at startup rather than look for bytes no one produced.
+        #[cfg(target_os = "windows")]
+        {
+            #[cfg(not(debug_assertions))]
+            compile_shaders();
+        }
+        #[cfg(not(target_os = "windows"))]
+        println!("cargo::rustc-cfg=gpui_embedded_hlsl");
 
         // Embed the Windows manifest and resource file
         #[cfg(feature = "windows-manifest")]
@@ -270,12 +277,38 @@ mod windows {
         let rc_file = std::path::Path::new("resources/windows/gpui.rc");
         println!("cargo:rerun-if-changed={}", manifest.display());
         println!("cargo:rerun-if-changed={}", rc_file.display());
+
+        // A resource compiler resolves paths written inside a .rc against the
+        // directory that .rc sits in, and embed_resource preprocesses ours into
+        // OUT_DIR first -- so the relative manifest path stops resolving. On
+        // Windows rc.exe is handed the original directory too and never notices;
+        // llvm-rc, which is what a cross-compile gets, is not. Rewriting the path
+        // to an absolute one in a copy keeps the lookup working either way.
+        // Only off Windows: an absolute path there is `C:\...`, and backslashes
+        // inside a .rc string are escapes.
+        #[cfg(not(target_os = "windows"))]
+        let rc_file = {
+            let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+            let copy = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gpui.rc");
+            let source = fs::read_to_string(crate_dir.join(rc_file)).unwrap();
+            fs::write(
+                &copy,
+                source.replace(
+                    "\"resources/windows/",
+                    &format!("\"{}/resources/windows/", crate_dir.display()),
+                ),
+            )
+            .unwrap();
+            copy
+        };
+
         embed_resource::compile(rc_file, embed_resource::NONE)
             .manifest_required()
             .unwrap();
     }
 
     /// You can set the `GPUI_FXC_PATH` environment variable to specify the path to the fxc.exe compiler.
+    #[cfg(target_os = "windows")]
     fn compile_shaders() {
         let shader_path = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("src/platform/windows/shaders.hlsl");
@@ -326,6 +359,7 @@ mod windows {
     }
 
     /// You can set the `GPUI_FXC_PATH` environment variable to specify the path to the fxc.exe compiler.
+    #[cfg(target_os = "windows")]
     fn find_fxc_compiler() -> String {
         // Check environment variable
         if let Ok(path) = std::env::var("GPUI_FXC_PATH")
@@ -356,6 +390,7 @@ mod windows {
         panic!("Failed to find fxc.exe");
     }
 
+    #[cfg(target_os = "windows")]
     fn compile_shader_for_module(
         module: &str,
         out_dir: &str,
@@ -390,6 +425,7 @@ mod windows {
         generate_rust_binding(&const_name, &output_file, rust_binding_path);
     }
 
+    #[cfg(target_os = "windows")]
     fn compile_shader_impl(
         fxc_path: &str,
         entry_point: &str,
@@ -432,6 +468,7 @@ mod windows {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn generate_rust_binding(const_name: &str, head_file: &str, output_path: &str) {
         let header_content = fs::read_to_string(head_file).expect("Failed to read header file");
         let const_definition = {

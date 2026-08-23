@@ -724,7 +724,10 @@ version = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies.windows-registry]
 version = "0.5"
 
-[target.'cfg(target_os = "windows")'.build-dependencies.embed-resource]
+# Not host-gated: `cfg()` on a build-dependency is evaluated against the host,
+# so gating it on Windows makes it vanish exactly when cross-compiling to
+# Windows -- which is when build.rs needs it to embed the manifest.
+[build-dependencies.embed-resource]
 version = "3.0"
 
 [lints.clippy]
