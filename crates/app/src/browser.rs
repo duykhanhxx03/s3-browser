@@ -35,7 +35,9 @@ use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
 use crate::failure::{Failure, Fix};
 use crate::locale::{self, Language};
 use crate::platform::{self, Chrome};
-use crate::settings::{MotionChoice, Settings, SettingsStore, ThemeChoice};
+use crate::settings::{
+    GridStep, MotionChoice, Settings, SettingsStore, ThemeChoice, GRID_STEPS, LIST_ROW_HEIGHTS,
+};
 use crate::theme::Theme;
 
 /// Diagnostic logging, enabled with `S3BROWSER_DEBUG=1`. Kept out of the normal
@@ -112,10 +114,24 @@ fn animation_key_hash(key: &str) -> u64 {
     hasher.finish()
 }
 
+/// Row height for the fixed-size lists: the sidebar, the queue, the palette.
+/// The object list has its own, which the user can zoom — see
+/// [`Settings::list_row_height`].
 const ROW_HEIGHT: f32 = 28.;
-const GRID_COLUMNS: usize = 5;
-const GRID_ROW_HEIGHT: f32 = 212.;
-const GRID_MEDIA_HEIGHT: f32 = 112.;
+
+/// How far the wheel has to travel to move the listing one zoom step.
+///
+/// A mouse wheel notch is one line, which `ScrollDelta::Lines` reports as
+/// exactly 1.0 — so one notch is one step and the constant below is what a
+/// trackpad has to add up to before it matches. Set to roughly two notches'
+/// worth of pixels: low enough that a flick zooms, high enough that a
+/// two-finger drift does not walk through the whole table.
+const ZOOM_STEP: f32 = 48.;
+
+/// What one line of wheel travel is worth against [`ZOOM_STEP`]. Chosen so a
+/// single notch always clears the threshold — a wheel that needed two clicks
+/// to do anything reads as a wheel that is not working.
+const ZOOM_LINE: f32 = ZOOM_STEP;
 /// One scale for every bar and panel, so nothing is a few pixels off its
 /// neighbour for no reason. Before this there were six different bar heights
 /// and three widths for what is visually the same dialog.
@@ -1024,6 +1040,20 @@ pub struct Browser {
     /// Object pane presentation: dense list for operations, grid for scanning
     /// folders and image-heavy prefixes.
     layout: LayoutMode,
+    /// Wheel travel banked towards the next zoom step.
+    ///
+    /// A trackpad reports a stream of small pixel deltas where a mouse sends
+    /// one line per notch. Stepping on every delta would run the whole table
+    /// in a single gesture, so the travel accumulates here and spends itself
+    /// a step at a time.
+    zoom_scroll: f32,
+    /// The first object on screen, as of the last draw.
+    ///
+    /// A zoom changes how tall every row is, so the scroll offset that used to
+    /// show this object now points somewhere else entirely. Re-anchoring on it
+    /// keeps the zoom centred on what the user was looking at rather than
+    /// throwing them to a different part of the listing.
+    first_visible: usize,
 
     scroll: UniformListScrollHandle,
     status: SharedString,
@@ -1376,6 +1406,8 @@ impl Browser {
             hovered_row: None,
             anchor: None,
             layout: LayoutMode::List,
+            zoom_scroll: 0.,
+            first_visible: 0,
             scroll: UniformListScrollHandle::new(),
             status: "Select a profile to get started".into(),
             failures: Vec::new(),
@@ -2754,6 +2786,80 @@ impl Browser {
             }
         }
         cx.notify();
+    }
+
+    /// Ctrl — Cmd on macOS — and the wheel resize the listing rather than
+    /// scrolling it, which is how every file manager and browser spells zoom.
+    ///
+    /// This runs *after* the list has already scrolled itself. gpui dispatches
+    /// the bubble phase innermost first, and a uniform list registers its own
+    /// scroll handler inside this one, so there is no ordering that gets here
+    /// first short of patching gpui. Pinning the anchor on every zoom event —
+    /// not only the ones that land on a new step — undoes that scroll, and the
+    /// listing holds still for the length of the gesture.
+    fn on_zoom_scroll(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.modifiers.secondary() {
+            // Banked travel belongs to the gesture that banked it. Carried
+            // into the next one it would zoom on the first notch of a gesture
+            // that had barely begun.
+            self.zoom_scroll = 0.;
+            return;
+        }
+        cx.stop_propagation();
+
+        let anchor = self.first_visible.min(self.visible.len().saturating_sub(1));
+        self.scroll_to_object(anchor);
+
+        let steps = zoom_steps(&mut self.zoom_scroll, event.delta);
+        if steps == 0 {
+            return;
+        }
+        self.zoom_listing(steps, anchor, cx);
+    }
+
+    /// Moves the listing `direction` steps along its size table.
+    ///
+    /// Positive is a scroll away from the user, which is zooming in: bigger
+    /// rows, or fewer and wider grid columns.
+    fn zoom_listing(&mut self, direction: i32, anchor: usize, cx: &mut Context<Self>) {
+        let (current, count) = match self.layout {
+            LayoutMode::List => (self.settings.list_zoom, LIST_ROW_HEIGHTS.len()),
+            LayoutMode::Grid => (self.settings.grid_zoom, GRID_STEPS.len()),
+        };
+        let next = zoom_step_after(current, direction, count);
+        if next == current {
+            return;
+        }
+
+        let layout = self.layout;
+        self.update_settings(
+            |settings| match layout {
+                LayoutMode::List => settings.list_zoom = next,
+                LayoutMode::Grid => settings.grid_zoom = next,
+            },
+            cx,
+        );
+        // Again after the resize, not only before it: the grid counts scroll
+        // positions in rows, and how many objects sit on a row is precisely
+        // what just changed.
+        self.scroll_to_object(anchor);
+    }
+
+    /// Puts an object at the top of the pane, in whichever unit the current
+    /// layout counts scroll positions in — objects for the list, rows of
+    /// `columns` objects for the grid.
+    fn scroll_to_object(&self, position: usize) {
+        let index = match self.layout {
+            LayoutMode::List => position,
+            LayoutMode::Grid => position / self.settings.grid_step().columns,
+        };
+        self.scroll
+            .scroll_to_item_strict(index, gpui::ScrollStrategy::Top);
     }
 
     /// Re-lists the buckets, past the cache.
@@ -8532,10 +8638,7 @@ impl Browser {
                         .child(setting_row(
                             locale::text("about.author"),
                             None,
-                            div()
-                                .text_xs()
-                                .text_color(theme.text)
-                                .child("duykhanhxx03"),
+                            div().text_xs().text_color(theme.text).child("duykhanhxx03"),
                             theme,
                         ))
                         // Only the crash folder. The config folder has its own
@@ -9180,7 +9283,10 @@ impl Browser {
                 .child(chip(SortKey::Size, "Kích thước"))
                 .child(chip(SortKey::Modified, "Sửa đổi"))
                 .child(div().flex_1())
-                .child(SharedString::from(format!("{} cột", GRID_COLUMNS)));
+                .child(SharedString::from(format!(
+                    "{} cột",
+                    self.settings.grid_step().columns
+                )));
         }
         let all_selected = !self.visible.is_empty()
             && self
@@ -9525,12 +9631,14 @@ impl Browser {
 
     fn render_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let row_height = self.settings.list_row_height();
 
         uniform_list(
             "objects",
             self.visible.len(),
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
                 this.perf.note_visible(&range);
+                this.first_visible = range.start;
                 this.maybe_prefetch(&range, cx);
                 this.load_thumbnails(&range, cx);
 
@@ -9740,6 +9848,7 @@ impl Browser {
                             },
                             checkbox,
                             actions,
+                            row_height,
                             theme,
                         )
                         .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
@@ -9800,31 +9909,34 @@ impl Browser {
             }),
         )
         .track_scroll(self.scroll.clone())
+        .on_scroll_wheel(cx.listener(Self::on_zoom_scroll))
         .h_full()
     }
 
     fn render_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let rows = grid_row_count(self.visible.len());
+        let step = self.settings.grid_step();
+        let rows = grid_row_count(self.visible.len(), step.columns);
 
         uniform_list(
             "objects-grid",
             rows,
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
-                let object_start = range.start * GRID_COLUMNS;
-                let object_end = (range.end * GRID_COLUMNS).min(this.visible.len());
+                let object_start = range.start * step.columns;
+                let object_end = (range.end * step.columns).min(this.visible.len());
                 let object_range = object_start..object_end;
                 this.perf.note_visible(&object_range);
+                this.first_visible = object_start;
                 this.maybe_prefetch(&object_range, cx);
                 this.load_thumbnails(&object_range, cx);
 
                 range
                     .map(|row| {
-                        let start = row * GRID_COLUMNS;
-                        let end = (start + GRID_COLUMNS).min(this.visible.len());
+                        let start = row * step.columns;
+                        let end = (start + step.columns).min(this.visible.len());
                         div()
                             .id(SharedString::from(format!("grid-row-{row}")))
-                            .h(px(GRID_ROW_HEIGHT))
+                            .h(px(step.row_height))
                             .w_full()
                             .px_3()
                             .pt_3()
@@ -9974,6 +10086,7 @@ impl Browser {
                                     },
                                     checkbox,
                                     actions,
+                                    step,
                                     theme,
                                 )
                                 .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
@@ -10032,7 +10145,7 @@ impl Browser {
                                 .into_any_element()
                             }))
                             .children(
-                                (end - start..GRID_COLUMNS)
+                                (end - start..step.columns)
                                     .map(|_| div().flex_1().min_w(px(0.)).into_any_element()),
                             )
                             .into_any_element()
@@ -10041,6 +10154,7 @@ impl Browser {
             }),
         )
         .track_scroll(self.scroll.clone())
+        .on_scroll_wheel(cx.listener(Self::on_zoom_scroll))
         .h_full()
     }
 
@@ -11147,7 +11261,7 @@ impl Browser {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui::hsla(0., 0., 0., 0.34))
+                .bg(gpui::hsla(0., 0., 0., 0.45))
                 .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.acl_popup_open = false;
@@ -11164,7 +11278,7 @@ impl Browser {
                         .gap_3()
                         .text_xs()
                         .rounded_xl()
-                        .bg(preview_shell(theme))
+                        .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
@@ -11260,7 +11374,11 @@ impl Browser {
     /// The first-run screen. Without it a fresh install shows an empty list and
     /// a status line, with nothing saying what to do next — the three ways in
     /// exist but are invisible until a profile already exists.
-    fn render_onboarding(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_onboarding(
+        &self,
+        maximized: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.profiles.is_empty() {
             return None;
         }
@@ -11270,101 +11388,145 @@ impl Browser {
         Some(
             div()
                 .id("onboarding")
-                .relative()
                 .flex_1()
                 .flex()
-                .items_center()
-                .justify_center()
-                // Its own corner rather than the centered stack: a language
-                // picker is a settings control, not a step in the flow, and
-                // sitting between the logo and the connection choices made it
-                // read as one.
-                .when_some(self.language_select.clone(), |this, select| {
-                    this.child(
-                        div().absolute().top_4().right_4().w(px(200.)).child(
-                            Select::new(&select)
-                                .placeholder(locale::text("settings.language.choose"))
-                                .search_placeholder(locale::text("settings.language.search"))
-                                .menu_width(px(280.)),
-                        ),
-                    )
-                })
+                .flex_col()
+                // A minimal title bar. There is nothing to show in it yet —
+                // no bucket, no profile — but the window still needs a way to
+                // be moved and closed, and without this the first screen
+                // anyone sees has none: `render_title_bar`, the thing that
+                // normally draws both, only renders once a profile exists.
                 .child(
                     div()
-                        .w(px(360.))
+                        .id("onboarding-topbar")
+                        .flex_shrink_0()
+                        .h(px(TOOLBAR_HEIGHT))
                         .flex()
-                        .flex_col()
                         .items_center()
-                        .gap_4()
-                        .child(brand_logo(mode, 188.))
+                        .pl(px(platform::toolbar_leading_inset()))
+                        .child(self.render_title_drag(cx))
+                        .children(
+                            platform::window_controls_in_app()
+                                .then(|| self.render_window_controls(maximized, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("onboarding-body")
+                        .relative()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        // Its own corner rather than the centered stack: a
+                        // language picker is a settings control, not a step
+                        // in the flow, and sitting between the logo and the
+                        // connection choices made it read as one.
+                        .when_some(self.language_select.clone(), |this, select| {
+                            this.child(
+                                div().absolute().top_4().right_4().w(px(200.)).child(
+                                    Select::new(&select)
+                                        .placeholder(locale::text("settings.language.choose"))
+                                        .search_placeholder(locale::text(
+                                            "settings.language.search",
+                                        ))
+                                        .menu_width(px(280.)),
+                                ),
+                            )
+                        })
                         .child(
-                            div().w_full().flex().flex_col().gap_2().children(
-                                [
-                                    (
-                                        "path",
-                                        locale::text("onboarding.manual.title"),
-                                        "onboard-manual",
+                            div()
+                                .w(px(360.))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_4()
+                                .child(brand_logo(mode, 188.))
+                                .child(
+                                    div().w_full().flex().flex_col().gap_2().children(
+                                        [
+                                            (
+                                                "path",
+                                                locale::text("onboarding.manual.title"),
+                                                "onboard-manual",
+                                            ),
+                                            (
+                                                "bucket",
+                                                locale::text("onboarding.minio.title"),
+                                                "onboard-minio",
+                                            ),
+                                            (
+                                                "external",
+                                                locale::text("onboarding.aws_sso.title"),
+                                                "onboard-sso",
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        .map(
+                                            |(icon_name, title, id)| {
+                                                div()
+                                                    .id(id)
+                                                    .h(px(44.))
+                                                    .px_3()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .rounded_lg()
+                                                    .bg(theme.modal)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .cursor_pointer()
+                                                    .hover(|this| this.bg(theme.hover))
+                                                    .on_click(cx.listener(
+                                                        move |this, _event, window, cx| match id {
+                                                            "onboard-manual" => this.open_form(
+                                                                FormKind::NewProfile,
+                                                                window,
+                                                                cx,
+                                                            ),
+                                                            "onboard-minio" => {
+                                                                this.add_minio_dev_profile(cx)
+                                                            }
+                                                            _ => this.open_form(
+                                                                FormKind::SsoStart,
+                                                                window,
+                                                                cx,
+                                                            ),
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .w(px(22.))
+                                                            .flex_shrink_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(sized_icon(
+                                                                icon_name,
+                                                                15.,
+                                                                theme.accent,
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .overflow_hidden()
+                                                            .text_color(theme.text)
+                                                            .child(title),
+                                                    )
+                                            },
+                                        ),
                                     ),
-                                    (
-                                        "bucket",
-                                        locale::text("onboarding.minio.title"),
-                                        "onboard-minio",
-                                    ),
-                                    (
-                                        "external",
-                                        locale::text("onboarding.aws_sso.title"),
-                                        "onboard-sso",
-                                    ),
-                                ]
-                                .into_iter()
-                                .map(|(icon_name, title, id)| {
-                                    div()
-                                        .id(id)
-                                        .h(px(44.))
-                                        .px_3()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .rounded_lg()
-                                        .bg(theme.modal)
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .cursor_pointer()
-                                        .hover(|this| this.bg(theme.hover))
-                                        .on_click(cx.listener(move |this, _event, window, cx| {
-                                            match id {
-                                                "onboard-manual" => {
-                                                    this.open_form(FormKind::NewProfile, window, cx)
-                                                }
-                                                "onboard-minio" => this.add_minio_dev_profile(cx),
-                                                _ => this.open_form(FormKind::SsoStart, window, cx),
-                                            }
-                                        }))
-                                        .child(
-                                            div()
-                                                .w(px(22.))
-                                                .flex_shrink_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(sized_icon(icon_name, 15., theme.accent)),
+                                )
+                                .when_some(
+                                    self.failures.last().map(|failure| failure.summary.clone()),
+                                    |this, summary| {
+                                        this.child(
+                                            div().text_xs().text_color(theme.danger).child(summary),
                                         )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .overflow_hidden()
-                                                .text_color(theme.text)
-                                                .child(title),
-                                        )
-                                }),
-                            ),
-                        )
-                        .when_some(
-                            self.failures.last().map(|failure| failure.summary.clone()),
-                            |this, summary| {
-                                this.child(div().text_xs().text_color(theme.danger).child(summary))
-                            },
+                                    },
+                                ),
                         ),
                 )
                 .transition_opacity_and_offset(
@@ -12400,7 +12562,7 @@ impl Render for Browser {
             .text_color(theme.text)
             // Nothing to browse without a profile, and the chrome behind a
             // translucent overlay read as clutter rather than as background.
-            .when_some(self.render_onboarding(cx), |this, onboarding| {
+            .when_some(self.render_onboarding(maximized, cx), |this, onboarding| {
                 this.child(onboarding)
             })
             .when(!self.profiles.is_empty(), |this| {
@@ -13585,6 +13747,9 @@ fn object_row(
     checkbox: gpui::AnyElement,
     // Same reason as the checkbox.
     actions: gpui::AnyElement,
+    // From the user's zoom rather than a constant: Ctrl and the wheel step
+    // this through `LIST_ROW_HEIGHTS`.
+    row_height: f32,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let RowState {
@@ -13602,10 +13767,16 @@ fn object_row(
         .modified_epoch
         .map(format_timestamp)
         .unwrap_or_default();
+    // 10px of the row is padding no matter how tall it is; the rest is what
+    // the thumbnail gets. At the default row height this lands on the 18px
+    // the thumbnail was hardcoded to before zoom existed, so the row people
+    // already had looks exactly the same.
+    let thumbnail_size = row_height - 10.;
+    let icon_size = thumbnail_size - 2.;
 
     div()
         .id(position)
-        .h(px(ROW_HEIGHT))
+        .h(px(row_height))
         // Without this the row is only as wide as its content: `flex_1` on the
         // name has nothing to expand into, so the size and date columns bunch up
         // against the name instead of lining up under their headers.
@@ -13646,7 +13817,8 @@ fn object_row(
         .child(checkbox)
         .child(
             div()
-                .w(px(22.))
+                .w(px(thumbnail_size + 4.))
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 // Folders lead, so they carry the accent; files stay quiet.
@@ -13655,11 +13827,13 @@ fn object_row(
                 // images arrive.
                 .child(match thumbnail {
                     Some(image) => gpui::img(image)
-                        .size(px(18.))
+                        .size(px(thumbnail_size))
                         .rounded_sm()
                         .into_any_element(),
-                    None if entry.is_folder => icon("folder", theme.accent).into_any_element(),
-                    None => icon("file", theme.text_faint).into_any_element(),
+                    None if entry.is_folder => {
+                        sized_icon("folder", icon_size, theme.accent).into_any_element()
+                    }
+                    None => sized_icon("file", icon_size, theme.text_faint).into_any_element(),
                 }),
         )
         .child(
@@ -13719,6 +13893,9 @@ fn object_grid_card(
     state: RowState,
     checkbox: gpui::AnyElement,
     actions: gpui::AnyElement,
+    // From the user's zoom rather than a constant: Ctrl and the wheel step
+    // this through `GRID_STEPS`.
+    step: GridStep,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let RowState {
@@ -13746,7 +13923,7 @@ fn object_grid_card(
 
     div()
         .id(SharedString::from(format!("grid-card-{position}")))
-        .h(px(GRID_ROW_HEIGHT - 12.))
+        .h(px(step.row_height - 12.))
         .flex_1()
         .min_w(px(0.))
         .p_2()
@@ -13780,7 +13957,7 @@ fn object_grid_card(
         )
         .child(
             div()
-                .h(px(GRID_MEDIA_HEIGHT))
+                .h(px(step.media_height))
                 .w_full()
                 .p_1()
                 .flex()
@@ -13814,7 +13991,7 @@ fn object_grid_card(
                                 .child(
                                     gpui::img(image)
                                         .max_w_full()
-                                        .max_h(px(GRID_MEDIA_HEIGHT - 12.))
+                                        .max_h(px(step.media_height - 12.))
                                         .object_fit(ObjectFit::Contain)
                                         .rounded_md()
                                         .transition_opacity_and_offset(
@@ -13878,8 +14055,35 @@ fn object_grid_card(
         })
 }
 
-fn grid_row_count(items: usize) -> usize {
-    items.div_ceil(GRID_COLUMNS)
+fn grid_row_count(items: usize, columns: usize) -> usize {
+    items.div_ceil(columns.max(1))
+}
+
+/// How many zoom steps a wheel event is worth, spending what it banks.
+///
+/// A mouse sends one line per notch and a trackpad a stream of small pixel
+/// deltas, so the travel accumulates in `banked` and is spent a whole step at
+/// a time. The division truncates towards zero, which is the point: travel
+/// short of a step stays banked rather than rounding a twitch into a resize.
+fn zoom_steps(banked: &mut f32, delta: gpui::ScrollDelta) -> i32 {
+    *banked += match delta {
+        gpui::ScrollDelta::Lines(lines) => lines.y * ZOOM_LINE,
+        gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+    };
+    let steps = (*banked / ZOOM_STEP) as i32;
+    *banked -= steps as f32 * ZOOM_STEP;
+    steps
+}
+
+/// The step a zoom lands on, clamped to the table it walks.
+///
+/// `current` is clamped before the arithmetic rather than after: a
+/// hand-edited settings file can name a step past the end of the table, and
+/// zooming out from there has to walk back into range rather than sit stuck
+/// against a ceiling it is already above.
+fn zoom_step_after(current: usize, direction: i32, count: usize) -> usize {
+    let last = count.saturating_sub(1) as i32;
+    ((current as i32).min(last) + direction).clamp(0, last) as usize
 }
 
 // ------------------------------------------------------------------- helpers
@@ -16066,6 +16270,19 @@ mod tests {
     use super::*;
     use crate::theme::Mode;
 
+    /// A mouse wheel's notches, which arrive as whole lines.
+    fn lines(y: f32) -> gpui::ScrollDelta {
+        gpui::ScrollDelta::Lines(gpui::Point { x: 0., y })
+    }
+
+    /// A trackpad's travel, which arrives in pixels.
+    fn pixels(y: f32) -> gpui::ScrollDelta {
+        gpui::ScrollDelta::Pixels(gpui::Point {
+            x: px(0.),
+            y: px(y),
+        })
+    }
+
     fn entry(name: &str, is_folder: bool, size: i64) -> Entry {
         Entry {
             name: name.into(),
@@ -16129,6 +16346,8 @@ mod tests {
             hovered_row: None,
             anchor: None,
             layout: LayoutMode::List,
+            zoom_scroll: 0.,
+            first_visible: 0,
             scroll: UniformListScrollHandle::new(),
             status: "test".into(),
             failures: Vec::new(),
@@ -17834,10 +18053,100 @@ mod tests {
 
     #[test]
     fn grid_rows_cover_the_last_partial_line() {
-        assert_eq!(grid_row_count(0), 0);
-        assert_eq!(grid_row_count(1), 1);
-        assert_eq!(grid_row_count(GRID_COLUMNS), 1);
-        assert_eq!(grid_row_count(GRID_COLUMNS + 1), 2);
+        for columns in GRID_STEPS.map(|step| step.columns) {
+            assert_eq!(grid_row_count(0, columns), 0);
+            assert_eq!(grid_row_count(1, columns), 1);
+            assert_eq!(grid_row_count(columns, columns), 1);
+            assert_eq!(grid_row_count(columns + 1, columns), 2);
+        }
+
+        // Zero columns cannot draw a grid, but a hand-edited settings file can
+        // ask for one. Dividing by it is a panic; clamping is a wrong-looking
+        // grid the user can fix.
+        assert_eq!(grid_row_count(3, 0), 3);
+    }
+
+    #[test]
+    fn a_zoom_walks_its_table_and_stops_at_both_ends() {
+        assert_eq!(zoom_step_after(2, 1, 7), 3);
+        assert_eq!(zoom_step_after(2, -1, 7), 1);
+
+        // Clamped rather than wrapping. Jumping from the largest tiles to the
+        // smallest on one extra notch reads as the zoom breaking.
+        assert_eq!(zoom_step_after(6, 1, 7), 6);
+        assert_eq!(zoom_step_after(0, -1, 7), 0);
+
+        // Several steps at once, which is what a fast flick produces.
+        assert_eq!(zoom_step_after(2, 3, 7), 5);
+        assert_eq!(zoom_step_after(2, -9, 7), 0);
+
+        // A step read out of a hand-edited file can sit past the end of the
+        // table. Zooming out has to bring it back rather than leave someone
+        // stuck at a size no notch can change.
+        assert_eq!(zoom_step_after(99, -1, 7), 5);
+        assert_eq!(zoom_step_after(99, 1, 7), 6);
+    }
+
+    #[test]
+    fn a_wheel_notch_zooms_at_once_but_a_trackpad_drift_has_to_add_up() {
+        // One notch of a mouse wheel is one line, and it has to do something:
+        // a wheel that needs two clicks to move reads as a wheel that is not
+        // working.
+        let mut banked = 0.;
+        assert_eq!(zoom_steps(&mut banked, lines(1.)), 1);
+        assert_eq!(zoom_steps(&mut banked, lines(-1.)), -1);
+
+        // A trackpad sends a stream of small deltas instead. Stepping on each
+        // one would run the whole table in a single gesture, so they bank
+        // until they are worth a step.
+        let mut banked = 0.;
+        let nudge = pixels(ZOOM_STEP / 4.);
+        assert_eq!(zoom_steps(&mut banked, nudge), 0);
+        assert_eq!(zoom_steps(&mut banked, nudge), 0);
+        assert_eq!(zoom_steps(&mut banked, nudge), 0);
+        assert_eq!(zoom_steps(&mut banked, nudge), 1, "four quarters is a step");
+
+        // And the change is kept, not dropped: the next quarter-step lands on
+        // a fresh step rather than starting the count over.
+        assert_eq!(zoom_steps(&mut banked, pixels(ZOOM_STEP * 0.9)), 0);
+        assert_eq!(zoom_steps(&mut banked, nudge), 1);
+
+        // Reversing pays back what is banked before it counts the other way.
+        // Travel is never double-spent, so turning around costs at most the
+        // one step that was banked and not yet used.
+        let mut banked = 0.;
+        assert_eq!(zoom_steps(&mut banked, pixels(ZOOM_STEP * 0.9)), 0);
+        assert_eq!(zoom_steps(&mut banked, pixels(-ZOOM_STEP * 1.5)), 0);
+        assert_eq!(zoom_steps(&mut banked, pixels(-ZOOM_STEP * 0.5)), -1);
+    }
+
+    #[gpui::test]
+    fn a_zoom_resizes_the_layout_that_is_showing(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| offline(vec![entry("alpha.txt", false, 1)], cx));
+
+        entity.update(cx, |browser, cx| {
+            let list_start = browser.settings.list_zoom;
+            let grid_start = browser.settings.grid_zoom;
+
+            // In list mode the rows grow and the grid is left alone: the two
+            // are different sizes of different things, and one setting for
+            // both means zooming a list resizes tiles nobody was looking at.
+            browser.layout = LayoutMode::List;
+            browser.zoom_listing(1, 0, cx);
+            assert_eq!(browser.settings.list_zoom, list_start + 1);
+            assert_eq!(browser.settings.grid_zoom, grid_start);
+            assert!(browser.settings.list_row_height() > LIST_ROW_HEIGHTS[list_start]);
+
+            browser.layout = LayoutMode::Grid;
+            browser.zoom_listing(-1, 0, cx);
+            assert_eq!(browser.settings.list_zoom, list_start + 1);
+            assert_eq!(browser.settings.grid_zoom, grid_start - 1);
+            // Zooming out is more columns and smaller tiles, together.
+            assert!(browser.settings.grid_step().columns > GRID_STEPS[grid_start].columns);
+            assert!(
+                browser.settings.grid_step().media_height < GRID_STEPS[grid_start].media_height
+            );
+        });
     }
 
     #[test]

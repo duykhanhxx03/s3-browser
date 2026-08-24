@@ -75,6 +75,70 @@ pub const PREVIEW_LIMITS_MB: [u32; 3] = [1, 8, 32];
 /// the provider starts throttling — but on a fat link it is.
 pub const JOB_CONCURRENCY_CHOICES: [usize; 4] = [1, 2, 4, 8];
 
+/// Row heights the object list steps through, smallest first.
+///
+/// Discrete steps rather than a free-running scale: the row holds text at a
+/// fixed size, and a continuous zoom spends most of its range on heights that
+/// only add padding around it. Seven stops covers "fit as much on screen as
+/// possible" through to "readable across the room".
+pub const LIST_ROW_HEIGHTS: [f32; 7] = [22., 25., 28., 32., 38., 45., 54.];
+
+/// The step the list starts on, which is the height it had before this was
+/// adjustable.
+pub const LIST_ZOOM_DEFAULT: usize = 2;
+
+/// One stop on the grid's zoom.
+///
+/// Columns and heights travel together deliberately. A tile is `flex_1`, so
+/// its width is the pane divided by the column count — dropping to three
+/// columns without growing the row would draw wide, flat letterboxes rather
+/// than bigger thumbnails.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridStep {
+    pub columns: usize,
+    pub row_height: f32,
+    pub media_height: f32,
+}
+
+/// Grid stops, smallest tile first. Every row is its thumbnail area plus the
+/// 100px of checkbox, name and size that do not scale with it.
+pub const GRID_STEPS: [GridStep; 6] = [
+    GridStep {
+        columns: 8,
+        row_height: 168.,
+        media_height: 68.,
+    },
+    GridStep {
+        columns: 7,
+        row_height: 179.,
+        media_height: 79.,
+    },
+    GridStep {
+        columns: 6,
+        row_height: 193.,
+        media_height: 93.,
+    },
+    GridStep {
+        columns: 5,
+        row_height: 212.,
+        media_height: 112.,
+    },
+    GridStep {
+        columns: 4,
+        row_height: 242.,
+        media_height: 142.,
+    },
+    GridStep {
+        columns: 3,
+        row_height: 294.,
+        media_height: 194.,
+    },
+];
+
+/// The step the grid starts on: five columns, as it was before this was
+/// adjustable.
+pub const GRID_ZOOM_DEFAULT: usize = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -93,6 +157,14 @@ pub struct Settings {
     /// it off. Turning it off does not disable the manual command - asking on
     /// purpose is a different act from being asked on every launch.
     pub check_updates: bool,
+    /// Which step of [`LIST_ROW_HEIGHTS`] the object list is drawn at.
+    ///
+    /// Persisted rather than reset each launch: someone who zoomed out to fit
+    /// a long listing on screen meant it, and having to do it again every time
+    /// the app opens is the opposite of a preference.
+    pub list_zoom: usize,
+    /// Which step of [`GRID_STEPS`] the grid is drawn at.
+    pub grid_zoom: usize,
 }
 
 impl Default for Settings {
@@ -105,6 +177,8 @@ impl Default for Settings {
             bandwidth_limit: 0,
             job_concurrency: 2,
             check_updates: true,
+            list_zoom: LIST_ZOOM_DEFAULT,
+            grid_zoom: GRID_ZOOM_DEFAULT,
         }
     }
 }
@@ -122,6 +196,19 @@ impl Settings {
 
     pub fn job_concurrency(&self) -> usize {
         self.job_concurrency.clamp(1, 16)
+    }
+
+    /// The list's row height, for the step it is on.
+    ///
+    /// Clamped on read for the same reason the preview cap is: the file is
+    /// editable by hand, and an index past the end of the table would be a
+    /// panic rather than a mistake anyone could see and correct.
+    pub fn list_row_height(&self) -> f32 {
+        LIST_ROW_HEIGHTS[self.list_zoom.min(LIST_ROW_HEIGHTS.len() - 1)]
+    }
+
+    pub fn grid_step(&self) -> GridStep {
+        GRID_STEPS[self.grid_zoom.min(GRID_STEPS.len() - 1)]
     }
 }
 
@@ -183,6 +270,53 @@ mod tests {
         };
         assert_eq!(settings.preview_limit_bytes(), 256 * 1024 * 1024);
         assert_eq!(settings.job_concurrency(), 16);
+
+        // A zoom step past the end of its table would index out of bounds,
+        // which is a panic rather than something the user could see and undo.
+        let settings = Settings {
+            list_zoom: 99,
+            grid_zoom: 99,
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.list_row_height(),
+            LIST_ROW_HEIGHTS[LIST_ROW_HEIGHTS.len() - 1]
+        );
+        assert_eq!(settings.grid_step(), GRID_STEPS[GRID_STEPS.len() - 1]);
+    }
+
+    #[test]
+    fn the_default_zoom_is_the_size_the_app_had_before_it_was_adjustable() {
+        // Anyone upgrading has no zoom in their settings file, so the default
+        // has to land on what they were already looking at rather than
+        // silently resizing every listing on first launch.
+        let settings = Settings::default();
+        assert_eq!(settings.list_row_height(), 28.);
+        assert_eq!(settings.grid_step().columns, 5);
+        assert_eq!(settings.grid_step().row_height, 212.);
+        assert_eq!(settings.grid_step().media_height, 112.);
+    }
+
+    #[test]
+    fn every_grid_step_keeps_the_chrome_the_tile_cannot_scale() {
+        // A tile is its thumbnail plus a checkbox row, a name and a size line.
+        // Those hold a fixed text size, so they cost the same 100px at every
+        // step — a table that forgets this crops the name at one end of the
+        // range and leaves a gap at the other.
+        for step in GRID_STEPS {
+            assert_eq!(
+                step.row_height - step.media_height,
+                100.,
+                "step {step:?} does not leave room for the fixed rows"
+            );
+        }
+
+        // Wider tiles, taller rows: the two have to move together or fewer
+        // columns just draws letterboxes.
+        for pair in GRID_STEPS.windows(2) {
+            assert!(pair[0].columns > pair[1].columns, "{pair:?}");
+            assert!(pair[0].media_height < pair[1].media_height, "{pair:?}");
+        }
     }
 
     #[test]
@@ -219,6 +353,8 @@ mod tests {
             // Not the default, so the round trip below proves the field is
             // written and read rather than quietly falling back both times.
             check_updates: false,
+            list_zoom: 5,
+            grid_zoom: 1,
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
@@ -236,6 +372,8 @@ mod tests {
             Settings::default().preview_limit_mb
         );
         assert_eq!(loaded.check_updates, Settings::default().check_updates);
+        assert_eq!(loaded.list_zoom, Settings::default().list_zoom);
+        assert_eq!(loaded.grid_zoom, Settings::default().grid_zoom);
 
         _ = std::fs::remove_dir_all(&dir);
     }
