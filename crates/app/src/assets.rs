@@ -63,6 +63,8 @@ icons![
     "transfer",
     "trash",
     "upload",
+    // The window controls the app draws for itself on Windows and Linux.
+    "window-maximize", "window-minimize", "window-restore",
 ];
 
 /// The UI typeface, embedded so every machine renders the same.

@@ -15,10 +15,12 @@ use gpui::{
     Subscription, Task, Transition, TransitionExt, UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+// `on_double_click` lives on gpui-component's extension trait, not on gpui's
+// own `StatefulInteractiveElement`.
+use gpui_component::InteractiveElementExt as _;
 use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::TitleBar;
 use gpui_tokio::Tokio;
 use s3core::{
     capability::{Capabilities, CapabilityCache, Support},
@@ -157,6 +159,15 @@ const PALETTE_ROW_HEIGHT: f32 = 38.;
 /// and a 26px close button, and at 30 it was the tallest thing in the row by
 /// half again — a large empty box next to a small label, which is most of why
 /// it read as unfinished.
+/// One window button, square against `TOOLBAR_HEIGHT`.
+const WINDOW_CONTROL_WIDTH: f32 = 40.;
+const WINDOW_CONTROL_GLYPH: f32 = 14.;
+/// The narrowest the drag strip is allowed to get. Below this there is nowhere
+/// left to pick the window up by, on a platform where the title bar is the only
+/// place to pick it up at all.
+const TITLE_DRAG_MIN: f32 = 40.;
+/// The path box stops growing here so the drag strip has room to exist.
+const PATH_INPUT_MAX: f32 = 560.;
 const KIND_TILE: f32 = 26.;
 /// The same tile standing in for a whole preview, when the type is one this app
 /// hands to another application rather than drawing itself.
@@ -1015,6 +1026,9 @@ pub struct Browser {
     previewing: Option<Previewing>,
     /// A file on its way down so another app can open it.
     opening: Option<Opening>,
+    /// A press is being held on the title bar's drag strip, on the platforms
+    /// where moving the window is the application's job.
+    title_drag: bool,
     screen: Screen,
     /// Whether the path box is showing where you have been.
     ///
@@ -1314,6 +1328,7 @@ impl Browser {
             next_tab_id: 1,
             previewing: None,
             opening: None,
+            title_drag: false,
             screen: Screen::default(),
             path_suggesting: false,
             path_choice: None,
@@ -6211,42 +6226,61 @@ impl Browser {
     /// than hiding it behind a click. Two reasons it belongs there: it is the
     /// only way in when the token cannot list buckets, and a box that is always
     /// on screen also always says where you are.
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The title bar.
+    ///
+    /// On Windows and Linux this row *is* the title bar: the app draws every
+    /// part of it, the three window buttons included. Nothing sits underneath
+    /// to fall back on — see [`platform::window_controls_in_app`]. On macOS it
+    /// is the same row with the native traffic lights floating over its left
+    /// inset, and it draws no buttons of its own.
+    ///
+    /// This used to be gpui-component's `TitleBar`, which does carry buttons —
+    /// and drew them with `IconName::WindowClose`, which resolves to
+    /// `icons/window-close.svg`. This app serves its own hand-authored icon
+    /// set, which has no such name, so the loader answered `None` and all three
+    /// buttons rendered blank. They were there, they took their space, they
+    /// were hit-testable, and they were invisible: the same failure as the
+    /// component library's `cleanable(true)` two rounds ago, and for the same
+    /// reason.
+    fn render_title_bar(&self, maximized: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let profile = self
             .active_profile
             .and_then(|ix| self.profiles.get(ix))
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Chưa chọn profile".to_string());
+        let controls = platform::window_controls_in_app()
+            .then(|| self.render_window_controls(maximized, cx));
 
-        // A `TitleBar` rather than a plain row, because on Windows and Linux
-        // this row *is* the title bar and nothing else draws one. Windows hides
-        // the system caption whenever `appears_transparent` is set, and GNOME's
-        // compositor implements no server-side decoration protocol at all, so a
-        // window whose application draws no controls has no way to be closed,
-        // minimised or moved. This component carries the three buttons, the
-        // drag region and the right-click window menu, and reports each one to
-        // the platform through `WindowControlArea` so hit-testing outside our
-        // own paint still works. On macOS it renders no buttons: the native
-        // traffic lights are still there, floating over the transparent
-        // titlebar.
-        TitleBar::new()
+        div()
+            .id("title-bar")
+            .flex_shrink_0()
             .h(px(TOOLBAR_HEIGHT))
+            .flex()
             .items_center()
             .gap_2()
             .pl(px(platform::toolbar_leading_inset()))
-            .pr_2()
             .bg(theme.panel)
+            .border_b_1()
             .border_color(theme.border)
             .when_some(self.path_input.clone(), |this, input| {
-                this.child(div().flex_1().min_w(px(0.)).child(
-                    Input::new(&input).h(px(FIELD_HEIGHT)).prefix(sized_icon(
-                        "path",
-                        12.,
-                        theme.text_faint,
-                    )),
-                ))
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        // Capped, where it used to take the whole row: past this
+                        // width the bar has nothing left that is not a control,
+                        // and on Windows and Linux a title bar with no inert
+                        // strip is a window that cannot be moved.
+                        .max_w(px(PATH_INPUT_MAX))
+                        .child(Input::new(&input).h(px(FIELD_HEIGHT)).prefix(sized_icon(
+                            "path",
+                            12.,
+                            theme.text_faint,
+                        ))),
+                )
             })
+            .child(self.render_title_drag(cx))
             // The account, where Brows3 puts it: the same path under two
             // profiles is two different places, so it belongs beside the path.
             .child(
@@ -6273,6 +6307,138 @@ impl Browser {
                     )
                     .child(sized_icon("chevron-down", 10., theme.text_faint)),
             )
+            .children(controls)
+    }
+
+    /// The strip of title bar you can pick the window up by.
+    ///
+    /// A spacer rather than the whole row, and that is not a matter of taste.
+    /// Windows answers `WM_NCHITTEST` from the **first** registered control area
+    /// containing the pointer, and those areas are registered in paint order —
+    /// a parent before its children. A drag area covering the whole bar
+    /// therefore swallows every click meant for the path box and the profile
+    /// chip inside it: the bar's own hitbox is found first, so the OS is told
+    /// the pointer is on the caption rather than on a text field, and the field
+    /// never sees the press.
+    fn render_title_drag(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("title-drag")
+            .flex_1()
+            .min_w(px(TITLE_DRAG_MIN))
+            .h_full()
+            // Windows needs no handler at all: told this is the caption, it
+            // moves the window itself, and brings its snap gestures with it.
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.window_control_area(gpui::WindowControlArea::Drag)
+            })
+            .on_double_click(cx.listener(|_this, _event, window, _cx| {
+                if cfg!(target_os = "macos") {
+                    // Honours the system setting, which may be zoom or minimise.
+                    window.titlebar_double_click();
+                } else {
+                    window.zoom_window();
+                }
+            }))
+            // Linux has no hit test to answer, so the move is started by hand —
+            // on the first movement rather than on the press, or a double click
+            // would be swallowed by a window move that began before its second
+            // half arrived.
+            .when(cfg!(target_os = "linux"), |this| {
+                this.on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _event, _window, _cx| this.title_drag = true),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _event, _window, _cx| this.title_drag = false),
+                )
+                .on_mouse_move(cx.listener(|this, _event, window, _cx| {
+                    if std::mem::take(&mut this.title_drag) {
+                        window.start_window_move();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Right,
+                    |event: &gpui::MouseDownEvent, window, _cx| {
+                        window.show_window_menu(event.position)
+                    },
+                )
+            })
+    }
+
+    fn render_window_controls(&self, maximized: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .h_full()
+            .child(self.render_window_control(WindowButton::Minimize, cx))
+            .child(self.render_window_control(
+                if maximized {
+                    WindowButton::Restore
+                } else {
+                    WindowButton::Maximize
+                },
+                cx,
+            ))
+            .child(self.render_window_control(WindowButton::Close, cx))
+    }
+
+    fn render_window_control(
+        &self,
+        button: WindowButton,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let danger = button == WindowButton::Close;
+        // One group per button, so hovering one does not light the other two.
+        let group = SharedString::from(button.id());
+        let hovered = if danger {
+            theme.text_on_accent
+        } else {
+            theme.text
+        };
+
+        div()
+            .id(button.id())
+            .group(group.clone())
+            .w(px(WINDOW_CONTROL_WIDTH))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(if danger { theme.danger } else { theme.hover }))
+            .child(
+                gpui::svg()
+                    .path(SharedString::from(format!("icons/{}.svg", button.icon())))
+                    .size(px(WINDOW_CONTROL_GLYPH))
+                    // Set here, not inherited from the button. gpui's svg
+                    // element paints *nothing at all* when its own
+                    // `style.text.color` is `None` — `paint` zips the path with
+                    // the colour and skips the draw if either is missing — and
+                    // a parent's text colour does not cascade into an element's
+                    // computed style. Leaving it off so the hover could change
+                    // it made all three buttons invisible: the exact bug this
+                    // whole round exists to fix, reintroduced one layer down.
+                    .text_color(theme.text_muted)
+                    // Which is why the hover tint has to sit on the glyph as
+                    // well, keyed to the button's group: the pointer is over
+                    // the 40px button, not necessarily over the 14px of glyph.
+                    .group_hover(group, move |style| style.text_color(hovered)),
+            )
+            // Windows never delivers this click: once the hit test names the
+            // button, the press is a non-client event the OS acts on itself.
+            .when(cfg!(target_os = "windows"), |this| {
+                this.window_control_area(button.area())
+            })
+            .when(!cfg!(target_os = "windows"), |this| {
+                this.on_click(cx.listener(move |_this, _event, window, _cx| match button {
+                    WindowButton::Minimize => window.minimize_window(),
+                    WindowButton::Maximize | WindowButton::Restore => window.zoom_window(),
+                    WindowButton::Close => window.remove_window(),
+                }))
+            })
     }
 
     /// The tab bar.
@@ -11875,6 +12041,11 @@ impl Render for Browser {
 
         sync_component_theme(theme_mode(self.settings.theme, self.appearance), window, cx);
 
+        // Read here rather than inside the title bar: the maximise button and
+        // the restore button are the same button, and which one it is depends
+        // on a window state that only `render` has a window to ask.
+        let maximized = window.is_maximized();
+
         // The one place that has both a window and the current location. Not
         // while it has focus: overwriting what someone is halfway through
         // typing is worse than a box that lags a navigation they did not make.
@@ -11959,7 +12130,7 @@ impl Render for Browser {
                 this.child(onboarding)
             })
             .when(!self.profiles.is_empty(), |this| {
-                this.child(self.render_title_bar(cx))
+                this.child(self.render_title_bar(maximized, cx))
                     .child(self.render_tabs(cx))
                     .child(
                         div()
@@ -14637,6 +14808,50 @@ fn check_box(checked: bool, theme: Theme) -> impl IntoElement {
         })
 }
 
+/// One of the three buttons the app draws in place of a system title bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowButton {
+    Minimize,
+    /// Shown while the window is maximised; the same button as `Maximize` with
+    /// the opposite meaning, which is why the state has to be read every frame
+    /// rather than remembered.
+    Restore,
+    Maximize,
+    Close,
+}
+
+impl WindowButton {
+    fn id(self) -> &'static str {
+        match self {
+            WindowButton::Minimize => "window-minimize",
+            WindowButton::Restore => "window-restore",
+            WindowButton::Maximize => "window-maximize",
+            WindowButton::Close => "window-close",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            WindowButton::Minimize => "window-minimize",
+            WindowButton::Restore => "window-restore",
+            WindowButton::Maximize => "window-maximize",
+            // The same glyph as every other dismiss in the app, rather than a
+            // second X drawn slightly differently for this one place.
+            WindowButton::Close => "close",
+        }
+    }
+
+    /// What Windows is told the pointer is on, so it can act on the press
+    /// without the event ever reaching us.
+    fn area(self) -> gpui::WindowControlArea {
+        match self {
+            WindowButton::Minimize => gpui::WindowControlArea::Min,
+            WindowButton::Restore | WindowButton::Maximize => gpui::WindowControlArea::Max,
+            WindowButton::Close => gpui::WindowControlArea::Close,
+        }
+    }
+}
+
 /// The file-type tile shown in the preview and detail headers.
 ///
 /// One helper for all three places that had it, because they were three copies
@@ -15322,6 +15537,7 @@ mod tests {
             next_tab_id: 1,
             previewing: None,
             opening: None,
+            title_drag: false,
             screen: Screen::default(),
             path_suggesting: false,
             path_choice: None,
@@ -16542,6 +16758,34 @@ mod tests {
             location_text("demo", &keys[..1], true),
             "s3://demo/reports/q1.txt"
         );
+    }
+
+    #[test]
+    fn every_window_button_has_an_icon_that_actually_exists() {
+        use gpui::AssetSource as _;
+
+        // The bug this exists for, in full: the component library's title bar
+        // drew its buttons with `IconName::WindowClose`, which resolves to
+        // `icons/window-close.svg`. This app serves its own hand-authored set,
+        // which has no such name, so the loader answered `None` — and all three
+        // window buttons rendered as blank space that was still hit-testable.
+        // Nothing failed, nothing logged, and on Windows and Linux the window
+        // simply appeared to have no way to close it.
+        for button in [
+            WindowButton::Minimize,
+            WindowButton::Restore,
+            WindowButton::Maximize,
+            WindowButton::Close,
+        ] {
+            let path = format!("icons/{}.svg", button.icon());
+            assert!(
+                crate::assets::Assets
+                    .load(&path)
+                    .expect("bộ icon không đọc được")
+                    .is_some(),
+                "{path} không có trong bộ icon"
+            );
+        }
     }
 
     #[test]

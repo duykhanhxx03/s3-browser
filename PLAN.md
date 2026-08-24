@@ -1203,3 +1203,74 @@ Không thêm màu theo họ tệp. Cả app đang là trung tính + một màu n
 phải thứ đoán mò khi chưa build được.
 
 **Chưa biên dịch**, mới chắc cú pháp (`rustfmt` phân tích trọn file).
+
+### 10.25 Title bar tự vẽ, không dựa vào native (23/08/2026)
+
+Windows và Linux không có nút đóng/thu nhỏ/phóng to. Nguyên nhân **không phải**
+là thiếu title bar — mà là đúng cái bẫy file này đã dính hai lần trước.
+
+`TitleBar` của gpui-component *có* vẽ ba nút, bằng `IconName::WindowClose`, tức
+`icons/window-close.svg`. App này phục vụ bộ icon tự vẽ của chính nó, không có
+tên đó, nên `Assets::load` trả `None`. **Ba cái nút vẫn ở đó**: vẫn chiếm 34px
+mỗi cái, vẫn đăng ký `WindowControlArea` nên Windows vẫn bấm được — và vô hình.
+Không lỗi, không log. Giống hệt `cleanable(true)` ở §10.10h và giống hệt lý do
+`menu_icon` phải tồn tại.
+
+Sửa bằng cách **bỏ hẳn `TitleBar`** và tự dựng, theo đúng yêu cầu: icon của
+mình, theme của mình, kích thước của mình. Ba icon mới (`window-minimize`,
+`window-maximize`, `window-restore`); nút đóng dùng lại `close` sẵn có, vì một
+chữ X thứ hai vẽ hơi khác chữ X ở mọi chỗ khác là thứ không ai muốn.
+
+**Một phát hiện định hình cả layout.** Windows trả lời `WM_NCHITTEST` bằng vùng
+control **đầu tiên** chứa con trỏ, mà các vùng được đăng ký theo thứ tự vẽ — cha
+trước con. Một vùng kéo phủ cả hàng vì thế **nuốt mọi cú bấm** dành cho ô path
+và chip profile nằm trong nó: hitbox của hàng được tìm thấy trước, OS được bảo
+là con trỏ đang ở trên caption. Nên vùng kéo là một dải riêng giữa ô path và
+chip, và ô path bị chặn ở 560px để dải đó luôn có chỗ tồn tại.
+
+Chia việc theo nền tảng, mỗi chỗ một lý do:
+
+| | kéo cửa sổ | bấm nút |
+|---|---|---|
+| Windows | `WindowControlArea::Drag`, OS tự kéo | OS tự xử lý, click không tới app |
+| Linux | `start_window_move()` khi *di chuyển* chứ không phải khi nhấn — nhấn là nuốt mất cú double-click | `on_click` của mình |
+| macOS | traffic light gốc, không vẽ gì | — |
+
+Chuột phải trên dải kéo mở `show_window_menu` (Linux). Viền kéo giãn thì `Root`
+của gpui-component đã bọc `window_border()` sẵn, không thiếu.
+
+Thêm `S3BROWSER_WINDOW_CONTROLS=0|1` cùng tinh thần với `S3BROWSER_GLASS`: đó là
+cách soi ba cái nút trên máy Mac mà không phải cross-compile sang nền tảng thật
+sự cần chúng.
+
+Và một test chặn đúng loại lỗi này tái phát: duyệt mọi `WindowButton` rồi khẳng
+định `Assets::load` trả về `Some` cho icon của nó. Nếu ai đó đổi tên icon, test
+đỏ — thay vì cửa sổ lặng lẽ mất nút.
+
+**Hai lỗi tiếp theo, và cách tìm ra (23/08/2026).** Bản đầu vẫn không có icon.
+
+Nguyên nhân là tôi tái tạo đúng cái bug đang sửa, thấp hơn một tầng. Tôi bỏ
+`text_color` trên svg để hover đổi màu được — nhưng `vendor/gpui/src/elements/svg.rs`
+làm thế này:
+
+```rust
+if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
+```
+
+Thiếu màu thì nó **không vẽ gì cả**, và `compute_style` dựng style từ
+`Style::default()` rồi refine bằng `base_style` của chính phần tử — màu chữ của
+cha *không* cascade xuống. Ba cái nút lại vô hình, lần này do tôi. Sửa: svg có
+màu nền của riêng nó, còn sắc hover đặt bằng `group_hover` khoá theo group của
+nút — vì con trỏ nằm trên nút 40px chứ không nhất thiết trên 14px glyph.
+
+Lỗi thứ hai: `window-restore` tôi vẽ tay ra một khối đặc chứ không phải nét
+viền. Tìm ra bằng cách **rasterise rồi nhìn**: `qlmanage -t -s 256 -o <dir>
+<file>.svg` sinh PNG, và PNG thì đọc được. Vẽ lại theo lối hai ô vuông kinh
+điển rồi render lại để xác nhận. Kỹ thuật này đáng nhớ — từ nay icon tự vẽ
+không phải đoán nữa.
+
+Và khi ép `S3BROWSER_WINDOW_CONTROLS=1` trên macOS thì có **hai** bộ nút cửa
+sổ: traffic light của hệ thống bên trái, ba nút của app bên phải. Hai bộ trên
+một thanh không phải bản xem thử của nền tảng chỉ có một bộ, nên khi bật cờ,
+traffic light bị đẩy ra ngoài cửa sổ và `toolbar_leading_inset` tụt từ 88 xuống
+12 — chỗ trống 88px vốn để chừa cho những cái nút giờ không còn ở đó.

@@ -130,17 +130,63 @@ pub fn titlebar_options() -> Option<TitlebarOptions> {
     Some(TitlebarOptions {
         title: Some("s3browser".into()),
         appears_transparent: true,
-        traffic_light_position: if cfg!(target_os = "macos") {
-            Some(point(px(14.), px(13.)))
-        } else {
-            None
-        },
+        traffic_light_position: traffic_light_position(),
     })
+}
+
+/// Where macOS puts its own three buttons, or nowhere.
+///
+/// Nudged to line up with our toolbar normally. Parked off the window when the
+/// in-app controls have been forced on, because two sets of window buttons on
+/// one bar is not a preview of the platform that has one set — and gpui offers
+/// no way to ask macOS to leave them out entirely.
+fn traffic_light_position() -> Option<gpui::Point<gpui::Pixels>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    if window_controls_in_app() {
+        return Some(point(px(-200.), px(-200.)));
+    }
+    Some(point(px(14.), px(13.)))
+}
+
+/// Whether the app has to draw its own close, minimise and maximise buttons.
+///
+/// True everywhere except macOS. The window is created with
+/// `appears_transparent`, which on Windows tells the OS to hide its caption
+/// entirely, and on Linux GNOME implements no server-side decoration protocol
+/// at all — so on both, a window whose application draws no controls has no
+/// visible way to be closed, minimised or moved. macOS keeps its traffic
+/// lights floating over the transparent titlebar, and a second set beside them
+/// would be two ways to close one window.
+///
+/// Overridable with `S3BROWSER_WINDOW_CONTROLS=0|1`, in the same spirit as
+/// `S3BROWSER_GLASS` above: it is how the controls can be looked at on a Mac
+/// without cross-compiling for the platform that actually needs them.
+pub fn window_controls_in_app() -> bool {
+    decide_window_controls(
+        std::env::var("S3BROWSER_WINDOW_CONTROLS").ok().as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// The decision on its own, so both branches can be tested from either
+/// platform — the interesting one is by definition not the one running the test.
+fn decide_window_controls(override_var: Option<&str>, native_controls: bool) -> bool {
+    match override_var {
+        Some("1") | Some("true") => return true,
+        Some("0") | Some("false") => return false,
+        _ => {}
+    }
+    !native_controls
 }
 
 /// Left inset of the toolbar, reserving room for the macOS traffic lights.
 pub fn toolbar_leading_inset() -> f32 {
-    if cfg!(target_os = "macos") {
+    // Room for the traffic lights only where there are traffic lights. Tied to
+    // the same decision that draws our own buttons, so a forced preview does
+    // not leave 88px of empty bar reserved for controls that are not there.
+    if cfg!(target_os = "macos") && !window_controls_in_app() {
         88.
     } else {
         12.
@@ -321,6 +367,27 @@ mod tests {
         // empty family, which renders as a blank run of text.
         assert_eq!(pick_font(&["Nope", "Nada"], &installed), "Nope");
         assert_eq!(pick_font(&[], &installed), "sans-serif");
+    }
+
+    #[test]
+    fn only_the_platforms_without_native_controls_draw_their_own() {
+        // macOS has traffic lights floating over the transparent titlebar.
+        assert!(!decide_window_controls(None, true));
+        // Windows hides its caption for a transparent titlebar, and GNOME has
+        // no server-side decorations to hide in the first place.
+        assert!(decide_window_controls(None, false));
+    }
+
+    #[test]
+    fn the_window_control_override_works_in_both_directions() {
+        for value in ["1", "true"] {
+            assert!(decide_window_controls(Some(value), true));
+        }
+        for value in ["0", "false"] {
+            assert!(!decide_window_controls(Some(value), false));
+        }
+        // Anything else is not an override and must fall through.
+        assert!(decide_window_controls(Some("maybe"), false));
     }
 
     #[test]
