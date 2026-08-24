@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use s3core::{Profile, S3Client};
+use s3core::{Grantee, Profile, S3Client};
 
 /// Returns a client only when MinIO is reachable *and* seeded. Three outcomes
 /// have to stay distinguishable: no server (skip), server without the fixture
@@ -803,7 +803,7 @@ async fn acl_reads_grants_and_flags_public_ones() {
         client.delete_object(bucket, key).await.unwrap();
         return;
     }
-    assert!(!acl.owner.is_empty(), "owner should be reported");
+    assert!(acl.owner != Grantee::Unknown, "owner should be reported");
     assert!(
         !acl.grants.iter().any(|grant| grant.public),
         "a new object must not be world-readable: {acl:?}"

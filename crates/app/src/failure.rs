@@ -13,6 +13,8 @@
 
 use gpui::SharedString;
 
+use crate::locale;
+
 /// What can be done about a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fix {
@@ -32,9 +34,9 @@ pub enum Fix {
 impl Fix {
     pub fn label(self) -> &'static str {
         match self {
-            Fix::OpenBucketByName => "Mở bucket theo tên",
-            Fix::EditProfile => "Sửa profile",
-            Fix::Retry => "Thử lại",
+            Fix::OpenBucketByName => locale::text("fix.open_bucket_by_name"),
+            Fix::EditProfile => locale::text("fix.edit_profile"),
+            Fix::Retry => locale::text("fix.retry"),
         }
     }
 }
@@ -121,13 +123,13 @@ fn classify(raw: &str) -> (Option<String>, Option<Fix>) {
     // allowed", so they have to be checked before the permission cases.
     if has("InvalidAccessKeyId") || has("SignatureDoesNotMatch") {
         return (
-            Some("Khoá truy cập không đúng".into()),
+            Some(locale::text("error.invalid_access_key").into()),
             Some(Fix::EditProfile),
         );
     }
     if has("ExpiredToken") || has("TokenRefreshRequired") || has("InvalidToken") {
         return (
-            Some("Phiên đăng nhập đã hết hạn".into()),
+            Some(locale::text("error.session_expired").into()),
             Some(Fix::EditProfile),
         );
     }
@@ -136,7 +138,7 @@ fn classify(raw: &str) -> (Option<String>, Option<Fix>) {
     // setup, not a mistake — so this one gets a door rather than a diagnosis.
     if (has("AccessDenied") || has("Forbidden")) && has("ListBuckets") {
         return (
-            Some("Token không có quyền liệt kê bucket".into()),
+            Some(locale::text("error.cannot_list_buckets").into()),
             Some(Fix::OpenBucketByName),
         );
     }
@@ -144,7 +146,7 @@ fn classify(raw: &str) -> (Option<String>, Option<Fix>) {
         // No fix: which permission is missing depends on the request, and this
         // function only has the text. Guessing a button here would send people
         // to edit a profile that is perfectly correct.
-        return (Some("Token không có quyền cho thao tác này".into()), None);
+        return (Some(locale::text("error.forbidden").into()), None);
     }
 
     // A bucket in another region. S3 says so precisely and then buries it in a
@@ -152,31 +154,31 @@ fn classify(raw: &str) -> (Option<String>, Option<Fix>) {
     // the client rather than one field being wrong.
     if has("PermanentRedirect") || has("AuthorizationHeaderMalformed") {
         let named = expected_region(raw)
-            .map(|region| format!("Bucket nằm ở region {region}"))
-            .unwrap_or_else(|| "Bucket nằm ở region khác".to_string());
+            .map(|region| format!("{} {region}", locale::text("error.bucket_region_named")))
+            .unwrap_or_else(|| locale::text("error.bucket_wrong_region").to_string());
         return (Some(named), Some(Fix::EditProfile));
     }
 
     if has("NoSuchBucket") {
-        return (Some("Bucket không tồn tại".into()), None);
+        return (Some(locale::text("error.no_such_bucket").into()), None);
     }
     if has("NoSuchKey") {
-        return (Some("Object không còn ở đó".into()), None);
+        return (Some(locale::text("error.no_such_key").into()), None);
     }
     if has("BucketAlreadyExists") || has("BucketAlreadyOwnedByYou") {
-        return (Some("Tên bucket đã có người dùng".into()), None);
+        return (Some(locale::text("error.bucket_name_taken").into()), None);
     }
     if has("AccessControlListNotSupported") {
-        return (Some("Bucket này đã tắt ACL".into()), None);
+        return (Some(locale::text("error.acl_disabled").into()), None);
     }
     if has("NotImplemented") || has("MethodNotAllowed") {
-        return (Some("Provider không hỗ trợ thao tác này".into()), None);
+        return (Some(locale::text("error.not_implemented").into()), None);
     }
 
     // Throttling is temporary by definition, so retrying is exactly right.
     if has("SlowDown") || has("ServiceUnavailable") || has("RequestLimitExceeded") {
         return (
-            Some("Provider đang chặn bớt yêu cầu".into()),
+            Some(locale::text("error.throttled").into()),
             Some(Fix::Retry),
         );
     }
@@ -191,9 +193,25 @@ fn classify(raw: &str) -> (Option<String>, Option<Fix>) {
         || has("dns error")
     {
         return (
-            Some("Không kết nối được tới endpoint".into()),
+            Some(locale::text("error.connection_failed").into()),
             Some(Fix::Retry),
         );
+    }
+
+    // SSO device-code polling expired before the user finished in the
+    // browser. Not an SDK error at all, so there is no code to match on —
+    // `s3core::sso` bails with this exact marker text.
+    if has("sso device code expired") {
+        return (
+            Some(locale::text("error.sso_device_code_expired").into()),
+            None,
+        );
+    }
+
+    // A downloaded file's checksum did not match the server's — surfaced by
+    // `transfer::worker` with this exact marker text, same reasoning.
+    if has("checksum mismatch for") {
+        return (Some(locale::text("error.checksum_mismatch").into()), None);
     }
 
     (None, None)
@@ -209,12 +227,12 @@ mod tests {
         // opposite actions: one means fix the profile, the other means the
         // profile is fine and the policy is not.
         let (summary, fix) = classify("InvalidAccessKeyId: The key is not valid");
-        assert_eq!(summary.as_deref(), Some("Khoá truy cập không đúng"));
+        assert_eq!(summary.as_deref(), Some("Invalid access key"));
         assert_eq!(fix, Some(Fix::EditProfile));
 
         let (_, fix) = classify("AccessDenied: not authorized to PutObject");
         // Deliberately no button: which permission is missing depends on the
-        // request, and offering "sửa profile" would send someone to edit
+        // request, and offering "edit profile" would send someone to edit
         // credentials that are perfectly correct.
         assert_eq!(fix, None);
     }
@@ -227,7 +245,7 @@ mod tests {
         let (summary, fix) = classify("AccessDenied when calling ListBuckets");
         assert_eq!(
             summary.as_deref(),
-            Some("Token không có quyền liệt kê bucket")
+            Some("This token cannot list buckets")
         );
         assert_eq!(fix, Some(Fix::OpenBucketByName));
     }
@@ -240,14 +258,14 @@ mod tests {
         let raw = "AuthorizationHeaderMalformed: The authorization header is \
                    malformed; the region 'us-east-1' is wrong; expecting 'eu-west-1'";
         let (summary, fix) = classify(raw);
-        assert_eq!(summary.as_deref(), Some("Bucket nằm ở region eu-west-1"));
+        assert_eq!(summary.as_deref(), Some("Bucket is in region eu-west-1"));
         assert_eq!(fix, Some(Fix::EditProfile));
 
         // Some providers redirect without naming anything. Still worth saying
         // what kind of wrong it is; inventing a region would be worse than
         // saying "another one".
         let (summary, fix) = classify("PermanentRedirect: the bucket is in another region");
-        assert_eq!(summary.as_deref(), Some("Bucket nằm ở region khác"));
+        assert_eq!(summary.as_deref(), Some("Bucket is in another region"));
         assert_eq!(fix, Some(Fix::EditProfile));
 
         // And the extractor does not go hunting in unrelated text.
@@ -264,6 +282,20 @@ mod tests {
         // Retrying a bucket that does not exist just fails again, more slowly.
         assert_eq!(classify("NoSuchBucket").1, None);
         assert_eq!(classify("NotImplemented").1, None);
+    }
+
+    #[test]
+    fn markers_from_the_backend_crates_are_recognised() {
+        // s3core::sso and transfer::worker have no SDK error code to match on
+        // for these two cases, so they bail with a stable English marker
+        // instead of user-facing text, and classify() matches on it here.
+        let (summary, _) = classify("sso device code expired");
+        assert_eq!(summary.as_deref(), Some("The sign-in code expired, start over"));
+
+        let (summary, _) = classify(
+            "checksum mismatch for photo.png: downloaded file differs from the server's version",
+        );
+        assert_eq!(summary.as_deref(), Some("Checksum verification failed"));
     }
 
     #[test]
@@ -286,13 +318,13 @@ mod tests {
         assert_eq!(listing.fix, Some(Fix::OpenBucketByName));
 
         // But the same call site also sees expired credentials and dead
-        // networks, and "sửa profile" beats a workaround that will fail the
+        // networks, and "edit profile" beats a workaround that will fail the
         // same way. Claiming a permission problem here would send someone to
         // read an IAM policy that is perfectly correct.
         let bad_key =
             Failure::new("ListBuckets: SignatureDoesNotMatch").or_fix(Fix::OpenBucketByName);
         assert_eq!(bad_key.fix, Some(Fix::EditProfile));
-        assert_eq!(bad_key.summary, "Khoá truy cập không đúng");
+        assert_eq!(bad_key.summary, "Invalid access key");
 
         let offline = Failure::new("ListBuckets: dispatch failure").or_fix(Fix::OpenBucketByName);
         assert_eq!(offline.fix, Some(Fix::Retry));
@@ -306,7 +338,7 @@ mod tests {
         let raw = "ServiceError\n  source: dispatch failure\n  source: io error";
         let failure = Failure::new(raw);
 
-        assert_eq!(failure.summary, "Không kết nối được tới endpoint");
+        assert_eq!(failure.summary, "Could not connect to the endpoint");
         assert_eq!(failure.detail, raw, "the original is never thrown away");
 
         let unknown = Failure::new("Weird\n  source: also weird");

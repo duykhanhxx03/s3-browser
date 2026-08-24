@@ -85,13 +85,13 @@ pub async fn begin(start_url: &str, region: &str) -> Result<DeviceAuthorization>
         .client_type("public")
         .send()
         .await
-        .context("RegisterClient thất bại")?;
+        .context("RegisterClient failed")?;
 
     let (Some(client_id), Some(client_secret)) = (
         registration.client_id().map(str::to_owned),
         registration.client_secret().map(str::to_owned),
     ) else {
-        bail!("RegisterClient không trả về client id/secret");
+        bail!("RegisterClient did not return a client id/secret");
     };
 
     let authorization = client
@@ -101,16 +101,16 @@ pub async fn begin(start_url: &str, region: &str) -> Result<DeviceAuthorization>
         .start_url(start_url)
         .send()
         .await
-        .context("StartDeviceAuthorization thất bại")?;
+        .context("StartDeviceAuthorization failed")?;
 
     let device_code = authorization
         .device_code()
-        .context("StartDeviceAuthorization không trả về device code")?
+        .context("StartDeviceAuthorization did not return a device code")?
         .to_string();
     let verification_uri = authorization
         .verification_uri_complete()
         .or_else(|| authorization.verification_uri())
-        .context("StartDeviceAuthorization không trả về URL xác thực")?
+        .context("StartDeviceAuthorization did not return a verification URL")?
         .to_string();
 
     Ok(DeviceAuthorization {
@@ -144,7 +144,7 @@ pub async fn poll_once(auth: &DeviceAuthorization, region: &str) -> Result<Optio
             .access_token()
             .map(str::to_owned)
             .map(Some)
-            .context("CreateToken không trả về access token"),
+            .context("CreateToken did not return an access token"),
         Err(error) => {
             let message = format!("{error:?}");
             // Still waiting, or told to back off: both mean keep going.
@@ -153,7 +153,7 @@ pub async fn poll_once(auth: &DeviceAuthorization, region: &str) -> Result<Optio
             {
                 Ok(None)
             } else {
-                Err(error).context("CreateToken thất bại")
+                Err(error).context("CreateToken failed")
             }
         }
     }
@@ -167,7 +167,10 @@ pub async fn poll_once(auth: &DeviceAuthorization, region: &str) -> Result<Optio
 pub async fn wait_for_token(auth: &DeviceAuthorization, region: &str) -> Result<String> {
     loop {
         if has_expired(auth, SystemTime::now()) {
-            bail!("Mã đăng nhập đã hết hạn, thử lại từ đầu");
+            // Marker text matched by `app::failure::classify` — not an SDK
+            // error, so there is no error code to key a translated summary
+            // off of otherwise.
+            bail!("sso device code expired");
         }
         if let Some(token) = poll_once(auth, region).await? {
             return Ok(token);
@@ -190,7 +193,7 @@ pub async fn list_roles(access_token: &str, region: &str) -> Result<Vec<SsoRole>
 
     let mut listed = Vec::new();
     while let Some(page) = accounts.next().await {
-        let page = page.context("ListAccounts thất bại")?;
+        let page = page.context("ListAccounts failed")?;
         for account in page.account_list() {
             if let Some(id) = account.account_id() {
                 listed.push((
@@ -210,7 +213,7 @@ pub async fn list_roles(access_token: &str, region: &str) -> Result<Vec<SsoRole>
             .send();
 
         while let Some(page) = pages.next().await {
-            let page = page.context("ListAccountRoles thất bại")?;
+            let page = page.context("ListAccountRoles failed")?;
             for role in page.role_list() {
                 if let Some(role_name) = role.role_name() {
                     roles.push(SsoRole {
@@ -238,11 +241,11 @@ pub async fn credentials_for(
         .role_name(&role.role_name)
         .send()
         .await
-        .context("GetRoleCredentials thất bại")?;
+        .context("GetRoleCredentials failed")?;
 
     let credentials = out
         .role_credentials()
-        .context("GetRoleCredentials không trả về credentials")?;
+        .context("GetRoleCredentials did not return credentials")?;
 
     Ok(TemporaryCredentials {
         access_key: credentials.access_key_id().unwrap_or_default().to_string(),

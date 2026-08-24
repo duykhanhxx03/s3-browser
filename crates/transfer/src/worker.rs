@@ -395,11 +395,14 @@ async fn verify_download(client: &S3Client, job: &Job) -> Result<()> {
     let verification =
         tokio::task::spawn_blocking(move || checksum::verify(&path, Some(&expected)))
             .await
-            .context("tác vụ kiểm checksum không hoàn tất")??;
+            .context("checksum verification task did not complete")??;
 
     if verification == checksum::Verification::Mismatch {
+        // Marker text matched by `app::failure::classify` — not an SDK
+        // error, so there is no error code to key a translated summary off
+        // of otherwise.
         anyhow::bail!(
-            "Checksum không khớp cho {}: tệp tải về khác với bản trên máy chủ",
+            "checksum mismatch for {}: downloaded file differs from the server's version",
             job.key
         );
     }

@@ -25,8 +25,8 @@ use gpui_component::InteractiveElementExt as _;
 use gpui_tokio::Tokio;
 use s3core::{
     capability::{Capabilities, CapabilityCache, Support},
-    format_size, format_timestamp, restore_state, sort_entries, Entry, ObjectAcl, ObjectHead,
-    ObjectVersion, Profile, RestoreState, S3Client, Sort, SortKey,
+    format_size, restore_state, sort_entries, Entry, Grantee, ObjectAcl, ObjectHead, ObjectVersion,
+    Profile, RestoreState, S3Client, Sort, SortKey, TimestampParts,
 };
 use transfer::{Job, JobState, TransferEngine};
 use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
@@ -3501,7 +3501,7 @@ impl Browser {
                         this.status = match expires_at {
                             Some(at) => format!(
                                 "Đã nhận role, phiên hết hạn {}",
-                                s3core::format_timestamp(
+                                format_timestamp(
                                     at.duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_secs() as i64)
                                         .unwrap_or(0)
@@ -7422,7 +7422,7 @@ impl Browser {
                         let created = self
                             .bucket_created
                             .get(name.as_ref())
-                            .map(|at| s3core::format_timestamp(*at))
+                            .map(|at| format_timestamp(*at))
                             .unwrap_or_else(|| "—".to_string());
                         div()
                             .id(SharedString::from(format!("bucket-row-{index}")))
@@ -7625,9 +7625,7 @@ impl Browser {
                                     div()
                                         .whitespace_nowrap()
                                         .text_color(theme.text_faint)
-                                        .child(SharedString::from(s3core::format_timestamp(
-                                            target.at,
-                                        ))),
+                                        .child(SharedString::from(format_timestamp(target.at))),
                                 )
                             })
                             .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -7878,7 +7876,7 @@ impl Browser {
                     section
                         .child(preview_detail_row(
                             "Chủ sở hữu",
-                            elide_middle(&acl.owner, 28),
+                            elide_middle(&grantee_label(&acl.owner), 28),
                             theme,
                         ))
                         .child(
@@ -7901,11 +7899,11 @@ impl Browser {
                     section
                         .child(div().text_color(theme.text_faint).child("Preset nhanh"))
                         .child(div().flex().flex_wrap().gap_1().children(
-                            s3core::CANNED_ACLS.iter().map(|(canned, label)| {
+                            s3core::CANNED_ACLS.iter().map(|canned| {
                                 let canned = *canned;
                                 action_button_dyn(
                                     SharedString::from(format!("preview-acl-{canned}")),
-                                    SharedString::from(*label),
+                                    SharedString::from(canned_acl_label(canned)),
                                     theme,
                                 )
                                 .on_click(cx.listener(
@@ -10614,7 +10612,7 @@ impl Browser {
                                 section
                                     .child(detail_row(
                                         "Chủ sở hữu",
-                                        elide_middle(&acl.owner, 30),
+                                        elide_middle(&grantee_label(&acl.owner), 30),
                                         theme,
                                     ))
                                     .child(
@@ -10636,11 +10634,11 @@ impl Browser {
                             section
                                 .child(div().text_color(theme.text_faint).child("Preset nhanh"))
                                 .child(div().flex().flex_wrap().gap_1().children(
-                                    s3core::CANNED_ACLS.iter().map(|(canned, label)| {
+                                    s3core::CANNED_ACLS.iter().map(|canned| {
                                         let canned = *canned;
                                         action_button_dyn(
                                             SharedString::from(format!("acl-{canned}")),
-                                            SharedString::from(*label),
+                                            SharedString::from(canned_acl_label(canned)),
                                             theme,
                                         )
                                         .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -11222,11 +11220,11 @@ impl Browser {
                                 })
                                 .child(div().text_color(theme.text_faint).child("Preset nhanh"))
                                 .child(div().flex().flex_wrap().gap_1().children(
-                                    s3core::CANNED_ACLS.iter().map(|(canned, label)| {
+                                    s3core::CANNED_ACLS.iter().map(|canned| {
                                         let canned = *canned;
                                         action_button_dyn(
                                             SharedString::from(format!("acl-popup-{canned}")),
-                                            SharedString::from(*label),
+                                            SharedString::from(canned_acl_label(canned)),
                                             theme,
                                         )
                                         .on_click(
@@ -12758,14 +12756,18 @@ fn acl_permission_rows(acl: &ObjectAcl) -> Vec<AclPermissionRow> {
     let mut seen = HashSet::new();
     let mut grantees = Vec::new();
 
-    for grantee in [&acl.owner, "Mọi người", "Người dùng đã xác thực"] {
-        if !grantee.is_empty() && seen.insert(grantee.to_string()) {
-            grantees.push(grantee.to_string());
+    for grantee in [
+        acl.owner.clone(),
+        Grantee::AllUsers,
+        Grantee::AuthenticatedUsers,
+    ] {
+        if seen.insert(grantee.clone()) {
+            grantees.push(grantee);
         }
     }
 
     for grant in &acl.grants {
-        if !grant.grantee.is_empty() && seen.insert(grant.grantee.clone()) {
+        if seen.insert(grant.grantee.clone()) {
             grantees.push(grant.grantee.clone());
         }
     }
@@ -12775,7 +12777,7 @@ fn acl_permission_rows(acl: &ObjectAcl) -> Vec<AclPermissionRow> {
         .map(|grantee| {
             let grants = acl.grants.iter().filter(|grant| grant.grantee == grantee);
             let mut row = AclPermissionRow {
-                grantee: grantee.clone(),
+                grantee: grantee_label(&grantee),
                 read: false,
                 write: false,
                 full: false,
@@ -12938,6 +12940,51 @@ fn format_age(seconds: i64) -> String {
         s if s < 3600 => format!("{} phút trước", s / 60),
         s if s < 86_400 => format!("{} giờ trước", s / 3600),
         s => format!("{} ngày trước", s / 86_400),
+    }
+}
+
+/// Display label for a `s3core::CANNED_ACLS` id, in the user's language.
+fn canned_acl_label(id: &str) -> &'static str {
+    locale::text(&format!("acl.canned.{}", id.replace('-', "_")))
+}
+
+/// Display label for a grant's grantee, in the user's language.
+///
+/// `Named` carries the provider's own text (a display name or id) and is
+/// shown as-is; the two well-known groups and the unidentified case are
+/// worded by this layer, which knows what language the user chose.
+fn grantee_label(grantee: &Grantee) -> String {
+    match grantee {
+        Grantee::AllUsers => locale::text("acl.grantee.all_users").to_string(),
+        Grantee::AuthenticatedUsers => locale::text("acl.grantee.authenticated_users").to_string(),
+        Grantee::Unknown => locale::text("common.unknown").to_string(),
+        Grantee::Named(name) => name.clone(),
+    }
+}
+
+/// A timestamp as a person would say it, in the user's language.
+///
+/// S3 reports UTC; showing that unconverted puts a file uploaded at nine in
+/// the morning at "02:43", which reads as a different day's work. And an
+/// absolute date for something saved minutes ago makes the reader do
+/// arithmetic to answer "is this the one I just uploaded?" — which is the
+/// question a file list is usually being asked.
+fn format_timestamp(epoch: i64) -> String {
+    match s3core::timestamp_parts(epoch) {
+        TimestampParts::Today { clock } => format!("{} {clock}", locale::text("time.today")),
+        TimestampParts::Yesterday { clock } => {
+            format!("{} {clock}", locale::text("time.yesterday"))
+        }
+        // Within the current year the year adds nothing, and dropping it
+        // keeps the column narrow enough to scan.
+        TimestampParts::ThisYear { date, month, clock } => {
+            format!("{date:02}/{month:02} {clock}")
+        }
+        // A different year needs the year, and drops the clock — nobody
+        // reads the minute of something from last year.
+        TimestampParts::OtherYear { date, month, year } => {
+            format!("{date:02}/{month:02}/{year}")
+        }
     }
 }
 
@@ -17001,15 +17048,15 @@ mod tests {
     #[test]
     fn acl_permission_table_expands_full_control() {
         let acl = ObjectAcl {
-            owner: "owner-1".into(),
+            owner: Grantee::Named("owner-1".into()),
             grants: vec![
                 s3core::AclGrant {
-                    grantee: "owner-1".into(),
+                    grantee: Grantee::Named("owner-1".into()),
                     permission: "FULL_CONTROL".into(),
                     public: false,
                 },
                 s3core::AclGrant {
-                    grantee: "Mọi người".into(),
+                    grantee: Grantee::AllUsers,
                     permission: "READ".into(),
                     public: true,
                 },
@@ -17027,7 +17074,7 @@ mod tests {
                 public: false,
             })
         );
-        assert!(rows.iter().any(|row| row.grantee == "Mọi người"
+        assert!(rows.iter().any(|row| row.grantee == "Everyone"
             && row.read
             && !row.write
             && !row.full

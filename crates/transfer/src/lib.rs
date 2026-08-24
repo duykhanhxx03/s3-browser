@@ -389,7 +389,7 @@ impl TransferEngine {
     ) -> Result<i64> {
         let head = client.head_object(bucket, key).await?;
         let local = safe_join(destination_dir, relative)
-            .with_context(|| format!("đường dẫn không hợp lệ cho {key}"))?;
+            .with_context(|| format!("invalid local path for {key}"))?;
 
         let id = self.insert(Job {
             id: 0,

@@ -114,11 +114,11 @@ pub async fn assume_role(base: &Profile, request: &AssumeRole) -> Result<Tempora
     let out = call
         .send()
         .await
-        .with_context(|| format!("AssumeRole thất bại cho {}", request.role_arn))?;
+        .with_context(|| format!("AssumeRole failed for {}", request.role_arn))?;
 
     let credentials = out
         .credentials()
-        .context("AssumeRole không trả về credentials")?;
+        .context("AssumeRole did not return credentials")?;
 
     Ok(TemporaryCredentials {
         access_key: credentials.access_key_id().to_string(),

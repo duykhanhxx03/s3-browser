@@ -35,14 +35,14 @@ pub fn crc32_of_file(path: &Path) -> Result<String> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)
-        .with_context(|| format!("mở {} để kiểm checksum", path.display()))?;
+        .with_context(|| format!("open {} for checksum verification", path.display()))?;
     let mut hasher = crc32fast::Hasher::new();
     let mut buffer = vec![0u8; 1024 * 1024];
 
     loop {
         let read = file
             .read(&mut buffer)
-            .with_context(|| format!("đọc {}", path.display()))?;
+            .with_context(|| format!("read {}", path.display()))?;
         if read == 0 {
             break;
         }

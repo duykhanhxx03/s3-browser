@@ -260,13 +260,9 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// every one; nobody reading a permissions panel wants that shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObjectAcl {
-    /// Display name if the provider gives one, otherwise the canonical id.
-    pub owner: String,
+    pub owner: Grantee,
     pub grants: Vec<AclGrant>,
 }
-
-/// What a provider returns when it answers ACL reads without implementing them.
-const UNKNOWN: &str = "không rõ";
 
 impl ObjectAcl {
     /// Whether this says anything at all.
@@ -279,14 +275,32 @@ impl ObjectAcl {
     /// So the test is whether the answer carries information, not whether the
     /// call returned — and it costs no extra request.
     pub fn is_meaningful(&self) -> bool {
-        self.owner != UNKNOWN || self.grants.iter().any(|grant| grant.grantee != UNKNOWN)
+        self.owner != Grantee::Unknown
+            || self.grants.iter().any(|grant| grant.grantee != Grantee::Unknown)
     }
+}
+
+/// Who a grant applies to. A display name and the two AWS well-known groups
+/// are kept apart from a plain string so the UI layer — which knows the
+/// user's chosen language — decides how to word them, rather than this crate
+/// baking in one language's text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Grantee {
+    /// The `AllUsers` predefined group: anyone, including anonymous requests.
+    AllUsers,
+    /// The `AuthenticatedUsers` predefined group: any AWS-authenticated caller.
+    AuthenticatedUsers,
+    /// The provider answered without identifying who this is — MinIO's ACL
+    /// stub is the common case.
+    #[default]
+    Unknown,
+    /// A display name or id the provider did give.
+    Named(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclGrant {
-    /// `Mọi người`, `Người dùng đã xác thực`, a display name, or an id.
-    pub grantee: String,
+    pub grantee: Grantee,
     /// READ, WRITE, FULL_CONTROL…
     pub permission: String,
     /// True for the two AWS predefined groups that make an object reachable by
@@ -295,14 +309,15 @@ pub struct AclGrant {
     pub public: bool,
 }
 
-/// The canned ACLs worth offering. The full grant syntax exists, but hand-built
-/// grants are how buckets end up accidentally world-readable — a short list of
-/// named intents is safer and covers what people actually want.
-pub const CANNED_ACLS: [(&str, &str); 4] = [
-    ("private", "Riêng tư"),
-    ("public-read", "Ai cũng đọc được"),
-    ("bucket-owner-read", "Chủ bucket đọc được"),
-    ("bucket-owner-full-control", "Chủ bucket toàn quyền"),
+/// The canned ACLs worth offering, by id. The full grant syntax exists, but
+/// hand-built grants are how buckets end up accidentally world-readable — a
+/// short list of named intents is safer and covers what people actually want.
+/// Display labels live in the UI layer, keyed by these ids.
+pub const CANNED_ACLS: [&str; 4] = [
+    "private",
+    "public-read",
+    "bucket-owner-read",
+    "bucket-owner-full-control",
 ];
 
 /// Whether a provider refused `DeleteObjects` because it does not have it.
@@ -1063,7 +1078,7 @@ impl S3Client {
                     .set_objects(Some(batch))
                     .quiet(true)
                     .build()
-                    .context("danh sách xoá không hợp lệ")?;
+                    .context("invalid delete list")?;
 
                 let out = self
                     .inner
@@ -1079,7 +1094,7 @@ impl S3Client {
                     report.errors.push(format!(
                         "{}: {}",
                         error.key().unwrap_or("?"),
-                        error.message().unwrap_or("lỗi không rõ")
+                        error.message().unwrap_or("unknown error")
                     ));
                 }
                 report.deleted += deleted - failed;
@@ -1192,7 +1207,7 @@ impl S3Client {
             .send()
             .await
             .with_context(|| {
-                format!("Khôi phục version {version_id} của s3://{bucket}/{key} thất bại")
+                format!("restoring version {version_id} of s3://{bucket}/{key} failed")
             })?;
         Ok(())
     }
@@ -1208,7 +1223,7 @@ impl S3Client {
             .send()
             .await
             .with_context(|| {
-                format!("Xoá version {version_id} của s3://{bucket}/{key} thất bại")
+                format!("deleting version {version_id} of s3://{bucket}/{key} failed")
             })?;
         Ok(())
     }
@@ -1229,8 +1244,8 @@ impl S3Client {
         let owner = out
             .owner()
             .and_then(|owner| non_empty(owner.display_name()).or_else(|| non_empty(owner.id())))
-            .unwrap_or(UNKNOWN)
-            .to_string();
+            .map(|name| Grantee::Named(name.to_string()))
+            .unwrap_or(Grantee::Unknown);
 
         let grants = out
             .grants()
@@ -1245,14 +1260,14 @@ impl S3Client {
                     || uri.ends_with("/groups/global/AuthenticatedUsers");
 
                 let name = if uri.ends_with("/groups/global/AllUsers") {
-                    "Mọi người".to_string()
+                    Grantee::AllUsers
                 } else if uri.ends_with("/groups/global/AuthenticatedUsers") {
-                    "Người dùng đã xác thực".to_string()
+                    Grantee::AuthenticatedUsers
                 } else {
                     non_empty(grantee.display_name())
                         .or_else(|| non_empty(grantee.id()))
-                        .unwrap_or(UNKNOWN)
-                        .to_string()
+                        .map(|name| Grantee::Named(name.to_string()))
+                        .unwrap_or(Grantee::Unknown)
                 };
 
                 Some(AclGrant {
@@ -1328,7 +1343,7 @@ impl S3Client {
                     .key(key_name)
                     .value(value)
                     .build()
-                    .context("thẻ không hợp lệ")?,
+                    .context("invalid tag")?,
             );
         }
 
@@ -1340,7 +1355,7 @@ impl S3Client {
                 Tagging::builder()
                     .set_tag_set(Some(set))
                     .build()
-                    .context("bộ thẻ không hợp lệ")?,
+                    .context("invalid tag set")?,
             )
             .send()
             .await
@@ -1359,7 +1374,7 @@ impl S3Client {
                 GlacierJobParameters::builder()
                     .tier(Tier::Standard)
                     .build()
-                    .context("tham số restore không hợp lệ")?,
+                    .context("invalid restore parameters")?,
             )
             .build();
 
@@ -1396,7 +1411,7 @@ impl S3Client {
     /// claims a week and dies in an hour.
     pub async fn presign_get(&self, bucket: &str, key: &str, expires: Duration) -> Result<String> {
         let config =
-            PresigningConfig::expires_in(expires).context("thời hạn presigned URL không hợp lệ")?;
+            PresigningConfig::expires_in(expires).context("invalid presigned URL expiry")?;
 
         let request = self
             .inner
@@ -1530,10 +1545,7 @@ impl S3Client {
         let head = self.head_object(bucket, key).await?;
         let size = head.size.max(0) as u64;
         if size > COPY_OBJECT_LIMIT {
-            anyhow::bail!(
-                "Object {} lớn hơn 5 GiB, không sửa header tại chỗ được",
-                key
-            );
+            anyhow::bail!("Object {} is larger than 5 GiB, cannot edit headers in place", key);
         }
 
         let mut req = self
@@ -1567,7 +1579,7 @@ impl S3Client {
 
         req.send()
             .await
-            .with_context(|| format!("CopyObject (sửa header) failed for s3://{bucket}/{key}"))?;
+            .with_context(|| format!("CopyObject (edit headers) failed for s3://{bucket}/{key}"))?;
         Ok(())
     }
 
@@ -1733,7 +1745,7 @@ impl S3Client {
         }
         // Copying a prefix into itself would walk keys it is still creating.
         if dst_prefix.starts_with(src_prefix) {
-            anyhow::bail!("Không thể chép {src_prefix} vào trong chính nó ({dst_prefix})");
+            anyhow::bail!("cannot copy {src_prefix} into itself ({dst_prefix})");
         }
 
         let keys = self.list_keys_recursive(bucket, src_prefix).await?;
@@ -1777,7 +1789,7 @@ impl S3Client {
         }
         // Moving a prefix inside itself would walk keys it is still creating.
         if dst_prefix.starts_with(src_prefix) {
-            anyhow::bail!("Không thể chuyển {src_prefix} vào trong chính nó ({dst_prefix})");
+            anyhow::bail!("cannot move {src_prefix} into itself ({dst_prefix})");
         }
 
         let keys = self.list_keys_recursive(bucket, src_prefix).await?;
@@ -2071,8 +2083,8 @@ pub struct BucketInfo {
 ///
 /// `s3.example.com` is what people type, and what the AWS SDK answers with is
 /// `dispatch failure` — a message that names nothing, reads like the network is
-/// down, and which this app then classifies as "không kết nối được tới
-/// endpoint" and offers a **Thử lại** button for. So eight missing characters
+/// down, and which this app then classifies as "Could not connect to the
+/// endpoint" and offers a **Retry** button for. So eight missing characters
 /// buy a button that can never work, for a mistake nothing on screen points at.
 ///
 /// Loopback gets `http`, everything else `https`. Not a coin flip: an object
@@ -2138,15 +2150,29 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// A timestamp as a person would say it.
+/// A timestamp broken into locale-agnostic parts, for a UI layer to word.
 ///
 /// S3 reports UTC; showing that unconverted puts a file uploaded at nine in the
 /// morning at "02:43", which reads as a different day's work. And an absolute
 /// date for something saved minutes ago makes the reader do arithmetic to
 /// answer "is this the one I just uploaded?" — which is the question a file
-/// list is usually being asked.
-pub fn format_timestamp(epoch: i64) -> String {
-    format_timestamp_at(
+/// list is usually being asked. Today and yesterday are singled out for that
+/// reason; wording them is left to the caller, which knows the user's chosen
+/// language and this crate does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimestampParts {
+    Today { clock: String },
+    Yesterday { clock: String },
+    /// Within the current year: the year adds nothing and would only widen
+    /// the column.
+    ThisYear { date: i64, month: i64, clock: String },
+    /// A different year drops the clock — nobody reads the minute of
+    /// something from last year.
+    OtherYear { date: i64, month: i64, year: i64 },
+}
+
+pub fn timestamp_parts(epoch: i64) -> TimestampParts {
+    timestamp_parts_at(
         epoch,
         now_epoch(),
         LOCAL_OFFSET.load(std::sync::atomic::Ordering::Relaxed),
@@ -2155,7 +2181,7 @@ pub fn format_timestamp(epoch: i64) -> String {
 
 /// The pure form: `now` and `offset` are passed in so every branch is testable
 /// without waiting for a particular day.
-pub fn format_timestamp_at(epoch: i64, now: i64, offset: i32) -> String {
+pub fn timestamp_parts_at(epoch: i64, now: i64, offset: i32) -> TimestampParts {
     let local = epoch + offset as i64;
     let today = (now + offset as i64).div_euclid(86_400);
     let day = local.div_euclid(86_400);
@@ -2167,12 +2193,10 @@ pub fn format_timestamp_at(epoch: i64, now: i64, offset: i32) -> String {
     let (this_year, _, _) = civil_from_days(today);
 
     match today - day {
-        0 => format!("Hôm nay {clock}"),
-        1 => format!("Hôm qua {clock}"),
-        // Within the current year the year adds nothing, and dropping it keeps
-        // the column narrow enough to scan.
-        _ if year == this_year => format!("{date} thg {month} {clock}"),
-        _ => format!("{date} thg {month}, {year}"),
+        0 => TimestampParts::Today { clock },
+        1 => TimestampParts::Yesterday { clock },
+        _ if year == this_year => TimestampParts::ThisYear { date, month, clock },
+        _ => TimestampParts::OtherYear { date, month, year },
     }
 }
 
@@ -2223,8 +2247,8 @@ mod tests {
     #[test]
     fn an_endpoint_typed_without_a_scheme_gets_one() {
         // The whole point: the SDK answers a scheme-less URL with `dispatch
-        // failure`, which this app then shows as "không kết nối được tới
-        // endpoint" with a Thử lại button that can never work.
+        // failure`, which this app then shows as "Could not connect to the
+        // endpoint" with a Retry button that can never work.
         assert_eq!(
             normalize_endpoint("s3.example.com"),
             "https://s3.example.com"
@@ -2446,22 +2470,40 @@ mod tests {
 
         // Today and yesterday are what a file list is usually asked about, so
         // they are named rather than dated.
-        assert_eq!(format_timestamp_at(noon, noon + 7200, vn), "Hôm nay 09:43");
         assert_eq!(
-            format_timestamp_at(noon, noon + 86_400, vn),
-            "Hôm qua 09:43"
+            timestamp_parts_at(noon, noon + 7200, vn),
+            TimestampParts::Today {
+                clock: "09:43".into()
+            }
+        );
+        assert_eq!(
+            timestamp_parts_at(noon, noon + 86_400, vn),
+            TimestampParts::Yesterday {
+                clock: "09:43".into()
+            }
         );
 
         // Further back in the same year: the year adds nothing and would only
         // widen the column.
-        let older = format_timestamp_at(noon, noon + 30 * 86_400, vn);
-        assert!(older.starts_with("19 thg 8"), "{older}");
-        assert!(!older.contains("2026"), "{older}");
+        assert_eq!(
+            timestamp_parts_at(noon, noon + 30 * 86_400, vn),
+            TimestampParts::ThisYear {
+                date: 19,
+                month: 8,
+                clock: "09:43".into()
+            }
+        );
 
         // A different year needs the year, and drops the clock — nobody reads
         // the minute of something from last year.
-        let ancient = format_timestamp_at(noon, noon + 400 * 86_400, vn);
-        assert_eq!(ancient, "19 thg 8, 2026");
+        assert_eq!(
+            timestamp_parts_at(noon, noon + 400 * 86_400, vn),
+            TimestampParts::OtherYear {
+                date: 19,
+                month: 8,
+                year: 2026
+            }
+        );
     }
 
     #[test]
@@ -2469,15 +2511,21 @@ mod tests {
         // 23:30 UTC is already the next morning in Vietnam. Showing the raw UTC
         // day would put a file under yesterday for anyone east of Greenwich.
         let late = 1_787_182_200;
-        let utc = format_timestamp_at(late, late, 0);
-        let vn = format_timestamp_at(late, late, 7 * 3600);
+        let utc = timestamp_parts_at(late, late, 0);
+        let vn = timestamp_parts_at(late, late, 7 * 3600);
 
-        assert!(utc.starts_with("Hôm nay 23:"), "{utc}");
-        assert!(vn.starts_with("Hôm nay 06:"), "{vn}");
-
-        // And a zero offset must still produce a valid label rather than
-        // nothing, since that is what an unset timezone falls back to.
-        assert!(!utc.is_empty());
+        assert_eq!(
+            utc,
+            TimestampParts::Today {
+                clock: "23:30".into()
+            }
+        );
+        assert_eq!(
+            vn,
+            TimestampParts::Today {
+                clock: "06:30".into()
+            }
+        );
     }
 
     #[test]
