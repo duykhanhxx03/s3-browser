@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use gpui::Focusable as _;
 use gpui::{
-    div, ease_out_quint, point, prelude::*, px, uniform_list, App, ClickEvent, Context, Entity,
-    ExternalPaths, FocusHandle, FontWeight, KeyDownEvent, Modifiers, ObjectFit, Pixels, Point,
-    SharedString, Subscription, Task, Transition, TransitionExt, UniformListScrollHandle, Window,
+    div, ease_out_quint, point, prelude::*, px, uniform_list, AnyElement, App, ClickEvent, Context,
+    CursorStyle, Entity, ExternalPaths, FocusHandle, FontWeight, KeyDownEvent, Modifiers,
+    MouseButton, ObjectFit, Pixels, Point, ResizeEdge, SharedString, Subscription, Task,
+    Transition, TransitionExt, UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 // `on_double_click` lives on gpui-component's extension trait, not on gpui's
@@ -8528,6 +8529,15 @@ impl Browser {
                                 .child(SharedString::from(version_line())),
                             theme,
                         ))
+                        .child(setting_row(
+                            locale::text("about.author"),
+                            None,
+                            div()
+                                .text_xs()
+                                .text_color(theme.text)
+                                .child("duykhanhxx03"),
+                            theme,
+                        ))
                         // Only the crash folder. The config folder has its own
                         // row in Cài đặt, one line above this in the sidebar,
                         // and a second copy here would be two Vietnamese
@@ -11260,10 +11270,25 @@ impl Browser {
         Some(
             div()
                 .id("onboarding")
+                .relative()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
+                // Its own corner rather than the centered stack: a language
+                // picker is a settings control, not a step in the flow, and
+                // sitting between the logo and the connection choices made it
+                // read as one.
+                .when_some(self.language_select.clone(), |this, select| {
+                    this.child(
+                        div().absolute().top_4().right_4().w(px(200.)).child(
+                            Select::new(&select)
+                                .placeholder(locale::text("settings.language.choose"))
+                                .search_placeholder(locale::text("settings.language.search"))
+                                .menu_width(px(280.)),
+                        ),
+                    )
+                })
                 .child(
                     div()
                         .w(px(360.))
@@ -11272,18 +11297,6 @@ impl Browser {
                         .items_center()
                         .gap_4()
                         .child(brand_logo(mode, 188.))
-                        .when_some(self.language_select.clone(), |this, select| {
-                            this.child(
-                                div().w(px(220.)).child(
-                                    Select::new(&select)
-                                        .placeholder(locale::text("settings.language.choose"))
-                                        .search_placeholder(locale::text(
-                                            "settings.language.search",
-                                        ))
-                                        .menu_width(px(280.)),
-                                ),
-                            )
-                        })
                         .child(
                             div().w_full().flex().flex_col().gap_2().children(
                                 [
@@ -12322,6 +12335,7 @@ impl Render for Browser {
 
         div()
             .id("root")
+            .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_action(cx.listener(|this, _: &ActionCopy, _window, cx| {
@@ -12471,6 +12485,13 @@ impl Render for Browser {
                             }),
                     )
                     .children(self.render_drawer(cx))
+            })
+            // Under every dialog's scrim, so an open one blocks a resize the
+            // same way it blocks everything else behind it; over the base
+            // content, so it wins the hit test on the exact edge pixels the
+            // title bar and panels already claim by filling the window.
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.children(resize_handles())
             })
             .child(self.render_status(cx))
             .children(self.render_share(cx))
@@ -12986,6 +13007,144 @@ fn format_timestamp(epoch: i64) -> String {
             format!("{date:02}/{month:02}/{year}")
         }
     }
+}
+
+/// The eight corner/edge hit-regions that let a borderless window be resized
+/// by dragging, the way a native title bar's own frame would.
+///
+/// Only needed where the app draws its own chrome: `appears_transparent`
+/// hides the OS caption on Linux and Windows, and with it goes the frame's
+/// resize border, so nothing answers a drag started at the window's edge
+/// unless something here does. macOS keeps its real `NSWindow` frame and
+/// needs none of this — see `platform::window_controls_in_app`.
+fn resize_handles() -> Vec<AnyElement> {
+    const EDGE: f32 = 4.;
+    const CORNER: f32 = 10.;
+
+    // `top`/`right`/`bottom`/`left` position the region; `None` leaves that
+    // side unset so the opposite side plus `width`/`height` sizes it instead.
+    #[allow(clippy::too_many_arguments)]
+    let region = |top: Option<f32>,
+                  right: Option<f32>,
+                  bottom: Option<f32>,
+                  left: Option<f32>,
+                  width: Option<f32>,
+                  height: Option<f32>,
+                  cursor: CursorStyle,
+                  edge: ResizeEdge| {
+        let mut el = div()
+            .id(SharedString::from(format!("resize-{edge:?}")))
+            .absolute();
+        if let Some(top) = top {
+            el = el.top(px(top));
+        }
+        if let Some(right) = right {
+            el = el.right(px(right));
+        }
+        if let Some(bottom) = bottom {
+            el = el.bottom(px(bottom));
+        }
+        if let Some(left) = left {
+            el = el.left(px(left));
+        }
+        if let Some(width) = width {
+            el = el.w(px(width));
+        }
+        if let Some(height) = height {
+            el = el.h(px(height));
+        }
+        el.cursor(cursor)
+            .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
+                window.start_window_resize(edge);
+            })
+            .into_any_element()
+    };
+
+    vec![
+        // Edges, inset past the corners so a corner region gets first say
+        // over the diagonal cursor and the diagonal resize.
+        region(
+            Some(0.),
+            Some(CORNER),
+            None,
+            Some(CORNER),
+            None,
+            Some(EDGE),
+            CursorStyle::ResizeUpDown,
+            ResizeEdge::Top,
+        ),
+        region(
+            None,
+            Some(CORNER),
+            Some(0.),
+            Some(CORNER),
+            None,
+            Some(EDGE),
+            CursorStyle::ResizeUpDown,
+            ResizeEdge::Bottom,
+        ),
+        region(
+            Some(CORNER),
+            None,
+            Some(CORNER),
+            Some(0.),
+            Some(EDGE),
+            None,
+            CursorStyle::ResizeLeftRight,
+            ResizeEdge::Left,
+        ),
+        region(
+            Some(CORNER),
+            Some(0.),
+            Some(CORNER),
+            None,
+            Some(EDGE),
+            None,
+            CursorStyle::ResizeLeftRight,
+            ResizeEdge::Right,
+        ),
+        // Corners.
+        region(
+            Some(0.),
+            None,
+            None,
+            Some(0.),
+            Some(CORNER),
+            Some(CORNER),
+            CursorStyle::ResizeUpLeftDownRight,
+            ResizeEdge::TopLeft,
+        ),
+        region(
+            Some(0.),
+            Some(0.),
+            None,
+            None,
+            Some(CORNER),
+            Some(CORNER),
+            CursorStyle::ResizeUpRightDownLeft,
+            ResizeEdge::TopRight,
+        ),
+        region(
+            None,
+            None,
+            Some(0.),
+            Some(0.),
+            Some(CORNER),
+            Some(CORNER),
+            CursorStyle::ResizeUpRightDownLeft,
+            ResizeEdge::BottomLeft,
+        ),
+        region(
+            None,
+            Some(0.),
+            Some(0.),
+            None,
+            Some(CORNER),
+            Some(CORNER),
+            CursorStyle::ResizeUpLeftDownRight,
+            ResizeEdge::BottomRight,
+        ),
+    ]
 }
 
 /// Shortens an opaque token so it stays on one line.
