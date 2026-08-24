@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use gpui::Focusable as _;
 use gpui::{
     div, ease_out_quint, point, prelude::*, px, uniform_list, App, ClickEvent, Context, Entity,
-    ExternalPaths, FocusHandle, KeyDownEvent, Modifiers, ObjectFit, Pixels, Point, SharedString,
-    Subscription, Task, Transition, TransitionExt, UniformListScrollHandle, Window,
+    ExternalPaths, FocusHandle, FontWeight, KeyDownEvent, Modifiers, ObjectFit, Pixels, Point,
+    SharedString, Subscription, Task, Transition, TransitionExt, UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 // `on_double_click` lives on gpui-component's extension trait, not on gpui's
@@ -13014,18 +13014,40 @@ fn menu_icon(name: &'static str) -> gpui_component::Icon {
     gpui_component::Icon::empty().path(SharedString::from(format!("icons/{name}.svg")))
 }
 
-fn brand_logo_path(mode: crate::theme::Mode) -> &'static str {
-    match mode {
-        crate::theme::Mode::Light => "brand/s3-browser-logo-light.svg",
-        crate::theme::Mode::Dark => "brand/s3-browser-logo-dark.svg",
-    }
-}
-
 fn brand_logo(mode: crate::theme::Mode, width: f32) -> impl IntoElement {
-    gpui::img(brand_logo_path(mode))
+    let height = width * 144. / 440.;
+    let font_size = width * 64. / 440.;
+    let (accent, foreground) = match mode {
+        crate::theme::Mode::Light => (gpui::rgb(0x1476f2), gpui::rgb(0x111827)),
+        crate::theme::Mode::Dark => (gpui::rgb(0x2f8cff), gpui::rgb(0xf8fafc)),
+    };
+
+    // Keep the wordmark in GPUI's text pipeline. The old SVG contained <text>
+    // whose font was resolved by usvg's separate, system-only font database;
+    // on a minimal Linux install none of its macOS/Windows families existed and
+    // the logo rasterized blank. This uses the embedded UI font registered at
+    // startup, so the title bar, onboarding and About dialog behave identically
+    // on every platform.
+    div()
         .w(px(width))
-        .h(px(width * 144. / 440.))
-        .object_fit(ObjectFit::Contain)
+        .h(px(height))
+        .flex()
+        .items_center()
+        .font_family(platform::BUNDLED_UI_FONT)
+        .text_size(px(font_size))
+        .line_height(px(height))
+        .child(
+            div()
+                .font_weight(FontWeight(760.))
+                .text_color(accent)
+                .child("S3"),
+        )
+        .child(
+            div()
+                .font_weight(FontWeight(540.))
+                .text_color(foreground)
+                .child("Browser"),
+        )
 }
 
 /// An icon at a chosen size. 16px suits a button; a chevron sitting inline with

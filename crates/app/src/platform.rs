@@ -202,7 +202,12 @@ pub fn toolbar_leading_inset() -> f32 {
 /// `all_font_names` reports only what the operating system has installed.
 /// Probing for it finds nothing and falls through to a system font, discarding
 /// the very font that was bundled to avoid that.
-pub const BUNDLED_UI_FONT: &str = "Inter";
+// This must match the family stored in `InterVariable.ttf`, not the product
+// name used on Inter's web site. Linux's cosmic-text backend compares family
+// names exactly; asking it for `Inter` leaves the embedded `Inter Variable`
+// faces unused and can make text disappear when no suitable system fallback is
+// installed.
+pub const BUNDLED_UI_FONT: &str = "Inter Variable";
 
 /// Kept for the case where the bundled font fails to register: these are what
 /// the platform is likely to have.
@@ -216,7 +221,7 @@ pub fn ui_font_candidates() -> &'static [&'static str] {
     // preference, not a promise — `pick_font` drops anything not installed.
     if cfg!(target_os = "macos") {
         &[
-            "Inter",
+            "Inter Variable",
             // The real name of the macOS system font. "SF Pro Text" is what it
             // is called in design tools and is *not* installed under that name,
             // so asking for it silently fell through to gpui's default.
@@ -225,9 +230,20 @@ pub fn ui_font_candidates() -> &'static [&'static str] {
             "Helvetica",
         ]
     } else if cfg!(target_os = "windows") {
-        &["Inter", "Segoe UI Variable Text", "Segoe UI", "Arial"]
+        &[
+            "Inter Variable",
+            "Segoe UI Variable Text",
+            "Segoe UI",
+            "Arial",
+        ]
     } else {
-        &["Inter", "Cantarell", "Ubuntu", "DejaVu Sans", "Noto Sans"]
+        &[
+            "Inter Variable",
+            "Cantarell",
+            "Ubuntu",
+            "DejaVu Sans",
+            "Noto Sans",
+        ]
     }
 }
 
@@ -348,10 +364,13 @@ mod tests {
 
     #[test]
     fn the_chosen_font_is_one_the_system_has() {
-        let installed = vec!["Inter".to_string(), "Helvetica".to_string()];
+        let installed = vec!["Inter Variable".to_string(), "Helvetica".to_string()];
 
         // First preference wins when present.
-        assert_eq!(pick_font(&["Inter", "Helvetica"], &installed), "Inter");
+        assert_eq!(
+            pick_font(&["Inter Variable", "Helvetica"], &installed),
+            "Inter Variable"
+        );
         // Missing preferences are skipped rather than requested and ignored —
         // the bug this exists for: the app asked for "SF Pro Text", which is
         // not installed under that name, and silently rendered in something

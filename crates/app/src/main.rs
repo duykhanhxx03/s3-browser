@@ -21,8 +21,6 @@ mod settings;
 mod theme;
 mod update;
 
-use std::time::Duration;
-
 use gpui::{px, size, App, AppContext as _, Application, Bounds, WindowOptions};
 
 use browser::Browser;
