@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::locale::{self, Language};
+
 /// Which palette to paint, when the system's own answer is not wanted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,9 +30,9 @@ impl ThemeChoice {
 
     pub fn label(self) -> &'static str {
         match self {
-            ThemeChoice::System => "Theo hệ thống",
-            ThemeChoice::Light => "Sáng",
-            ThemeChoice::Dark => "Tối",
+            ThemeChoice::System => locale::text("theme.system"),
+            ThemeChoice::Light => locale::text("theme.light"),
+            ThemeChoice::Dark => locale::text("theme.dark"),
         }
     }
 }
@@ -55,9 +57,9 @@ impl MotionChoice {
 
     pub fn label(self) -> &'static str {
         match self {
-            MotionChoice::System => "Theo hệ thống",
-            MotionChoice::Full => "Mượt",
-            MotionChoice::Reduced => "Giảm",
+            MotionChoice::System => locale::text("motion.system"),
+            MotionChoice::Full => locale::text("motion.full"),
+            MotionChoice::Reduced => locale::text("motion.reduced"),
         }
     }
 }
@@ -76,6 +78,7 @@ pub const JOB_CONCURRENCY_CHOICES: [usize; 4] = [1, 2, 4, 8];
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub language: Language,
     pub theme: ThemeChoice,
     pub motion: MotionChoice,
     pub preview_limit_mb: u32,
@@ -95,6 +98,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language: Language::English,
             theme: ThemeChoice::System,
             motion: MotionChoice::System,
             preview_limit_mb: 8,
@@ -206,6 +210,7 @@ mod tests {
         let store = SettingsStore::beside(&dir.join("profiles.json"));
 
         let settings = Settings {
+            language: Language::Vietnamese,
             theme: ThemeChoice::Dark,
             motion: MotionChoice::Reduced,
             preview_limit_mb: 32,
@@ -224,6 +229,7 @@ mod tests {
         std::fs::write(store.path(), r#"{"theme":"dark"}"#).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.theme, ThemeChoice::Dark);
+        assert_eq!(loaded.language, Settings::default().language);
         assert_eq!(loaded.motion, Settings::default().motion);
         assert_eq!(
             loaded.preview_limit_mb,

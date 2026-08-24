@@ -42,11 +42,15 @@ objc2-foundation = "0.3"
 # file can supply. See docs/PACKAGING.md for the steps and for what a user sees
 # when they are missing.
 [package.metadata.packager]
-product-name = "s3browser"
+product-name = "S3 Browser"
 identifier = "dev.s3browser.app"
-description = "Trình duyệt S3 cho máy tính"
+description = "Desktop S3 browser"
 authors = ["s3browser"]
 formats = ["app", "dmg"]
+icons = [
+  "../../assets/brand/s3-browser.icns",
+  "assets/brand/s3-browser.icns",
+]
 
 [package.metadata.packager.macos]
 # 12.0 is where NSVisualEffectView vibrancy behaves the way the glass UI needs.

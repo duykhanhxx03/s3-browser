@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 144" role="img" aria-labelledby="title desc">
+  <title id="title">S3 Browser logo for dark backgrounds</title>
+  <desc id="desc">Wordmark reading S3 Browser, with S3 in blue and Browser in light text.</desc>
+  <style>
+    .wordmark {
+      font-family: "Avenir Next", "Manrope", "SF Pro Display", "Segoe UI", Arial, sans-serif;
+      font-size: 64px;
+      letter-spacing: 0;
+      dominant-baseline: alphabetic;
+    }
+  </style>
+  <text class="wordmark" x="28" y="94" fill="#2F8CFF" font-weight="760">S3</text>
+  <text class="wordmark" x="116" y="94" fill="#F8FAFC" font-weight="540">Browser</text>
+</svg>

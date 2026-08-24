@@ -17,10 +17,11 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 // `on_double_click` lives on gpui-component's extension trait, not on gpui's
 // own `StatefulInteractiveElement`.
-use gpui_component::InteractiveElementExt as _;
 use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tooltip::Tooltip;
+use gpui_component::IndexPath;
+use gpui_component::InteractiveElementExt as _;
 use gpui_tokio::Tokio;
 use s3core::{
     capability::{Capabilities, CapabilityCache, Support},
@@ -31,6 +32,7 @@ use transfer::{Job, JobState, TransferEngine};
 use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
 
 use crate::failure::{Failure, Fix};
+use crate::locale::{self, Language};
 use crate::platform::{self, Chrome};
 use crate::settings::{MotionChoice, Settings, SettingsStore, ThemeChoice};
 use crate::theme::Theme;
@@ -314,22 +316,26 @@ pub enum FormKind {
 impl FormKind {
     fn title(&self) -> String {
         match self {
-            FormKind::NewProfile => "Profile mới",
-            FormKind::EditProfile(_) => "Sửa profile",
-            FormKind::NewFolder => "Thư mục mới",
-            FormKind::NewBucket => "Bucket mới",
-            FormKind::Rename(_) => "Đổi tên",
-            FormKind::Duplicate(_) => "Sao chép",
-            FormKind::OpenBucket => "Mở bucket",
+            FormKind::NewProfile => locale::text("form.new_profile"),
+            FormKind::EditProfile(_) => locale::text("form.edit_profile"),
+            FormKind::NewFolder => locale::text("form.new_folder"),
+            FormKind::NewBucket => locale::text("form.new_bucket"),
+            FormKind::Rename(_) => locale::text("form.rename"),
+            FormKind::Duplicate(_) => locale::text("form.duplicate"),
+            FormKind::OpenBucket => locale::text("form.open_bucket"),
             // The count, because setting a header on four hundred objects and
             // on one look identical once the dialog is open.
             FormKind::EditHeaders(keys) if keys.len() > 1 => {
-                return format!("Sửa header cho {} mục", keys.len())
+                return format!(
+                    "{} ({})",
+                    locale::text("form.edit_headers_many"),
+                    keys.len()
+                );
             }
-            FormKind::EditHeaders(_) => "Sửa header",
-            FormKind::AddTag => "Thẻ mới",
-            FormKind::AssumeRole => "Nhận role",
-            FormKind::SsoStart => "Đăng nhập SSO",
+            FormKind::EditHeaders(_) => locale::text("form.edit_headers"),
+            FormKind::AddTag => locale::text("form.add_tag"),
+            FormKind::AssumeRole => locale::text("form.assume_role"),
+            FormKind::SsoStart => locale::text("form.sso_start"),
         }
         .to_string()
     }
@@ -339,40 +345,71 @@ impl FormKind {
     fn fields(&self) -> Vec<(&'static str, &'static str, bool)> {
         match self {
             FormKind::NewProfile | FormKind::EditProfile(_) => vec![
-                ("Tên", "R2 của tôi", false),
-                ("Endpoint", "để trống nếu là AWS", false),
-                ("Region", "us-east-1", false),
-                ("Bucket thử", "nếu token không list bucket", false),
-                ("Access key", "", false),
+                (locale::text("form.connection_name"), "Production R2", false),
                 (
-                    "Secret key",
+                    locale::text("form.endpoint"),
+                    locale::text("form.endpoint.placeholder"),
+                    false,
+                ),
+                (locale::text("form.region"), "us-east-1", false),
+                (
+                    locale::text("form.probe_bucket"),
+                    locale::text("form.probe_bucket.placeholder"),
+                    false,
+                ),
+                (locale::text("form.access_key"), "", false),
+                (
+                    locale::text("form.secret_key"),
                     if matches!(self, FormKind::EditProfile(_)) {
-                        "giữ nguyên nếu để trống"
+                        locale::text("form.secret_key.placeholder")
                     } else {
                         ""
                     },
                     true,
                 ),
             ],
-            FormKind::NewFolder => vec![("Tên", "", false)],
-            FormKind::NewBucket => vec![("Tên", "", false)],
-            FormKind::Rename(_) => vec![("Tên mới", "", false)],
-            FormKind::Duplicate(_) => vec![("Tên bản sao", "", false)],
-            FormKind::OpenBucket => vec![("Bucket", "bucket hoặc s3://bucket/prefix/", false)],
+            FormKind::NewFolder => vec![(locale::text("form.name"), "", false)],
+            FormKind::NewBucket => vec![(locale::text("form.name"), "", false)],
+            FormKind::Rename(_) => vec![(locale::text("form.rename_name"), "", false)],
+            FormKind::Duplicate(_) => vec![(locale::text("form.duplicate_name"), "", false)],
+            FormKind::OpenBucket => vec![(
+                locale::text("form.bucket"),
+                locale::text("form.bucket.placeholder"),
+                false,
+            )],
             FormKind::EditHeaders(_) => vec![
-                ("Content-Type", "image/png", false),
-                ("Cache-Control", "public, max-age=3600", false),
-                ("Content-Disposition", "inline", false),
+                (locale::text("form.content_type"), "image/png", false),
+                (
+                    locale::text("form.cache_control"),
+                    "public, max-age=3600",
+                    false,
+                ),
+                (locale::text("form.content_disposition"), "inline", false),
             ],
-            FormKind::AddTag => vec![("Khoá", "", false), ("Giá trị", "", false)],
+            FormKind::AddTag => vec![
+                (locale::text("form.key"), "", false),
+                (locale::text("form.value"), "", false),
+            ],
             FormKind::AssumeRole => vec![
-                ("Role ARN", "arn:aws:iam::…:role/…", false),
-                ("MFA serial", "không bắt buộc", false),
-                ("Mã MFA", "không bắt buộc", false),
+                (
+                    locale::text("form.role_arn"),
+                    "arn:aws:iam::…:role/…",
+                    false,
+                ),
+                (
+                    locale::text("form.mfa_serial"),
+                    locale::text("form.mfa_optional"),
+                    false,
+                ),
+                (
+                    locale::text("form.mfa_code"),
+                    locale::text("form.mfa_optional"),
+                    false,
+                ),
             ],
             FormKind::SsoStart => vec![
-                ("Portal URL", "https://…/start", false),
-                ("Region", "us-east-1", false),
+                (locale::text("form.portal_url"), "https://…/start", false),
+                (locale::text("form.region"), "us-east-1", false),
             ],
         }
     }
@@ -679,7 +716,7 @@ impl Tab {
     /// what tells two tabs apart when they are in the same bucket.
     fn title(bucket: Option<&SharedString>, prefix: &str) -> SharedString {
         match bucket {
-            None => "Trống".into(),
+            None => locale::text("common.empty").into(),
             Some(bucket) => match prefix.trim_end_matches('/').rsplit('/').next() {
                 Some(segment) if !segment.is_empty() => segment.to_string().into(),
                 _ => bucket.clone(),
@@ -894,6 +931,7 @@ pub struct Browser {
     place_store: Option<PlaceStore>,
     settings: Settings,
     settings_store: Option<SettingsStore>,
+    language_select: Option<Entity<SelectState<Vec<&'static str>>>>,
     /// Whether the settings panel is open.
     settings_open: bool,
     /// Whether the About dialog is open.
@@ -922,6 +960,10 @@ pub struct Browser {
     buckets_cached: bool,
     /// Set for one connect, by the refresh control.
     bucket_cache_bypass: bool,
+    /// A bucket typed while saving a profile, opened as soon as that profile
+    /// connects. This is the bucket-scoped-token path: `ListBuckets` may be
+    /// denied, but the named bucket can still be the right door.
+    pending_open: Option<(String, SharedString, String)>,
     /// Narrows the sidebar. Only exists once there are enough buckets for the
     /// list to be worth narrowing — see `BUCKET_FILTER_MIN`.
     bucket_filter: String,
@@ -1103,6 +1145,7 @@ pub struct Browser {
     /// reacting to what is typed into it.
     _filter_events: Option<Subscription>,
     _bucket_filter_events: Option<Subscription>,
+    _language_events: Option<Subscription>,
     _path_events: Option<Subscription>,
 }
 
@@ -1183,7 +1226,8 @@ impl Browser {
             },
         );
 
-        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Lọc theo tên"));
+        let filter_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(locale::text("search.filter_name")));
         // Live rather than on Enter: the list is right there, and making someone
         // commit a filter to find out whether it matched anything is a round
         // trip through their own attention for no reason.
@@ -1211,7 +1255,7 @@ impl Browser {
         );
 
         let bucket_filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Tìm bucket"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(locale::text("search.bucket")));
         // No Enter handling here on purpose: every bucket name is already in
         // memory, so there is nothing to go and fetch and nothing to charge for.
         let bucket_filter_events = cx.subscribe(
@@ -1234,7 +1278,31 @@ impl Browser {
             .as_ref()
             .map(|store| store.load())
             .unwrap_or_default();
+        locale::set_language(settings.language);
         set_reduce_motion(motion_choice_reduces(settings.motion));
+        let language_select = cx.new(|cx| {
+            SelectState::new(
+                language_select_items(),
+                Some(IndexPath::new(language_index(settings.language))),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let language_events = cx.subscribe_in(
+            &language_select,
+            window,
+            |this: &mut Self, _state, event: &SelectEvent<Vec<&'static str>>, window, cx| {
+                let SelectEvent::Confirm(Some(label)) = event else {
+                    return;
+                };
+                let Some(language) = language_from_label(label) else {
+                    return;
+                };
+                this.update_settings(|settings| settings.language = language, cx);
+                this.sync_language_select(window, cx);
+            },
+        );
         let places = place_store
             .as_ref()
             .map(|store| store.load())
@@ -1276,6 +1344,7 @@ impl Browser {
             place_store,
             settings: settings.clone(),
             settings_store,
+            language_select: Some(language_select),
             settings_open: false,
             about_open: false,
             client: None,
@@ -1284,6 +1353,7 @@ impl Browser {
             bucket_created: HashMap::new(),
             buckets_cached: false,
             bucket_cache_bypass: false,
+            pending_open: None,
             bucket_filter: String::new(),
             bucket_filter_input: Some(bucket_filter_input),
             bucket: None,
@@ -1306,7 +1376,7 @@ impl Browser {
             anchor: None,
             layout: LayoutMode::List,
             scroll: UniformListScrollHandle::new(),
-            status: "Chọn một profile để bắt đầu".into(),
+            status: "Select a profile to get started".into(),
             failures: Vec::new(),
             failures_open: false,
             perf: PerfStats::default(),
@@ -1362,6 +1432,7 @@ impl Browser {
             _appearance: Some(appearance),
             _filter_events: Some(filter_events),
             _bucket_filter_events: Some(bucket_filter_events),
+            _language_events: Some(language_events),
             _path_events: Some(path_events),
         };
 
@@ -1388,7 +1459,7 @@ impl Browser {
                 .unwrap_or(Ok(())),
         ) {
             self.fail(Failure::known(
-                "Không lưu được danh sách profile",
+                locale::text("error.save_profiles"),
                 format!("{}: {error}", store.path().display()),
                 None,
             ));
@@ -1398,7 +1469,7 @@ impl Browser {
     fn add_profile(&mut self, profile: StoredProfile, secret: &str, cx: &mut Context<Self>) {
         if let Err(error) = vault::set_secret_key(&profile.id, secret) {
             self.fail(Failure::known(
-                "Không lưu được khoá bí mật vào chuỗi khoá",
+                locale::text("error.save_secret"),
                 format!("{error}"),
                 None,
             ));
@@ -1417,13 +1488,13 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         if index >= self.profiles.len() {
-            self.report("Profile không còn tồn tại".into());
+            self.report(locale::text("error.profile_missing").into());
             return;
         }
         if let Some(secret) = secret.as_deref() {
             if let Err(error) = vault::set_secret_key(&profile.id, secret) {
                 self.fail(Failure::known(
-                    "Không lưu được khoá bí mật vào chuỗi khoá",
+                    locale::text("error.save_secret"),
                     format!("{error}"),
                     None,
                 ));
@@ -1440,7 +1511,7 @@ impl Browser {
         if active {
             self.connect(index, cx);
         } else {
-            self.status = "Đã lưu profile".into();
+            self.status = "Profile saved".into();
             cx.notify();
         }
     }
@@ -1459,6 +1530,16 @@ impl Browser {
         self.add_profile(profile, "minioadmin", cx);
     }
 
+    fn clear_pending_open(&mut self, profile_id: &str) {
+        if self
+            .pending_open
+            .as_ref()
+            .is_some_and(|(pending_profile, _, _)| pending_profile == profile_id)
+        {
+            self.pending_open = None;
+        }
+    }
+
     fn connect(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(stored) = self.profiles.get(index).cloned() else {
             return;
@@ -1468,7 +1549,7 @@ impl Browser {
             Ok(secret) => secret,
             Err(error) => {
                 self.fail(Failure::known(
-                    "Không đọc được khoá bí mật từ chuỗi khoá",
+                    locale::text("error.read_secret"),
                     format!("{error}"),
                     Some(Fix::EditProfile),
                 ));
@@ -1496,7 +1577,7 @@ impl Browser {
         self.entries.clear();
         self.visible.clear();
         self.connecting = true;
-        self.status = format!("Đang kết nối {}…", stored.name).into();
+        self.status = format!("Connecting to {}…", stored.name).into();
 
         let profile = Profile {
             name: stored.name.clone(),
@@ -1596,13 +1677,31 @@ impl Browser {
                                 .collect();
                         } else {
                             debug_log!("connected: bucket list unavailable");
-                            this.status = "Nhập bucket bạn có quyền để mở trực tiếp".into();
+                            this.status =
+                                "Enter a bucket you can access to open it directly".into();
                         }
                         this.client = Some(client);
+                        let pending = match this.pending_open.as_ref() {
+                            Some((pending_profile, bucket, prefix))
+                                if pending_profile == &profile_id =>
+                            {
+                                Some((bucket.clone(), prefix.clone()))
+                            }
+                            _ => None,
+                        };
+                        if pending.is_some() {
+                            this.pending_open = None;
+                        }
                         // `--open bucket/prefix/` jumps straight to a location,
                         // which keeps deep prefixes reachable from a script.
-                        match requested_location() {
-                            Some((bucket, prefix)) => this.open(bucket.into(), prefix, cx),
+                        // A bucket saved with the profile wins: it is the path
+                        // the user just supplied to get around denied
+                        // `ListBuckets`.
+                        match pending.or_else(|| {
+                            requested_location()
+                                .map(|(bucket, prefix)| (SharedString::from(bucket), prefix))
+                        }) {
+                            Some((bucket, prefix)) => this.open(bucket, prefix, cx),
                             None => {
                                 if let Some(first) = this.buckets.first().cloned() {
                                     this.open(first, String::new(), cx);
@@ -2639,6 +2738,7 @@ impl Browser {
         change(&mut self.settings);
 
         self.theme = theme_for(self.settings.theme, self.appearance, self.chrome);
+        locale::set_language(self.settings.language);
         set_reduce_motion(motion_choice_reduces(self.settings.motion));
         self.transfers
             .set_bandwidth_limit(self.settings.bandwidth_limit);
@@ -2708,6 +2808,16 @@ impl Browser {
                 None,
             ));
         }
+    }
+
+    fn sync_language_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(select) = self.language_select.clone() else {
+            return;
+        };
+        let index = IndexPath::new(language_index(self.settings.language));
+        select.update(cx, |select, cx| {
+            select.set_selected_index(Some(index), window, cx);
+        });
     }
 
     fn record_visit(&mut self) {
@@ -3036,17 +3146,38 @@ impl Browser {
         };
         let creating = Tokio::spawn(cx, async move {
             client.create_bucket(&name).await?;
-            let buckets = client.list_buckets().await?;
-            anyhow::Ok(buckets)
+            let buckets = client.list_buckets().await;
+            anyhow::Ok((name, buckets))
         });
 
         let task = cx.spawn(async move |this, cx| {
             let outcome = creating.await;
             _ = this.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok(buckets)) => {
-                        this.buckets = buckets.into_iter().map(SharedString::from).collect();
-                        this.status = format!("{} bucket", this.buckets.len()).into();
+                    Ok(Ok((name, listed))) => {
+                        let bucket = SharedString::from(name.clone());
+                        match listed {
+                            Ok(buckets) => {
+                                this.buckets = buckets.into_iter().map(SharedString::from).collect();
+                                this.status = format!("{} bucket", this.buckets.len()).into();
+                            }
+                            Err(error) => {
+                                let failure = Failure::new(format!("ListBuckets: {error:?}"))
+                                    .or_fix(Fix::OpenBucketByName);
+                                if failure.fix == Some(Fix::OpenBucketByName) {
+                                    this.status = format!(
+                                        "Đã tạo {name}; token không có quyền làm mới danh sách bucket"
+                                    )
+                                    .into();
+                                } else {
+                                    this.fail(failure);
+                                }
+                            }
+                        }
+                        if !this.buckets.contains(&bucket) {
+                            this.buckets.push(bucket.clone());
+                        }
+                        this.open(bucket, String::new(), cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
                     Err(error) => this.report(format!("Task lỗi: {error}")),
@@ -3401,7 +3532,7 @@ impl Browser {
             // profile at `us-east-1` for someone whose buckets are all in
             // Frankfurt is a redirect error waiting to happen.
             if let Some(region) = vault::system_default_region() {
-                form.set_owned("Region", region, window, cx);
+                form.set_owned(locale::text("form.region"), region, window, cx);
             }
 
             // Built here rather than in `Form::new` because the subscription
@@ -3429,10 +3560,25 @@ impl Browser {
         }
 
         if let Some(profile) = editing_profile {
-            form.set_owned("Tên", profile.name, window, cx);
-            form.set_owned("Endpoint", profile.endpoint.unwrap_or_default(), window, cx);
-            form.set_owned("Region", profile.region, window, cx);
-            form.set_owned("Access key", profile.access_key, window, cx);
+            form.set_owned(
+                locale::text("form.connection_name"),
+                profile.name,
+                window,
+                cx,
+            );
+            form.set_owned(
+                locale::text("form.endpoint"),
+                profile.endpoint.unwrap_or_default(),
+                window,
+                cx,
+            );
+            form.set_owned(locale::text("form.region"), profile.region, window, cx);
+            form.set_owned(
+                locale::text("form.access_key"),
+                profile.access_key,
+                window,
+                cx,
+            );
         }
 
         // Focus the first field. Nothing did this before, so every dialog
@@ -3466,7 +3612,7 @@ impl Browser {
         );
         if first.is_empty() && !optional {
             if let Some(form) = self.form.as_mut() {
-                form.error = Some("Chưa nhập gì".into());
+                form.error = Some(locale::text("validation.empty").into());
             }
             cx.notify();
             return;
@@ -3493,7 +3639,8 @@ impl Browser {
             FormKind::OpenBucket => {
                 let Some(path) = parse_s3_path(&first) else {
                     if let Some(form) = self.form.as_mut() {
-                        form.error = Some("Nhập bucket hoặc s3://bucket/prefix/".into());
+                        form.error =
+                            Some(locale::text("validation.bucket_or_path_required").into());
                     }
                     cx.notify();
                     return;
@@ -3507,7 +3654,8 @@ impl Browser {
                         if let Some(form) = self.form.as_mut() {
                             form.error = Some(
                                 format!(
-                                    "Path này ghi region {region}; profile đang dùng region khác"
+                                    "{}: {region}",
+                                    locale::text("validation.path_region_mismatch")
                                 )
                                 .into(),
                             );
@@ -3522,20 +3670,29 @@ impl Browser {
             FormKind::EditHeaders(keys) => {
                 let headers = s3core::ObjectHeaders {
                     content_type: some_if_filled(first),
-                    cache_control: some_if_filled(form.value("Cache-Control", cx)),
-                    content_disposition: some_if_filled(form.value("Content-Disposition", cx)),
+                    cache_control: some_if_filled(
+                        form.value(locale::text("form.cache_control"), cx),
+                    ),
+                    content_disposition: some_if_filled(
+                        form.value(locale::text("form.content_disposition"), cx),
+                    ),
                 };
                 self.form = None;
-                self.start_bulk("Sửa header", keys, BulkOp::Headers(headers), cx);
+                self.start_bulk(
+                    locale::text("form.edit_headers"),
+                    keys,
+                    BulkOp::Headers(headers),
+                    cx,
+                );
             }
             FormKind::AddTag => {
-                let value = form.value("Giá trị", cx);
+                let value = form.value(locale::text("form.value"), cx);
                 self.form = None;
                 self.add_tag(format!("{first}={value}"), cx);
             }
             FormKind::AssumeRole => {
-                let serial = form.value("MFA serial", cx);
-                let code = form.value("Mã MFA", cx);
+                let serial = form.value(locale::text("form.mfa_serial"), cx);
+                let code = form.value(locale::text("form.mfa_code"), cx);
                 self.form = None;
                 let text = if serial.is_empty() || code.is_empty() {
                     first
@@ -3545,7 +3702,7 @@ impl Browser {
                 self.assume_role(text, cx);
             }
             FormKind::SsoStart => {
-                let region = form.value("Region", cx);
+                let region = form.value(locale::text("form.region"), cx);
                 self.form = None;
                 self.start_sso(format!("{first} {region}").trim().to_string(), cx);
             }
@@ -3558,11 +3715,12 @@ impl Browser {
             return;
         };
         let kind = form.kind.clone();
-        let name = form.value("Tên", cx);
-        let endpoint = form.value("Endpoint", cx);
-        let region = form.value("Region", cx);
-        let access_key = form.value("Access key", cx);
-        let secret_key = form.value("Secret key", cx);
+        let name = form.value(locale::text("form.connection_name"), cx);
+        let endpoint = form.value(locale::text("form.endpoint"), cx);
+        let region = form.value(locale::text("form.region"), cx);
+        let probe_bucket = form.value(locale::text("form.probe_bucket"), cx);
+        let access_key = form.value(locale::text("form.access_key"), cx);
+        let secret_key = form.value(locale::text("form.secret_key"), cx);
         let editing = match kind {
             FormKind::EditProfile(index) => Some(index),
             _ => None,
@@ -3592,7 +3750,8 @@ impl Browser {
                     if let Err(error) = vault::secret_key(&profile.id) {
                         if let Some(form) = self.form.as_mut() {
                             form.error = Some(
-                                format!("Không có secret cũ, nhập secret key mới ({error})").into(),
+                                format!("{} ({error})", locale::text("validation.no_old_secret"))
+                                    .into(),
                             );
                         }
                         cx.notify();
@@ -3631,6 +3790,31 @@ impl Browser {
         // checksums. Getting these wrong looks like a credentials problem.
         .with_provider_defaults();
 
+        let bucket_hint = match profile_bucket_hint(&probe_bucket, bucket_hint, &stored.region) {
+            Ok(bucket_hint) => bucket_hint,
+            Err(message) => {
+                if let Some(form) = self.form.as_mut() {
+                    form.error = Some(message.into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+
+        let will_connect = editing
+            .map(|index| self.active_profile == Some(index))
+            .unwrap_or(true);
+        if will_connect {
+            self.clear_pending_open(&stored.id);
+            if let Some(path) = bucket_hint {
+                self.pending_open = Some((
+                    stored.id.clone(),
+                    SharedString::from(path.bucket),
+                    path.prefix,
+                ));
+            }
+        }
+
         self.form = None;
         if let Some(index) = editing {
             self.update_profile(
@@ -3641,16 +3825,6 @@ impl Browser {
             );
         } else {
             self.add_profile(stored, &secret_key, cx);
-        }
-        if editing.is_none() {
-            if let Some(bucket) = bucket_hint {
-                // The connection is still in flight; remembering it here means
-                // the sidebar has something even when ListBuckets is denied.
-                let bucket = SharedString::from(bucket);
-                if !self.buckets.contains(&bucket) {
-                    self.buckets.push(bucket);
-                }
-            }
         }
     }
 
@@ -3666,8 +3840,18 @@ impl Browser {
         form.probe = None;
 
         let form = self.form.as_ref().expect("just checked");
-        form.set("Endpoint", provider.endpoint_template(), window, cx);
-        form.set("Region", provider.region_template(), window, cx);
+        form.set(
+            locale::text("form.endpoint"),
+            provider.endpoint_template(),
+            window,
+            cx,
+        );
+        form.set(
+            locale::text("form.region"),
+            provider.region_template(),
+            window,
+            cx,
+        );
         cx.notify();
     }
 
@@ -3681,16 +3865,16 @@ impl Browser {
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        let endpoint_text = form.value("Endpoint", cx);
+        let endpoint_text = form.value(locale::text("form.endpoint"), cx);
         let (endpoint, endpoint_bucket) = if endpoint_text.is_empty() {
             (String::new(), None)
         } else {
             split_endpoint(&endpoint_text)
         };
-        let region = form.value("Region", cx);
-        let probe_bucket = form.value("Bucket thử", cx);
-        let access_key = form.value("Access key", cx);
-        let mut secret_key = form.value("Secret key", cx);
+        let region = form.value(locale::text("form.region"), cx);
+        let probe_bucket = form.value(locale::text("form.probe_bucket"), cx);
+        let access_key = form.value(locale::text("form.access_key"), cx);
+        let mut secret_key = form.value(locale::text("form.secret_key"), cx);
         if secret_key.is_empty() {
             if let FormKind::EditProfile(index) = &form.kind {
                 if let Some(profile) = self.profiles.get(*index) {
@@ -3698,8 +3882,13 @@ impl Browser {
                         Ok(secret) => secret_key = secret,
                         Err(error) => {
                             if let Some(form) = self.form.as_mut() {
-                                form.error =
-                                    Some(format!("Không đọc được secret cũ: {error}").into());
+                                form.error = Some(
+                                    format!(
+                                        "{}: {error}",
+                                        locale::text("validation.read_old_secret")
+                                    )
+                                    .into(),
+                                );
                             }
                             cx.notify();
                             return;
@@ -3711,51 +3900,10 @@ impl Browser {
 
         if access_key.is_empty() || secret_key.is_empty() {
             if let Some(form) = self.form.as_mut() {
-                form.error = Some("Cần access key và secret key để thử".into());
+                form.error = Some(locale::text("validation.test_credentials_required").into());
             }
             cx.notify();
             return;
-        }
-
-        let probe_target = if probe_bucket.is_empty() {
-            endpoint_bucket.map(|bucket| S3Path {
-                bucket,
-                prefix: String::new(),
-                region: None,
-            })
-        } else {
-            match parse_s3_path(&probe_bucket) {
-                Some(path) => Some(path),
-                None => {
-                    if let Some(form) = self.form.as_mut() {
-                        form.error =
-                            Some("Bucket thử phải là bucket hoặc s3://bucket/prefix/".into());
-                    }
-                    cx.notify();
-                    return;
-                }
-            }
-        };
-        if let Some(target) = probe_target.as_ref() {
-            if let Some(target_region) = target.region.as_ref() {
-                let profile_region = if region.is_empty() {
-                    "us-east-1"
-                } else {
-                    region.as_str()
-                };
-                if target_region != profile_region {
-                    if let Some(form) = self.form.as_mut() {
-                        form.error = Some(
-                            format!(
-                                "Bucket thử ghi region {target_region}; form đang dùng region {profile_region}"
-                            )
-                            .into(),
-                        );
-                    }
-                    cx.notify();
-                    return;
-                }
-            }
         }
 
         // Through the same quirk logic a saved profile goes through, or the
@@ -3774,6 +3922,18 @@ impl Browser {
             access_key: access_key.clone(),
         }
         .with_provider_defaults();
+
+        let probe_target = match profile_bucket_hint(&probe_bucket, endpoint_bucket, &stored.region)
+        {
+            Ok(target) => target,
+            Err(message) => {
+                if let Some(form) = self.form.as_mut() {
+                    form.error = Some(message.into());
+                }
+                cx.notify();
+                return;
+            }
+        };
 
         let profile = Profile {
             name: stored.name.clone(),
@@ -3819,7 +3979,7 @@ impl Browser {
                 };
                 form.probe = Some(match outcome {
                     Ok(Ok(ProfileProbe::Buckets(count))) => {
-                        Probe::Ok(format!("Kết nối được, thấy {count} bucket").into())
+                        Probe::Ok(format!("{}: {count}", locale::text("probe.bucket_count")).into())
                     }
                     Ok(Ok(ProfileProbe::Bucket {
                         bucket,
@@ -3835,10 +3995,7 @@ impl Browser {
                         if failure.fix == Some(Fix::EditProfile) {
                             Probe::Failed(failure.summary)
                         } else {
-                            Probe::Warning(
-                                "Kết nối được, nhưng token không liệt kê bucket. Nhập Bucket thử để kiểm tra bucket cụ thể."
-                                    .into(),
-                            )
+                            Probe::Warning(locale::text("probe.list_buckets_denied").into())
                         }
                     }
                     Ok(Err(error)) => {
@@ -3847,12 +4004,18 @@ impl Browser {
                             Probe::Failed(failure.summary)
                         } else {
                             Probe::Warning(
-                                format!("Kết nối được, nhưng bucket thử không đọc được: {}", failure.summary)
-                                    .into(),
+                                format!(
+                                    "{}: {}",
+                                    locale::text("probe.bucket_read_failed"),
+                                    failure.summary
+                                )
+                                .into(),
                             )
                         }
                     }
-                    Err(error) => Probe::Failed(format!("Task lỗi: {error}").into()),
+                    Err(error) => Probe::Failed(
+                        format!("{}: {error}", locale::text("error.task_failed")).into(),
+                    ),
                 });
                 cx.notify();
             });
@@ -3898,9 +4061,12 @@ impl Browser {
             return;
         };
         for (label, value) in [
-            ("Content-Type", head.content_type),
-            ("Cache-Control", head.cache_control),
-            ("Content-Disposition", head.content_disposition),
+            (locale::text("form.content_type"), head.content_type),
+            (locale::text("form.cache_control"), head.cache_control),
+            (
+                locale::text("form.content_disposition"),
+                head.content_disposition,
+            ),
         ] {
             if let Some(value) = value {
                 form.set_owned(label, value, window, cx);
@@ -4904,16 +5070,13 @@ impl Browser {
                         // that has been pulled is worse than no button.
                         this.update = None;
                         if announce {
-                            this.status = SharedString::from(format!(
-                                "Đang chạy bản mới nhất ({current})"
-                            ));
+                            this.status =
+                                SharedString::from(format!("Đang chạy bản mới nhất ({current})"));
                         }
                     }
                     Err(error) => {
                         if announce {
-                            this.report(format!(
-                                "Không kiểm tra được bản cập nhật: {error:?}"
-                            ));
+                            this.report(format!("Không kiểm tra được bản cập nhật: {error:?}"));
                         }
                     }
                 }
@@ -6248,9 +6411,9 @@ impl Browser {
             .active_profile
             .and_then(|ix| self.profiles.get(ix))
             .map(|profile| profile.name.clone())
-            .unwrap_or_else(|| "Chưa chọn profile".to_string());
-        let controls = platform::window_controls_in_app()
-            .then(|| self.render_window_controls(maximized, cx));
+            .unwrap_or_else(|| locale::text("profile.none").to_string());
+        let controls =
+            platform::window_controls_in_app().then(|| self.render_window_controls(maximized, cx));
 
         div()
             .id("title-bar")
@@ -6263,6 +6426,18 @@ impl Browser {
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(104.))
+                    .h(px(34.))
+                    .flex()
+                    .items_center()
+                    .child(brand_logo(
+                        theme_mode(self.settings.theme, self.appearance),
+                        104.,
+                    )),
+            )
             .when_some(self.path_input.clone(), |this, input| {
                 this.child(
                     div()
@@ -6574,7 +6749,7 @@ impl Browser {
                 sidebar_item(
                     "nav-buckets".into(),
                     "bucket",
-                    "Tất cả bucket".into(),
+                    locale::text("nav.all_buckets").into(),
                     self.screen == Screen::Buckets,
                     blocked,
                     theme,
@@ -6591,7 +6766,7 @@ impl Browser {
                 sidebar_item(
                     "nav-recent".into(),
                     "clock",
-                    "Gần đây".into(),
+                    locale::text("nav.recent").into(),
                     self.screen == Screen::Recent,
                     blocked,
                     theme,
@@ -6724,7 +6899,7 @@ impl Browser {
                 sidebar_item_with_badge(
                     "queue-toggle".into(),
                     "transfer",
-                    "Hàng đợi".into(),
+                    locale::text("nav.queue").into(),
                     queue_badge(&self.transfers.stats()),
                     self.drawer_open,
                     None,
@@ -6741,7 +6916,7 @@ impl Browser {
                 sidebar_item(
                     "settings-open".into(),
                     "more",
-                    "Cài đặt".into(),
+                    locale::text("nav.settings").into(),
                     false,
                     None,
                     theme,
@@ -6761,7 +6936,7 @@ impl Browser {
                 sidebar_item(
                     "about-open".into(),
                     "info",
-                    "Giới thiệu".into(),
+                    locale::text("nav.about").into(),
                     false,
                     None,
                     theme,
@@ -6807,7 +6982,7 @@ impl Browser {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(section_label("ĐÃ GHIM", theme))
+                .child(section_label(locale::text("nav.pinned"), theme))
                 .children(
                     favorites
                         .iter()
@@ -8008,12 +8183,33 @@ impl Browser {
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
-                        .child(div().text_color(theme.text).child("Cài đặt"))
-                        .child(settings_group("GIAO DIỆN", theme))
+                        .child(
+                            div()
+                                .text_color(theme.text)
+                                .child(locale::text("settings.title")),
+                        )
+                        .child(settings_group(locale::text("settings.appearance"), theme))
                         .child(setting_row(
-                            "Chủ đề",
-                            // No note: the chip says "Theo hệ thống", which is
-                            // the only part that needed explaining.
+                            locale::text("settings.language"),
+                            Some(locale::text("settings.language.note")),
+                            div().w(px(240.)).when_some(
+                                self.language_select.clone(),
+                                |this, select| {
+                                    this.child(
+                                        Select::new(&select)
+                                            .placeholder(locale::text("settings.language.choose"))
+                                            .search_placeholder(locale::text(
+                                                "settings.language.search",
+                                            ))
+                                            .menu_width(px(280.)),
+                                    )
+                                },
+                            ),
+                            theme,
+                        ))
+                        .child(setting_row(
+                            locale::text("settings.theme"),
+                            // No note: the chip itself names the system option.
                             None,
                             div()
                                 .flex()
@@ -8034,8 +8230,8 @@ impl Browser {
                             theme,
                         ))
                         .child(setting_row(
-                            "Chuyển động",
-                            Some("Ảnh hưởng tới mở panel và danh sách"),
+                            locale::text("settings.motion"),
+                            Some(locale::text("settings.motion.note")),
                             div()
                                 .flex()
                                 .gap_1()
@@ -8055,15 +8251,19 @@ impl Browser {
                             theme,
                         ))
                         .child(setting_row(
-                            "Kiểm tra bản mới",
-                            Some("Hỏi GitHub lúc mở app"),
+                            locale::text("settings.check_updates"),
+                            Some(locale::text("settings.check_updates.note")),
                             div()
                                 .flex()
                                 .gap_1()
                                 .children([true, false].into_iter().map(|on| {
                                     choice_chip(
                                         SharedString::from(format!("check-updates-{on}")),
-                                        if on { "Bật".into() } else { "Tắt".into() },
+                                        if on {
+                                            locale::text("common.on").into()
+                                        } else {
+                                            locale::text("common.off").into()
+                                        },
                                         settings.check_updates == on,
                                         theme,
                                     )
@@ -8075,10 +8275,10 @@ impl Browser {
                                 })),
                             theme,
                         ))
-                        .child(settings_group("TRUYỀN TẢI", theme))
+                        .child(settings_group(locale::text("settings.transfers"), theme))
                         .child(setting_row(
-                            "Băng thông",
-                            Some("Trần cho cả hàng đợi"),
+                            locale::text("settings.bandwidth"),
+                            Some(locale::text("settings.bandwidth.note")),
                             div()
                                 .flex()
                                 .gap_1()
@@ -8098,12 +8298,12 @@ impl Browser {
                             theme,
                         ))
                         .child(setting_row(
-                            "Số luồng",
+                            locale::text("settings.threads"),
                             // Said out loud rather than letting someone change
                             // it and wonder why nothing moved faster: the limit
                             // is a semaphore's permit count, and shrinking one
                             // means taking permits back from work in flight.
-                            Some("Áp dụng từ lần mở app sau"),
+                            Some(locale::text("settings.threads.note")),
                             div().flex().gap_1().children(
                                 crate::settings::JOB_CONCURRENCY_CHOICES
                                     .into_iter()
@@ -8123,15 +8323,15 @@ impl Browser {
                             ),
                             theme,
                         ))
-                        .child(settings_group("XEM TRƯỚC", theme))
+                        .child(settings_group(locale::text("settings.preview"), theme))
                         .child(setting_row(
-                            "Giới hạn",
+                            locale::text("settings.preview_limit"),
                             // Naming what it does not cover, because the number
                             // reads like a cap on everything: audio, video and
                             // PDF never load here at all — they are handed to
                             // the machine — and an image over the limit is
                             // refused rather than truncated.
-                            Some("Chỉ cho văn bản và ảnh"),
+                            Some(locale::text("settings.preview_limit.note")),
                             div().flex().gap_1().children(
                                 crate::settings::PREVIEW_LIMITS_MB.into_iter().map(|mb| {
                                     choice_chip(
@@ -8149,7 +8349,7 @@ impl Browser {
                             ),
                             theme,
                         ))
-                        .child(settings_group("DỮ LIỆU", theme))
+                        .child(settings_group(locale::text("settings.data"), theme))
                         // Brows3 has this and it earns its place: the bucket
                         // list is cached for half an hour, so a bucket made in
                         // the console does not appear here until it expires,
@@ -8157,22 +8357,28 @@ impl Browser {
                         // beside the sidebar heading — which is not where
                         // anyone looks for it.
                         .child(setting_row(
-                            "Bộ nhớ tạm",
-                            Some("Danh sách bucket, nhớ 30 phút"),
-                            action_button("settings-forget-cache", "Xoá và tải lại", theme)
-                                .on_click(cx.listener(|this, _event, _window, cx| {
+                            locale::text("settings.cache"),
+                            Some(locale::text("settings.cache.note")),
+                            action_button(
+                                "settings-forget-cache",
+                                locale::text("settings.forget_cache"),
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
                                     this.forget_bucket_cache();
                                     this.refresh_buckets(cx);
-                                    this.status = "Đã xoá bộ nhớ tạm".into();
+                                    this.status = locale::text("settings.cache_cleared").into();
                                     cx.notify();
-                                })),
+                                },
+                            )),
                             theme,
                         ))
                         .when_some(config_dir, |this, dir| {
                             let shown = dir.display().to_string();
                             this.child(setting_row(
-                                "Thư mục cấu hình",
-                                Some("Profile, nơi ghim, cài đặt, hàng đợi"),
+                                locale::text("settings.config_dir"),
+                                Some(locale::text("settings.config_dir.note")),
                                 action_button_dyn(
                                     "open-config".into(),
                                     SharedString::from(elide_middle(&shown, 44)),
@@ -8186,14 +8392,15 @@ impl Browser {
                                 theme,
                             ))
                         })
-                        .child(div().flex().justify_end().child(
-                            action_button("settings-close", "Xong", theme).on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.settings_open = false;
-                                    cx.notify();
-                                },
-                            )),
-                        )),
+                        .child(
+                            div().flex().justify_end().child(
+                                action_button("settings-close", locale::text("common.done"), theme)
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.settings_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                        ),
                 )
                 .transition_opacity_and_offset(
                     "settings-scrim-in",
@@ -8228,6 +8435,7 @@ impl Browser {
             return None;
         }
         let theme = self.theme;
+        let mode = theme_mode(self.settings.theme, self.appearance);
         let crash_dir = crate::crash::report_dir();
 
         // Both paths get the same row: the button's label *is* the path, so it
@@ -8250,7 +8458,8 @@ impl Browser {
                         // whose name is on the button.
                         if target != dir {
                             this.status = SharedString::from(format!(
-                                "Chưa có {}, đã mở thư mục cha",
+                                "{}: {}",
+                                locale::text("about.opened_parent"),
                                 dir.display()
                             ));
                         }
@@ -8297,9 +8506,23 @@ impl Browser {
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
-                        .child(div().text_color(theme.text).child("Giới thiệu"))
+                        .child(
+                            div().flex().items_center().gap_2().child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(brand_logo(mode, 156.))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.text_faint)
+                                            .child(locale::text("about.title")),
+                                    ),
+                            ),
+                        )
                         .child(setting_row(
-                            "Phiên bản",
+                            locale::text("about.version"),
                             None,
                             div()
                                 .text_xs()
@@ -8313,19 +8536,20 @@ impl Browser {
                         // literals and one elision width to keep in step.
                         .child(path_row(
                             "about-crashes",
-                            "Thư mục báo cáo crash",
-                            "Chỉ có tệp khi app từng tắt đột ngột",
+                            locale::text("about.crash_dir"),
+                            locale::text("about.crash_dir.note"),
                             crash_dir,
                             cx,
                         ))
-                        .child(div().flex().justify_end().child(
-                            action_button("about-close", "Xong", theme).on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.about_open = false;
-                                    cx.notify();
-                                },
-                            )),
-                        )),
+                        .child(
+                            div().flex().justify_end().child(
+                                action_button("about-close", locale::text("about.close"), theme)
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.about_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                        ),
                 )
                 .transition_opacity_and_offset(
                     "about-scrim-in",
@@ -8445,7 +8669,7 @@ impl Browser {
                                         div()
                                             .text_xs()
                                             .text_color(theme.text_faint)
-                                            .child("Chưa có profile nào"),
+                                            .child(locale::text("profiles.empty")),
                                     )
                                 }),
                         )
@@ -8454,18 +8678,32 @@ impl Browser {
                                 .flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(action_button("add-profile", "Profile mới", theme).on_click(
-                                    cx.listener(|this, _event, window, cx| {
-                                        this.profiles_open = false;
-                                        this.open_form(FormKind::NewProfile, window, cx)
-                                    }),
-                                ))
-                                .child(action_button("profiles-close", "Đóng", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.profiles_open = false;
-                                        cx.notify();
-                                    }),
-                                )),
+                                .child(
+                                    action_button(
+                                        "add-profile",
+                                        locale::text("form.new_profile"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, window, cx| {
+                                            this.profiles_open = false;
+                                            this.open_form(FormKind::NewProfile, window, cx)
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    action_button(
+                                        "profiles-close",
+                                        locale::text("common.done"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| {
+                                            this.profiles_open = false;
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
                         ),
                 )
                 .transition_opacity_and_offset(
@@ -9835,7 +10073,11 @@ impl Browser {
             0.
         };
         let measure = if total > 0 {
-            format!("{} / {}", format_size(done as i64), format_size(total as i64))
+            format!(
+                "{} / {}",
+                format_size(done as i64),
+                format_size(total as i64)
+            )
         } else {
             format_size(done as i64)
         };
@@ -9876,12 +10118,10 @@ impl Browser {
                         .child(
                             small_icon_button("opening-cancel".into(), "close", 10., theme)
                                 .size(px(18.))
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new("Huỷ").build(window, cx)
-                                })
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.cancel_open(cx)
-                                })),
+                                .tooltip(move |window, cx| Tooltip::new("Huỷ").build(window, cx))
+                                .on_click(
+                                    cx.listener(|this, _event, _window, cx| this.cancel_open(cx)),
+                                ),
                         ),
                 )
                 .child(
@@ -11017,11 +11257,7 @@ impl Browser {
             return None;
         }
         let theme = self.theme;
-
-        let step = |title: &'static str,
-                    detail: &'static str,
-                    button: &'static str,
-                    id: &'static str| { (title, detail, button, id) };
+        let mode = theme_mode(self.settings.theme, self.appearance);
 
         Some(
             div()
@@ -11032,78 +11268,86 @@ impl Browser {
                 .justify_center()
                 .child(
                     div()
-                        .w(px(DIALOG_WIDTH))
+                        .w(px(360.))
                         .flex()
                         .flex_col()
+                        .items_center()
                         .gap_4()
+                        .child(brand_logo(mode, 188.))
+                        .when_some(self.language_select.clone(), |this, select| {
+                            this.child(
+                                div().w(px(220.)).child(
+                                    Select::new(&select)
+                                        .placeholder(locale::text("settings.language.choose"))
+                                        .search_placeholder(locale::text(
+                                            "settings.language.search",
+                                        ))
+                                        .menu_width(px(280.)),
+                                ),
+                            )
+                        })
                         .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(div().text_color(theme.text).child("s3browser"))
-                                .child(
+                            div().w_full().flex().flex_col().gap_2().children(
+                                [
+                                    (
+                                        "path",
+                                        locale::text("onboarding.manual.title"),
+                                        "onboard-manual",
+                                    ),
+                                    (
+                                        "bucket",
+                                        locale::text("onboarding.minio.title"),
+                                        "onboard-minio",
+                                    ),
+                                    (
+                                        "external",
+                                        locale::text("onboarding.aws_sso.title"),
+                                        "onboard-sso",
+                                    ),
+                                ]
+                                .into_iter()
+                                .map(|(icon_name, title, id)| {
                                     div()
-                                        .text_xs()
-                                        .text_color(theme.text_muted)
-                                        .child("Khoá bí mật lưu trong Keychain."),
-                                ),
-                        )
-                        .children(
-                            [
-                                step(
-                                    "Nhập thủ công",
-                                    "R2, B2, Wasabi, Spaces, MinIO",
-                                    "Tạo",
-                                    "onboard-manual",
-                                ),
-                                step("MinIO trên máy", "127.0.0.1:9000", "Tạo", "onboard-minio"),
-                                step(
-                                    "Đăng nhập AWS SSO",
-                                    "Qua trình duyệt",
-                                    "Đăng nhập",
-                                    "onboard-sso",
-                                ),
-                            ]
-                            .map(|(title, detail, button, id)| {
-                                div()
-                                    .p_3()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .rounded_lg()
-                                    .bg(theme.panel)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            // Without a zero minimum a flex child
-                                            // refuses to shrink below its content,
-                                            // and the button next to it is pushed
-                                            // outside the card.
-                                            .min_w(px(0.))
-                                            .overflow_hidden()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .child(div().text_color(theme.text).child(title))
-                                            .child(div().text_xs().child(wrapped_text(
-                                                detail,
-                                                52,
-                                                theme.text_muted,
-                                            ))),
-                                    )
-                                    .child(action_button(id, button, theme).on_click(cx.listener(
-                                        move |this, _event, window, cx| match id {
-                                            "onboard-manual" => {
-                                                this.open_form(FormKind::NewProfile, window, cx)
+                                        .id(id)
+                                        .h(px(44.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .rounded_lg()
+                                        .bg(theme.modal)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .cursor_pointer()
+                                        .hover(|this| this.bg(theme.hover))
+                                        .on_click(cx.listener(move |this, _event, window, cx| {
+                                            match id {
+                                                "onboard-manual" => {
+                                                    this.open_form(FormKind::NewProfile, window, cx)
+                                                }
+                                                "onboard-minio" => this.add_minio_dev_profile(cx),
+                                                _ => this.open_form(FormKind::SsoStart, window, cx),
                                             }
-                                            "onboard-minio" => this.add_minio_dev_profile(cx),
-                                            _ => this.open_form(FormKind::SsoStart, window, cx),
-                                        },
-                                    )))
-                            }),
+                                        }))
+                                        .child(
+                                            div()
+                                                .w(px(22.))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(sized_icon(icon_name, 15., theme.accent)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .text_color(theme.text)
+                                                .child(title),
+                                        )
+                                }),
+                            ),
                         )
                         .when_some(
                             self.failures.last().map(|failure| failure.summary.clone()),
@@ -11178,10 +11422,12 @@ impl Browser {
                                                 .w(px(label_width))
                                                 .text_xs()
                                                 .text_color(theme.text_faint)
-                                                .child("Dịch vụ"),
+                                                .child(locale::text("form.provider")),
                                         )
                                         .child(div().flex_1().min_w(px(0.)).child(
-                                            Select::new(&select).placeholder("Chọn dịch vụ"),
+                                            Select::new(&select).placeholder(locale::text(
+                                                "form.provider.placeholder",
+                                            )),
                                         )),
                                 )
                             },
@@ -11230,7 +11476,12 @@ impl Browser {
                                     .items_center()
                                     .gap_2()
                                     .child(
-                                        action_button("form-test", "Thử kết nối", theme).on_click(
+                                        action_button(
+                                            "form-test",
+                                            locale::text("form.test_connection"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.test_profile_connection(cx)
                                             }),
@@ -11238,9 +11489,10 @@ impl Browser {
                                     )
                                     .when_some(form.probe.clone(), |this, probe| {
                                         let (colour, text) = match probe {
-                                            Probe::Running => {
-                                                (theme.text_muted, "Đang thử…".into())
-                                            }
+                                            Probe::Running => (
+                                                theme.text_muted,
+                                                locale::text("form.testing").into(),
+                                            ),
                                             Probe::Ok(message) => (theme.accent, message),
                                             Probe::Warning(message) => (theme.text_muted, message),
                                             Probe::Failed(message) => (theme.danger, message),
@@ -11254,15 +11506,25 @@ impl Browser {
                                 .flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(action_button("form-cancel", "Huỷ", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.form = None;
-                                        cx.notify();
-                                    }),
-                                ))
-                                .child(action_button("form-save", "Lưu", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| this.submit_form(cx)),
-                                )),
+                                .child(
+                                    action_button(
+                                        "form-cancel",
+                                        locale::text("common.cancel"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| {
+                                            this.form = None;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    action_button("form-save", locale::text("common.save"), theme)
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.submit_form(cx)
+                                        })),
+                                ),
                         ),
                 )
                 .transition_opacity_and_offset(
@@ -12213,7 +12475,6 @@ impl Render for Browser {
                     .children(self.render_drawer(cx))
             })
             .child(self.render_status(cx))
-            .children(self.render_confirm(cx))
             .children(self.render_share(cx))
             .children(self.render_sso(cx))
             .children(self.render_form(cx))
@@ -12228,6 +12489,10 @@ impl Render for Browser {
             // inside them; under the palette, which is summoned deliberately
             // and should not have a chip sitting on its corner.
             .children(self.render_opening(cx))
+            // Confirmations are the topmost blocking dialog. Profile deletion
+            // can be asked from inside the profile dialog, so this must paint
+            // after the dialog that spawned it.
+            .children(self.render_confirm(cx))
             // Last, so it paints over everything. The palette can be summoned
             // from on top of any of these — "Sửa nội dung" only makes sense
             // while a preview is open — and it used to come up *behind* the
@@ -12713,7 +12978,7 @@ fn version_line() -> String {
 fn dir_label(dir: Option<&Path>, max_chars: usize) -> String {
     match dir {
         Some(dir) => elide_middle(&dir.display().to_string(), max_chars),
-        None => "Không rõ".to_string(),
+        None => locale::text("common.unknown").to_string(),
     }
 }
 
@@ -12747,6 +13012,20 @@ fn icon(name: &'static str, color: gpui::Hsla) -> impl IntoElement {
 /// blanks beside every menu label.
 fn menu_icon(name: &'static str) -> gpui_component::Icon {
     gpui_component::Icon::empty().path(SharedString::from(format!("icons/{name}.svg")))
+}
+
+fn brand_logo_path(mode: crate::theme::Mode) -> &'static str {
+    match mode {
+        crate::theme::Mode::Light => "brand/s3-browser-logo-light.svg",
+        crate::theme::Mode::Dark => "brand/s3-browser-logo-dark.svg",
+    }
+}
+
+fn brand_logo(mode: crate::theme::Mode, width: f32) -> impl IntoElement {
+    gpui::img(brand_logo_path(mode))
+        .w(px(width))
+        .h(px(width * 144. / 440.))
+        .object_fit(ObjectFit::Contain)
 }
 
 /// An icon at a chosen size. 16px suits a button; a chevron sitting inline with
@@ -14559,19 +14838,36 @@ fn object_context_menu(
     // Items the row cannot do are left out rather than shown greyed: a menu of
     // mostly-dead entries is harder to read than a short live one.
     let menu = menu
-        .menu_with_icon("Chép", menu_icon("copy"), Box::new(ActionCopy))
-        .menu_with_icon("Cắt", menu_icon("cut"), Box::new(ActionCut))
-        .menu_with_icon_and_disabled("Dán", menu_icon("paste"), Box::new(ActionPaste), !can_paste)
+        .menu_with_icon(
+            locale::text("command.copy"),
+            menu_icon("copy"),
+            Box::new(ActionCopy),
+        )
+        .menu_with_icon(
+            locale::text("command.cut"),
+            menu_icon("cut"),
+            Box::new(ActionCut),
+        )
+        .menu_with_icon_and_disabled(
+            locale::text("command.paste"),
+            menu_icon("paste"),
+            Box::new(ActionPaste),
+            !can_paste,
+        )
         .separator();
 
     let menu = if single {
-        menu.menu_with_icon("Đổi tên", menu_icon("rename"), Box::new(ActionRename))
-            .menu_with_icon_and_disabled(
-                "Nhân bản",
-                menu_icon("duplicate"),
-                Box::new(ActionDuplicate),
-                is_folder,
-            )
+        menu.menu_with_icon(
+            locale::text("command.rename"),
+            menu_icon("rename"),
+            Box::new(ActionRename),
+        )
+        .menu_with_icon_and_disabled(
+            locale::text("command.duplicate"),
+            menu_icon("duplicate"),
+            Box::new(ActionDuplicate),
+            is_folder,
+        )
     } else {
         menu
     };
@@ -14580,7 +14876,7 @@ fn object_context_menu(
     // those never appear on one.
     let menu = if is_folder {
         let menu = menu.menu_with_icon(
-            "Mở trong tab mới",
+            locale::text("command.open_in_new_tab"),
             menu_icon("external"),
             Box::new(ActionOpenInTab),
         );
@@ -14588,12 +14884,12 @@ fn object_context_menu(
         // switched off — the default since 2023 — these two can only ever fail.
         if acl_supported {
             menu.menu_with_icon(
-                "Đặt riêng tư cho cả thư mục",
+                locale::text("command.acl_folder_private"),
                 menu_icon("eye"),
                 Box::new(ActionAclPrivate),
             )
             .menu_with_icon(
-                "Đặt ai cũng đọc được cho cả thư mục",
+                locale::text("command.acl_folder_public"),
                 menu_icon("eye"),
                 Box::new(ActionAclPublic),
             )
@@ -14601,34 +14897,58 @@ fn object_context_menu(
             menu
         }
     } else {
-        menu.menu_with_icon("Xem trước", menu_icon("eye"), Box::new(ActionPreview))
-            .menu_with_icon(
-                "Mở bằng app",
-                menu_icon("external"),
-                Box::new(ActionOpenExternally),
-            )
-            .menu_with_icon("Chia sẻ", menu_icon("link"), Box::new(ActionShare))
-            .menu_with_icon("Chi tiết", menu_icon("info"), Box::new(ActionInspect))
-            .menu_with_icon(
-                "Sửa header",
-                menu_icon("rename"),
-                Box::new(ActionEditHeaders),
-            )
+        menu.menu_with_icon(
+            locale::text("command.preview"),
+            menu_icon("eye"),
+            Box::new(ActionPreview),
+        )
+        .menu_with_icon(
+            locale::text("command.open_externally"),
+            menu_icon("external"),
+            Box::new(ActionOpenExternally),
+        )
+        .menu_with_icon(
+            locale::text("command.share"),
+            menu_icon("link"),
+            Box::new(ActionShare),
+        )
+        .menu_with_icon(
+            locale::text("command.inspect"),
+            menu_icon("info"),
+            Box::new(ActionInspect),
+        )
+        .menu_with_icon(
+            locale::text("command.edit_headers"),
+            menu_icon("rename"),
+            Box::new(ActionEditHeaders),
+        )
     };
 
-    menu.menu_with_icon("Tải xuống", menu_icon("download"), Box::new(ActionDownload))
-        .separator()
-        // Their own group, away from "Chép": that one puts objects on the
-        // clipboard for a paste, these two put text on it for somewhere else
-        // entirely.
-        .menu_with_icon(
-            "Chép đường dẫn s3://",
-            menu_icon("path"),
-            Box::new(ActionCopyPath),
-        )
-        .menu_with_icon("Chép key", menu_icon("copy"), Box::new(ActionCopyKey))
-        .separator()
-        .menu_with_icon("Xoá", menu_icon("trash"), Box::new(ActionDelete))
+    menu.menu_with_icon(
+        locale::text("command.download"),
+        menu_icon("download"),
+        Box::new(ActionDownload),
+    )
+    .separator()
+    // Their own group, away from "Chép": that one puts objects on the
+    // clipboard for a paste, these two put text on it for somewhere else
+    // entirely.
+    .menu_with_icon(
+        locale::text("command.copy_path"),
+        menu_icon("path"),
+        Box::new(ActionCopyPath),
+    )
+    .menu_with_icon(
+        locale::text("command.copy_key"),
+        menu_icon("copy"),
+        Box::new(ActionCopyKey),
+    )
+    .separator()
+    .menu_with_icon(
+        locale::text("command.delete"),
+        menu_icon("trash"),
+        Box::new(ActionDelete),
+    )
 }
 
 /// The palette to paint: the setting when it names one, the system otherwise.
@@ -14678,6 +14998,26 @@ fn settings_group(title: &'static str, theme: Theme) -> impl IntoElement {
         .gap_2()
         .child(div().text_xs().text_color(theme.text_faint).child(title))
         .child(div().flex_1().h(px(1.)).bg(theme.border))
+}
+
+fn language_select_items() -> Vec<&'static str> {
+    Language::ALL
+        .into_iter()
+        .map(Language::native_name)
+        .collect()
+}
+
+fn language_index(language: Language) -> usize {
+    Language::ALL
+        .iter()
+        .position(|candidate| *candidate == language)
+        .unwrap_or_default()
+}
+
+fn language_from_label(label: &str) -> Option<Language> {
+    Language::ALL
+        .into_iter()
+        .find(|language| language.native_name() == label)
 }
 
 fn setting_row(
@@ -15090,6 +15430,43 @@ fn split_endpoint(endpoint: &str) -> (String, Option<String>) {
     }
 }
 
+/// The bucket to open after saving a profile, if the form named one.
+///
+/// The endpoint hint is what Cloudflare and MinIO users often paste by
+/// accident; the explicit probe bucket wins because it is where the user meant
+/// the app to verify a scoped token.
+fn profile_bucket_hint(
+    probe_bucket: &str,
+    endpoint_bucket: Option<String>,
+    profile_region: &str,
+) -> Result<Option<S3Path>, String> {
+    let target = if probe_bucket.trim().is_empty() {
+        endpoint_bucket.map(|bucket| S3Path {
+            bucket,
+            prefix: String::new(),
+            region: None,
+        })
+    } else {
+        Some(
+            parse_s3_path(probe_bucket)
+                .ok_or_else(|| locale::text("validation.probe_bucket_format").to_string())?,
+        )
+    };
+
+    if let Some(path) = target.as_ref() {
+        if let Some(region) = path.region.as_ref() {
+            if region != profile_region {
+                return Err(format!(
+                    "{}: {region}; profile: {profile_region}",
+                    locale::text("validation.probe_bucket_region")
+                ));
+            }
+        }
+    }
+
+    Ok(target)
+}
+
 /// What is wrong with a profile form, or `None` if nothing is.
 ///
 /// Separate from the form itself because the fields now live inside the
@@ -15103,25 +15480,33 @@ fn validate_profile(
     secret_optional: bool,
 ) -> Option<&'static str> {
     if name.is_empty() {
-        Some("Cần tên profile")
+        Some(locale::text("validation.profile_name_required"))
     } else if access_key.is_empty() {
-        Some("Cần access key")
+        Some(locale::text("validation.access_key_required"))
     } else if secret_key.is_empty() && !secret_optional {
-        Some("Cần secret key")
+        Some(locale::text("validation.secret_key_required"))
     } else if taken.contains(&name) {
         // Names are how profiles are told apart in the sidebar, so a duplicate
         // makes the list unreadable even though the ids stay unique.
-        Some("Đã có profile trùng tên")
+        Some(locale::text("validation.duplicate_profile"))
     } else {
         None
     }
 }
 
 fn profile_probe_bucket_ok(bucket: &str, prefix: &str, entries: usize) -> String {
+    if locale::language() == Language::Vietnamese {
+        return if prefix.is_empty() {
+            format!("Kết nối được tới {bucket}, thấy {entries} mục trang đầu")
+        } else {
+            format!("Kết nối được tới s3://{bucket}/{prefix}, thấy {entries} mục trang đầu")
+        };
+    }
+
     if prefix.is_empty() {
-        format!("Kết nối được tới {bucket}, thấy {entries} mục trang đầu")
+        format!("Connection successful to {bucket}; first-page items: {entries}")
     } else {
-        format!("Kết nối được tới s3://{bucket}/{prefix}, thấy {entries} mục trang đầu")
+        format!("Connection successful to s3://{bucket}/{prefix}; first-page items: {entries}")
     }
 }
 
@@ -15186,45 +15571,45 @@ impl Command {
     /// palette is read, not pressed.
     fn label(self) -> (&'static str, &'static str) {
         match self {
-            Command::Refresh => ("Tải lại", "⌘R"),
-            Command::GoUp => ("Lên một cấp", "⌘↑"),
-            Command::Filter => ("Lọc", "⌘F"),
-            Command::Errors => ("Xem lỗi", ""),
-            Command::EditHeaders => ("Sửa header", ""),
-            Command::NewTab => ("Tab mới", "⌘T"),
-            Command::CloseTab => ("Đóng tab", "⌘W"),
-            Command::GoToPath => ("Đi tới đường dẫn", "⌘L"),
-            Command::ToggleFavorite => ("Ghim nơi này", ""),
-            Command::Recent => ("Gần đây", ""),
-            Command::Buckets => ("Tất cả bucket", ""),
-            Command::Settings => ("Cài đặt", ""),
-            Command::About => ("Giới thiệu", ""),
-            Command::CheckUpdate => ("Kiểm tra bản cập nhật", ""),
-            Command::CopyPath => ("Chép đường dẫn s3://", ""),
-            Command::CopyKey => ("Chép key", ""),
-            Command::AclFolderPrivate => ("Thư mục: đặt riêng tư", ""),
-            Command::AclFolderPublic => ("Thư mục: ai cũng đọc được", ""),
-            Command::EditText => ("Sửa nội dung", ""),
-            Command::SaveText => ("Lưu nội dung", ""),
-            Command::NewFolder => ("Thư mục mới", "⌘N"),
-            Command::NewBucket => ("Bucket mới", "⌘⇧N"),
-            Command::Rename => ("Đổi tên", "⌘⏎"),
-            Command::Duplicate => ("Nhân bản", ""),
-            Command::Copy => ("Chép", "⌘C"),
-            Command::Cut => ("Cắt", "⌘X"),
-            Command::Paste => ("Dán", "⌘V"),
-            Command::SelectAll => ("Chọn tất cả", "⌘A"),
-            Command::Share => ("Chia sẻ / presigned URL", ""),
-            Command::Inspect => ("Chi tiết", "⌘I"),
-            Command::Preview => ("Xem trước", "Space"),
-            Command::OpenExternally => ("Mở bằng app ngoài", ""),
-            Command::Download => ("Tải xuống", "⌘D"),
-            Command::Delete => ("Xoá mục đã chọn", "⌘⌫"),
-            Command::ToggleQueue => ("Hàng đợi truyền tải", "⌘J"),
-            Command::EmptyBucket => ("Dọn sạch bucket", ""),
-            Command::AssumeRole => ("Nhận role (STS AssumeRole)", ""),
-            Command::SsoSignIn => ("Đăng nhập AWS SSO", ""),
-            Command::NewProfile => ("Profile mới", ""),
+            Command::Refresh => (locale::text("command.refresh"), "⌘R"),
+            Command::GoUp => (locale::text("command.go_up"), "⌘↑"),
+            Command::Filter => (locale::text("command.filter"), "⌘F"),
+            Command::Errors => (locale::text("command.errors"), ""),
+            Command::EditHeaders => (locale::text("command.edit_headers"), ""),
+            Command::NewTab => (locale::text("command.new_tab"), "⌘T"),
+            Command::CloseTab => (locale::text("command.close_tab"), "⌘W"),
+            Command::GoToPath => (locale::text("command.go_to_path"), "⌘L"),
+            Command::ToggleFavorite => (locale::text("command.toggle_favorite"), ""),
+            Command::Recent => (locale::text("command.recent"), ""),
+            Command::Buckets => (locale::text("command.buckets"), ""),
+            Command::Settings => (locale::text("command.settings"), ""),
+            Command::About => (locale::text("command.about"), ""),
+            Command::CheckUpdate => (locale::text("command.check_update"), ""),
+            Command::CopyPath => (locale::text("command.copy_path"), ""),
+            Command::CopyKey => (locale::text("command.copy_key"), ""),
+            Command::AclFolderPrivate => (locale::text("command.acl_folder_private"), ""),
+            Command::AclFolderPublic => (locale::text("command.acl_folder_public"), ""),
+            Command::EditText => (locale::text("command.edit_text"), ""),
+            Command::SaveText => (locale::text("command.save_text"), ""),
+            Command::NewFolder => (locale::text("command.new_folder"), "⌘N"),
+            Command::NewBucket => (locale::text("command.new_bucket"), "⌘⇧N"),
+            Command::Rename => (locale::text("command.rename"), "⌘⏎"),
+            Command::Duplicate => (locale::text("command.duplicate"), ""),
+            Command::Copy => (locale::text("command.copy"), "⌘C"),
+            Command::Cut => (locale::text("command.cut"), "⌘X"),
+            Command::Paste => (locale::text("command.paste"), "⌘V"),
+            Command::SelectAll => (locale::text("command.select_all"), "⌘A"),
+            Command::Share => (locale::text("command.share"), ""),
+            Command::Inspect => (locale::text("command.inspect"), "⌘I"),
+            Command::Preview => (locale::text("command.preview"), "Space"),
+            Command::OpenExternally => (locale::text("command.open_externally"), ""),
+            Command::Download => (locale::text("command.download"), "⌘D"),
+            Command::Delete => (locale::text("command.delete"), "⌘⌫"),
+            Command::ToggleQueue => (locale::text("command.toggle_queue"), "⌘J"),
+            Command::EmptyBucket => (locale::text("command.empty_bucket"), ""),
+            Command::AssumeRole => (locale::text("command.assume_role"), ""),
+            Command::SsoSignIn => (locale::text("command.sso_sign_in"), ""),
+            Command::NewProfile => (locale::text("command.new_profile"), ""),
         }
     }
 
@@ -15273,8 +15658,8 @@ impl Command {
     }
 }
 
-/// Case- and accent-tolerant match. Vietnamese command names are typed without
-/// diacritics as often as with them, so "doi ten" has to find "Đổi tên".
+/// Case- and accent-tolerant match. This keeps Vietnamese command names easy
+/// to find when the language is set to Vietnamese.
 fn command_matches(label: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -15485,6 +15870,7 @@ mod tests {
             place_store: None,
             settings: Settings::default(),
             settings_store: None,
+            language_select: None,
             settings_open: false,
             about_open: false,
             client: None,
@@ -15493,6 +15879,7 @@ mod tests {
             bucket_created: HashMap::new(),
             buckets_cached: false,
             bucket_cache_bypass: false,
+            pending_open: None,
             bucket_filter: String::new(),
             bucket_filter_input: None,
             bucket: Some("demo".into()),
@@ -15571,6 +15958,7 @@ mod tests {
             _appearance: None,
             _filter_events: None,
             _bucket_filter_events: None,
+            _language_events: None,
             _path_events: None,
         };
         browser.resort_and_filter();
@@ -16270,15 +16658,15 @@ mod tests {
         // "invalid" — the point of the message is to say which box to fill.
         assert_eq!(
             validate_profile("", "AKIA", "secret", &[], false),
-            Some("Cần tên profile")
+            Some("Connection name is required")
         );
         assert_eq!(
             validate_profile("R2", "", "secret", &[], false),
-            Some("Cần access key")
+            Some("Access key ID is required")
         );
         assert_eq!(
             validate_profile("R2", "AKIA", "", &[], false),
-            Some("Cần secret key")
+            Some("Secret access key is required")
         );
         assert_eq!(validate_profile("R2", "AKIA", "", &[], true), None);
 
@@ -16286,7 +16674,7 @@ mod tests {
         // unique underneath.
         assert_eq!(
             validate_profile("R2", "AKIA", "secret", &["R2"], false),
-            Some("Đã có profile trùng tên")
+            Some("A profile with this name already exists")
         );
         // A different name alongside an existing one is fine.
         assert_eq!(
@@ -16299,12 +16687,57 @@ mod tests {
     fn profile_probe_names_the_bucket_scope_it_actually_tested() {
         assert_eq!(
             profile_probe_bucket_ok("photos", "", 3),
-            "Kết nối được tới photos, thấy 3 mục trang đầu"
+            "Connection successful to photos; first-page items: 3"
         );
         assert_eq!(
             profile_probe_bucket_ok("photos", "2026/", 1),
-            "Kết nối được tới s3://photos/2026/, thấy 1 mục trang đầu"
+            "Connection successful to s3://photos/2026/; first-page items: 1"
         );
+    }
+
+    #[test]
+    fn profile_save_opens_the_bucket_hint_the_form_names() {
+        let hint = profile_bucket_hint("", Some("from-endpoint".into()), "auto")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hint.bucket, "from-endpoint");
+        assert_eq!(hint.prefix, "");
+
+        let hint = profile_bucket_hint(
+            "s3://explicit@eu-west-1/photos",
+            Some("from-endpoint".into()),
+            "eu-west-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hint.bucket, "explicit");
+        assert_eq!(hint.prefix, "photos/");
+
+        assert!(
+            profile_bucket_hint("s3://explicit", Some("from-endpoint".into()), "us-east-1")
+                .unwrap()
+                .is_some(),
+            "a plain bucket does not need a region"
+        );
+        assert!(profile_bucket_hint("s3://explicit@eu-west-1", None, "us-east-1").is_err());
+        assert!(profile_bucket_hint("s3://", None, "us-east-1").is_err());
+    }
+
+    #[gpui::test]
+    fn saving_without_a_bucket_clears_an_old_pending_open(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| offline(Vec::new(), cx));
+
+        entity.update(cx, |browser, _| {
+            browser.pending_open = Some(("p1".into(), "old".into(), String::new()));
+            browser.clear_pending_open("p2");
+            assert!(
+                browser.pending_open.is_some(),
+                "other profiles stay untouched"
+            );
+
+            browser.clear_pending_open("p1");
+            assert!(browser.pending_open.is_none());
+        });
     }
 
     #[test]
@@ -16392,7 +16825,7 @@ mod tests {
         // A folder the app cannot locate still says so out loud. An empty row
         // would leave the reader unable to tell "there is no such folder" from
         // "this dialog is broken".
-        assert_eq!(dir_label(None, 44), "Không rõ");
+        assert_eq!(dir_label(None, 44), "Unknown");
 
         // A long path keeps both ends: the front says whose home it is under,
         // the last segment says which of the two folders it is.
@@ -16925,7 +17358,7 @@ mod tests {
         // With or without the trailing slash.
         assert_eq!(Tab::title(Some(&bucket), "photos/2026"), "2026");
         // A tab that is not anywhere yet still needs a name.
-        assert_eq!(Tab::title(None, ""), "Trống");
+        assert_eq!(Tab::title(None, ""), "Empty");
     }
 
     #[test]
@@ -16934,11 +17367,11 @@ mod tests {
         // hundred look exactly the same.
         assert_eq!(
             FormKind::EditHeaders(vec!["a".into()]).title(),
-            "Sửa header"
+            "Edit metadata headers"
         );
         assert_eq!(
             FormKind::EditHeaders(vec!["a".into(), "b".into(), "c".into()]).title(),
-            "Sửa header cho 3 mục"
+            "Edit metadata headers for selected objects (3)"
         );
     }
 

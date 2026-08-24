@@ -15,6 +15,7 @@ mod crash;
 mod failure;
 #[cfg(target_os = "macos")]
 mod glass_check;
+mod locale;
 mod platform;
 mod settings;
 mod theme;

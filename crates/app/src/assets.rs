@@ -64,7 +64,24 @@ icons![
     "trash",
     "upload",
     // The window controls the app draws for itself on Windows and Linux.
-    "window-maximize", "window-minimize", "window-restore",
+    "window-maximize",
+    "window-minimize",
+    "window-restore",
+];
+
+const BRAND: &[(&str, &[u8])] = &[
+    (
+        "brand/s3-browser-logo-dark.svg",
+        include_bytes!("../../../assets/brand/s3-browser-logo-dark.svg"),
+    ),
+    (
+        "brand/s3-browser-logo-light.svg",
+        include_bytes!("../../../assets/brand/s3-browser-logo-light.svg"),
+    ),
+    (
+        "brand/s3-browser-mark.svg",
+        include_bytes!("../../../assets/brand/s3-browser-mark.svg"),
+    ),
 ];
 
 /// The UI typeface, embedded so every machine renders the same.
@@ -85,6 +102,7 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(ICONS
             .iter()
+            .chain(BRAND.iter())
             .find(|(name, _)| *name == path)
             .map(|(_, bytes)| Cow::Borrowed(*bytes)))
     }
@@ -92,6 +110,7 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(ICONS
             .iter()
+            .chain(BRAND.iter())
             .filter(|(name, _)| name.starts_with(path))
             .map(|(name, _)| SharedString::from(*name))
             .collect())
@@ -147,6 +166,24 @@ mod tests {
     #[test]
     fn listing_is_scoped_to_the_prefix() {
         assert_eq!(Assets.list("icons/").unwrap().len(), ICONS.len());
+        assert_eq!(Assets.list("brand/").unwrap().len(), BRAND.len());
         assert!(Assets.list("nothing/").unwrap().is_empty());
+    }
+
+    #[test]
+    fn brand_assets_are_available() {
+        for (path, _) in BRAND {
+            let bytes = Assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{path} did not load"));
+            let text = std::str::from_utf8(&bytes).unwrap();
+
+            assert!(text.starts_with("<svg"), "{path} is not an SVG");
+            assert!(
+                text.contains("S3 Browser") || text.contains("S3"),
+                "{path} does not identify the brand"
+            );
+        }
     }
 }

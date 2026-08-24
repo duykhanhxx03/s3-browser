@@ -12,9 +12,10 @@ Credentials never live in a config file. Secret keys go to the operating
 system's credential store (Keychain, Credential Manager, Secret Service) and
 only profile metadata is stored as JSON.
 
-> **Status: usable, unreleased.** The application works and is used against
-> real providers, but there are no signed binaries, no release automation and
-> no CI. See [Status and limitations](#status-and-limitations) before
+> **Status: usable, unsigned.** The application works and is used against real
+> providers, and GitHub releases are published manually. There are no signed
+> binaries, no release automation and no CI. See
+> [Status and limitations](#status-and-limitations) before
 > depending on it.
 
 ## Features
@@ -64,7 +65,7 @@ themes following the system, and crash reports written to disk.
 | | |
 |---|---|
 | Signed builds | None. macOS Gatekeeper rejects the unsigned `.app`; Developer ID signing and notarisation need a paid Apple Developer account. See [docs/PACKAGING.md](docs/PACKAGING.md). |
-| CI and releases | None yet. Every build here is a local build. |
+| CI and releases | No CI or release automation yet. GitHub releases are built and uploaded manually. |
 | Windows | Cross-compiled from macOS and verified only by inspecting the executable — never run on Windows. |
 | Linux | Cross-compiled from macOS and verified only by inspecting the binary — never run on a Linux desktop. The build targets glibc 2.35, so it runs on Ubuntu 22.04 and newer. Window blur is unavailable outside KDE, so the theme falls back to solid. |
 | AWS SSO | The device flow talks to real AWS endpoints and cannot be simulated with MinIO. Only its pure logic is unit tested; treat it as unverified. |
