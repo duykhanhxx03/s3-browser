@@ -31,7 +31,10 @@ pub struct Update {
 /// repository that once publishes `nightly` nags every user forever.
 fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
     let tag = tag.trim();
-    let tag = tag.strip_prefix('v').or_else(|| tag.strip_prefix('V')).unwrap_or(tag);
+    let tag = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
     // A pre-release or build suffix is dropped rather than rejected: `0.2.0-rc.1`
     // is still recognisably 0.2.0, and comparing it as equal keeps a release
     // candidate from being offered as newer than the release it precedes.
@@ -80,10 +83,7 @@ pub async fn check(http: Arc<dyn HttpClient>, current: &str) -> Result<Option<Up
     if !is_newer(&release.tag_name, current) {
         return Ok(None);
     }
-    let version = release
-        .tag_name
-        .trim_start_matches(['v', 'V'])
-        .to_string();
+    let version = release.tag_name.trim_start_matches(['v', 'V']).to_string();
     Ok(Some(Update {
         version,
         url: format!(

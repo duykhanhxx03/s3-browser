@@ -24,6 +24,12 @@ serde_json = "1"
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+# Not host-gated: `cfg()` on a build-dependency is evaluated against the host,
+# so gating it on Windows makes it vanish exactly when cross-compiling to
+# Windows -- which is when build.rs needs it to embed the app icon.
+[build-dependencies.embed-resource]
+version = "3.0"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Used by the `--verify-glass` self-check to inspect the real NSWindow.
 # Versions match what gpui 0.2.2 already links.

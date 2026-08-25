@@ -243,10 +243,7 @@ mod tests {
         // to one bucket is what R2's own docs recommend, so being unable to
         // list buckets is the normal path for a lot of people.
         let (summary, fix) = classify("AccessDenied when calling ListBuckets");
-        assert_eq!(
-            summary.as_deref(),
-            Some("This token cannot list buckets")
-        );
+        assert_eq!(summary.as_deref(), Some("This token cannot list buckets"));
         assert_eq!(fix, Some(Fix::OpenBucketByName));
     }
 
@@ -290,7 +287,10 @@ mod tests {
         // for these two cases, so they bail with a stable English marker
         // instead of user-facing text, and classify() matches on it here.
         let (summary, _) = classify("sso device code expired");
-        assert_eq!(summary.as_deref(), Some("The sign-in code expired, start over"));
+        assert_eq!(
+            summary.as_deref(),
+            Some("The sign-in code expired, start over")
+        );
 
         let (summary, _) = classify(
             "checksum mismatch for photo.png: downloaded file differs from the server's version",

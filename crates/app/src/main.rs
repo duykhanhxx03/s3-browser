@@ -62,6 +62,14 @@ fn main() {
                     titlebar: platform::titlebar_options(),
                     window_background: chrome.window_background(),
                     window_min_size: Some(size(px(720.), px(420.))),
+                    // Without this, X11's WM_CLASS and Wayland's app_id are
+                    // never set, so the window manager cannot match the
+                    // running window to the installed `.desktop` entry (see
+                    // `scripts/build-deb.sh`, `Icon=s3browser`). The taskbar,
+                    // alt-tab switcher and dock then show a blank icon even
+                    // though the icon files are installed correctly. Only
+                    // matters on Linux; macOS and Windows ignore it.
+                    app_id: Some("s3browser".to_string()),
                     ..Default::default()
                 },
                 |window, cx| {
@@ -88,7 +96,7 @@ fn main() {
 fn schedule_glass_check(cx: &mut App) {
     let executor = cx.background_executor().clone();
     cx.spawn(async move |cx| {
-        executor.timer(Duration::from_millis(1200)).await;
+        executor.timer(std::time::Duration::from_millis(1200)).await;
         _ = cx.update(|cx| {
             let mtm = objc2_foundation::MainThreadMarker::new()
                 .expect("glass check must run on the main thread");

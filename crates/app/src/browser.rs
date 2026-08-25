@@ -1743,7 +1743,10 @@ impl Browser {
                         }
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -1876,7 +1879,10 @@ impl Browser {
                         this.status = this.listing_summary();
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -1939,7 +1945,10 @@ impl Browser {
                         this.status = this.listing_summary();
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -1949,10 +1958,15 @@ impl Browser {
 
     fn listing_summary(&self) -> SharedString {
         if let Some(completing) = self.completing.as_ref() {
-            return format!(
-                "Đang tải nốt để sắp xếp: {} mục, {} yêu cầu",
-                self.entries.len() + completing.buffer.len(),
-                completing.requests
+            return locale::text_with(
+                "listing.completing_progress",
+                &[
+                    (
+                        "{items}",
+                        &(self.entries.len() + completing.buffer.len()).to_string(),
+                    ),
+                    ("{requests}", &completing.requests.to_string()),
+                ],
             )
             .into();
         }
@@ -1961,7 +1975,7 @@ impl Browser {
         // all here, a sort by size or date is an answer about the part that is,
         // and staying quiet about that is the bug.
         if needs_complete_listing(self.sort) && self.continuation.is_some() {
-            return format!("{} mục, sắp xếp trên phần đã tải", self.visible.len()).into();
+            return locale::text_n("listing.sorted_partial", self.visible.len()).into();
         }
         // Otherwise nothing: the count moved to the footer under the list, and
         // the status bar saying it a second time is a line of chrome spent
@@ -2282,7 +2296,7 @@ impl Browser {
         self.bulk_task = Some(cx.spawn(async move |this, cx| {
             let outcome = running.await;
             _ = this.update(cx, |this, cx| {
-                let mut acl_not_supported = false;
+                let mut acl_support_downgrade = None;
                 {
                     let Some(bulk) = this.bulk.as_mut() else {
                         return;
@@ -2293,16 +2307,19 @@ impl Browser {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
                             let detail = format!("{error:?}");
-                            if op_is_acl && detail.contains("AccessControlListNotSupported") {
-                                acl_not_supported = true;
+                            if op_is_acl {
+                                acl_support_downgrade = classify_acl_write_error(&detail);
                             }
                             bulk.failed.push(format!("{key}: {detail}"));
                         }
-                        Err(error) => bulk.failed.push(format!("{key}: task lỗi: {error}")),
+                        Err(error) => bulk.failed.push(locale::text_with(
+                            "error.task_join_keyed",
+                            &[("{key}", &key), ("{error}", &error.to_string())],
+                        )),
                     }
                 }
-                if acl_not_supported {
-                    this.mark_acl_unsupported();
+                if let Some(support) = acl_support_downgrade {
+                    this.mark_acl_support(support);
                 }
                 this.status = this.bulk_summary();
                 this.bulk_step(cx);
@@ -2318,17 +2335,23 @@ impl Browser {
         self.bulk_task = None;
 
         if bulk.failed.is_empty() {
-            self.status = format!("{} xong {} mục", bulk.what, bulk.done).into();
+            self.status = locale::text_with(
+                "bulk.finished",
+                &[("{what}", bulk.what), ("{n}", &bulk.done.to_string())],
+            )
+            .into();
         } else {
             // One summary with every reason under it, not one red line per key:
             // the log holds more than one failure precisely so a batch can
             // report as a batch.
             self.fail(Failure::known(
-                &format!(
-                    "{} được {}/{} mục",
-                    bulk.what,
-                    bulk.done - bulk.failed.len(),
-                    bulk.keys.len()
+                &locale::text_with(
+                    "bulk.finished_partial",
+                    &[
+                        ("{what}", bulk.what),
+                        ("{ok}", &(bulk.done - bulk.failed.len()).to_string()),
+                        ("{total}", &bulk.keys.len().to_string()),
+                    ],
                 ),
                 bulk.failed.join("\n"),
                 None,
@@ -2466,7 +2489,10 @@ impl Browser {
                         None
                     }
                     Ok(Err(error)) => Some(format!("{error:?}")),
-                    Err(error) => Some(format!("Task lỗi: {error:?}")),
+                    Err(error) => Some(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &format!("{error:?}"))],
+                    )),
                 };
 
                 if let Some(message) = failure {
@@ -2712,8 +2738,8 @@ impl Browser {
         let Some(path) = parse_s3_path(text) else {
             if !text.trim().is_empty() {
                 self.fail(Failure::known(
-                    "Không đọc được đường dẫn",
-                    format!("{text}\nDạng đúng: s3://bucket/prefix/"),
+                    locale::text("error.path_unreadable"),
+                    locale::text_with("error.path_unreadable_detail", &[("{text}", text)]),
                     None,
                 ));
                 cx.notify();
@@ -2732,10 +2758,16 @@ impl Browser {
                 .map(|profile| profile.region.clone());
             if profile.as_deref() != Some(region.as_str()) {
                 self.fail(Failure::known(
-                    "Đường dẫn ghi region khác với profile",
-                    format!(
-                        "Đường dẫn: {region}\nProfile: {}",
-                        profile.as_deref().unwrap_or("chưa có")
+                    locale::text("error.path_region_mismatch"),
+                    locale::text_with(
+                        "error.path_region_mismatch_detail",
+                        &[
+                            ("{region}", &region),
+                            (
+                                "{profile}",
+                                profile.as_deref().unwrap_or(locale::text("common.not_set")),
+                            ),
+                        ],
                     ),
                     Some(Fix::EditProfile),
                 ));
@@ -2779,7 +2811,7 @@ impl Browser {
         if let Some(store) = self.settings_store.as_ref() {
             if let Err(error) = store.save(&self.settings) {
                 self.fail(Failure::known(
-                    "Không lưu được cài đặt",
+                    locale::text("error.save_settings"),
                     format!("{error}"),
                     None,
                 ));
@@ -2894,7 +2926,10 @@ impl Browser {
                         this.buckets_cached = false;
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &format!("{error:?}"))],
+                    )),
                 }
                 cx.notify();
             });
@@ -2910,7 +2945,7 @@ impl Browser {
             // Not worth a dialog: losing a favourite is an annoyance, and the
             // list is a convenience in the first place.
             self.fail(Failure::known(
-                "Không lưu được danh sách nơi đã ghim",
+                locale::text("error.save_places"),
                 format!("{error}"),
                 None,
             ));
@@ -2942,9 +2977,9 @@ impl Browser {
         let pinned = self.places.toggle_favorite(place);
         self.save_places();
         self.status = if pinned {
-            "Đã ghim".into()
+            locale::text("status.pinned").into()
         } else {
-            "Đã bỏ ghim".into()
+            locale::text("status.unpinned").into()
         };
         cx.notify();
     }
@@ -3021,7 +3056,7 @@ impl Browser {
         };
         self.places.recent.retain(|place| place.profile != profile);
         self.save_places();
-        self.status = "Đã xoá lịch sử".into();
+        self.status = locale::text("status.history_cleared").into();
         cx.notify();
     }
 
@@ -3158,7 +3193,10 @@ impl Browser {
                     Err(error) => {
                         completing.running = false;
                         completing.truncated = true;
-                        this.report(format!("Task lỗi: {error:?}"));
+                        this.report(locale::text_with(
+                            "error.task_join",
+                            &[("{error}", &format!("{error:?}"))],
+                        ));
                     }
                 }
 
@@ -3214,7 +3252,10 @@ impl Browser {
                 match outcome {
                     Ok(Ok(_)) => this.open(reopen.0, reopen.1, cx),
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -3265,15 +3306,17 @@ impl Browser {
                         let bucket = SharedString::from(name.clone());
                         match listed {
                             Ok(buckets) => {
-                                this.buckets = buckets.into_iter().map(SharedString::from).collect();
+                                this.buckets =
+                                    buckets.into_iter().map(SharedString::from).collect();
                                 this.status = format!("{} bucket", this.buckets.len()).into();
                             }
                             Err(error) => {
                                 let failure = Failure::new(format!("ListBuckets: {error:?}"))
                                     .or_fix(Fix::OpenBucketByName);
                                 if failure.fix == Some(Fix::OpenBucketByName) {
-                                    this.status = format!(
-                                        "Đã tạo {name}; token không có quyền làm mới danh sách bucket"
+                                    this.status = locale::text_with(
+                                        "status.bucket_created_list_denied",
+                                        &[("{name}", &name)],
                                     )
                                     .into();
                                 } else {
@@ -3287,7 +3330,10 @@ impl Browser {
                         this.open(bucket, String::new(), cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -3347,7 +3393,18 @@ impl Browser {
         Some(Failure::known(summary, detail, None))
     }
 
-    fn mark_acl_unsupported(&mut self) {
+    /// Downgrades the cached ACL capability after a write fails.
+    ///
+    /// `probe_acl` only ever establishes read access (`GetBucketAcl`); a
+    /// bucket can answer that and still refuse `PutObjectAcl`, so `Yes` from
+    /// the probe is optimistic and the first real write is what actually
+    /// confirms or corrects it. `support` should be `No` for
+    /// `AccessControlListNotSupported` and `Forbidden` for `AccessDenied`,
+    /// matching how `s3core::capability::classify` reads the same errors from
+    /// a probe — otherwise a token that can read a bucket's ACL but not write
+    /// one keeps getting the "bucket has ACLs off" message instead of "your
+    /// token lacks ACL permission".
+    fn mark_acl_support(&mut self, support: Support) {
         let Some(bucket) = self.bucket.clone() else {
             return;
         };
@@ -3356,9 +3413,9 @@ impl Browser {
             tagging: Support::Yes,
             lifecycle: Support::Yes,
             object_lock: Support::Yes,
-            acl: Support::No,
+            acl: support,
         });
-        capabilities.acl = Support::No;
+        capabilities.acl = support;
         self.capabilities = Some(capabilities);
         self.caps_cache.insert(&bucket, capabilities);
     }
@@ -3399,11 +3456,11 @@ impl Browser {
             None => (text, "us-east-1".to_string()),
         };
         if !start_url.starts_with("http") {
-            self.report("Cần URL portal, ví dụ: https://tên.awsapps.com/start".into());
+            self.report(locale::text("sso.portal_url_required").into());
             return;
         }
 
-        self.status = "Đang bắt đầu đăng nhập SSO…".into();
+        self.status = locale::text("sso.signing_in").into();
         let region_for_flow = region.clone();
 
         let beginning = Tokio::spawn(
@@ -3424,7 +3481,10 @@ impl Browser {
                 }
                 Err(error) => {
                     _ = this.update(cx, |this, cx| {
-                        this.report(format!("Task lỗi: {error}"));
+                        this.report(locale::text_with(
+                            "error.task_join",
+                            &[("{error}", &error.to_string())],
+                        ));
                         cx.notify();
                     });
                     return;
@@ -3477,7 +3537,7 @@ impl Browser {
                             flow.access_token = Some(token);
                             flow.roles = roles;
                         }
-                        this.status = "Đã đăng nhập, chọn role".into();
+                        this.status = locale::text("sso.signed_in_choose_role").into();
                     }
                     Ok(Err(error)) => {
                         this.sso = None;
@@ -3485,7 +3545,10 @@ impl Browser {
                     }
                     Err(error) => {
                         this.sso = None;
-                        this.report(format!("Task lỗi: {error}"));
+                        this.report(locale::text_with(
+                            "error.task_join",
+                            &[("{error}", &error.to_string())],
+                        ));
                     }
                 }
                 cx.notify();
@@ -3508,7 +3571,8 @@ impl Browser {
             .map(|stored| (stored.region.clone(), stored.endpoint.clone()))
             .unwrap_or_else(|| ("us-east-1".to_string(), None));
 
-        self.status = format!("Đang lấy credentials cho {}…", role.role_name).into();
+        self.status =
+            locale::text_with("sso.fetching_credentials", &[("{role}", &role.role_name)]).into();
 
         let fetching = Tokio::spawn(cx, async move {
             let credentials = s3core::sso::credentials_for(&token, &role, &region).await?;
@@ -3538,10 +3602,13 @@ impl Browser {
                         this.entries.clear();
                         this.visible.clear();
                         this.sso = None;
-                        this.status = "Đã đăng nhập bằng SSO".into();
+                        this.status = locale::text("sso.signed_in").into();
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -3560,14 +3627,17 @@ impl Browser {
             return;
         };
         let Some(request) = parse_assume_role(&text) else {
-            self.report("Cần role ARN, ví dụ: arn:aws:iam::123:role/tên".into());
+            self.report(locale::text("assume_role.arn_required").into());
             return;
         };
 
         let secret = match vault::secret_key(&stored.id) {
             Ok(secret) => secret,
             Err(error) => {
-                self.report(format!("Không đọc được khoá bí mật: {error}"));
+                self.report(locale::text_with(
+                    "error.read_secret_key",
+                    &[("{error}", &error.to_string())],
+                ));
                 return;
             }
         };
@@ -3583,7 +3653,8 @@ impl Browser {
             relaxed_checksums: stored.relaxed_checksums,
         };
 
-        self.status = format!("Đang nhận role {}…", request.role_arn).into();
+        self.status =
+            locale::text_with("assume_role.assuming", &[("{arn}", &request.role_arn)]).into();
 
         let assuming = Tokio::spawn(cx, async move {
             let credentials = s3core::sts::assume_role(&base, &request).await?;
@@ -3606,20 +3677,26 @@ impl Browser {
                         // Saying when it runs out matters: everything signed with
                         // this session, presigned URLs included, dies with it.
                         this.status = match expires_at {
-                            Some(at) => format!(
-                                "Đã nhận role, phiên hết hạn {}",
-                                format_timestamp(
-                                    at.duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as i64)
-                                        .unwrap_or(0)
-                                )
+                            Some(at) => locale::text_with(
+                                "assume_role.assumed_expires",
+                                &[(
+                                    "{expires}",
+                                    &format_timestamp(
+                                        at.duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs() as i64)
+                                            .unwrap_or(0),
+                                    ),
+                                )],
                             )
                             .into(),
-                            None => "Đã nhận role".into(),
+                            None => locale::text("assume_role.assumed").into(),
                         };
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -4200,8 +4277,8 @@ impl Browser {
             return;
         };
         self.confirm = Some(Confirm {
-            title: format!("Xoá profile {}?", profile.name).into(),
-            detail: "Xoá cả khoá trong Keychain. Dữ liệu trên S3 giữ nguyên.".into(),
+            title: locale::text_with("profile.remove_title", &[("{name}", &profile.name)]).into(),
+            detail: locale::text("profile.remove_detail").into(),
             doomed: Vec::new(),
             version: None,
             empty_bucket: None,
@@ -4216,7 +4293,10 @@ impl Browser {
         }
         let profile = self.profiles.remove(index);
         if let Err(error) = vault::delete_secret_key(&profile.id) {
-            self.report(format!("Không xoá được khoá: {error}"));
+            self.report(locale::text_with(
+                "error.delete_secret_key",
+                &[("{error}", &error.to_string())],
+            ));
         }
         self.save_profiles();
 
@@ -4228,7 +4308,7 @@ impl Browser {
             self.entries.clear();
             self.visible.clear();
             self.active_profile = None;
-            self.status = "Đã xoá profile đang dùng".into();
+            self.status = locale::text("profile.removed_active").into();
         } else if let Some(active) = self.active_profile {
             // Indices after the removed one shift down by one.
             if active > index {
@@ -4409,7 +4489,7 @@ impl Browser {
             return;
         }
 
-        self.status = format!("Đang xoá {} mục…", doomed.len()).into();
+        self.status = locale::text_n("status.deleting_items", doomed.len()).into();
         let reopen = (bucket.clone(), self.prefix.clone());
 
         let deleting = Tokio::spawn(
@@ -4423,17 +4503,20 @@ impl Browser {
                 match outcome {
                     Ok(Ok(report)) => {
                         if report.errors.is_empty() {
-                            this.status = format!("Đã xoá {} key", report.deleted).into();
+                            this.status =
+                                locale::text_n("status.deleted_keys", report.deleted).into();
                         } else {
                             // The whole reason the log holds more than one:
                             // a batch delete fails per key, and the summary
                             // has to say how many while the detail keeps
                             // every one of them.
                             this.fail(Failure::known(
-                                &format!(
-                                    "Xoá được {} key, {} key lỗi",
-                                    report.deleted,
-                                    report.errors.len()
+                                &locale::text_with(
+                                    "status.deleted_keys_partial",
+                                    &[
+                                        ("{ok}", &report.deleted.to_string()),
+                                        ("{failed}", &report.errors.len().to_string()),
+                                    ],
                                 ),
                                 report.errors.join("\n"),
                                 None,
@@ -4442,7 +4525,10 @@ impl Browser {
                         this.open(reopen.0, reopen.1, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -4456,7 +4542,7 @@ impl Browser {
     /// Queues everything dropped from the file manager into the open prefix.
     fn start_uploads(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
-            self.report("Chưa mở bucket nào để tải lên".into());
+            self.report(locale::text("upload.no_bucket_open").into());
             return;
         };
 
@@ -4464,7 +4550,7 @@ impl Browser {
         let prefix = self.prefix.clone();
         let count = paths.len();
         self.drawer_open = true;
-        self.status = format!("Đang xếp {count} mục vào hàng đợi…").into();
+        self.status = locale::text_n("status.queueing_items", count).into();
 
         let queueing = Tokio::spawn(cx, async move {
             engine
@@ -4478,10 +4564,13 @@ impl Browser {
                 match outcome {
                     Ok(Ok(ids)) => {
                         debug_log!("queued {} uploads", ids.len());
-                        this.status = format!("Đã xếp {} tệp vào hàng đợi", ids.len()).into();
+                        this.status = locale::text_n("status.queued_files", ids.len()).into();
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 this.start_ticking(cx);
                 cx.notify();
@@ -4534,14 +4623,14 @@ impl Browser {
         }
 
         let Some(destination) = dirs::download_dir().or_else(dirs::home_dir) else {
-            self.report("Không tìm được thư mục Downloads".into());
+            self.report(locale::text("download.no_downloads_dir").into());
             return;
         };
 
         let engine = self.transfers.clone();
         let prefix = self.prefix.clone();
         self.drawer_open = true;
-        self.status = "Đang chuẩn bị tải xuống…".into();
+        self.status = locale::text("status.preparing_download").into();
 
         let queueing = Tokio::spawn(cx, async move {
             // (key, path under the destination). Expanding folders needs a
@@ -4581,13 +4670,16 @@ impl Browser {
                 match outcome {
                     Ok(Ok(ids)) => {
                         this.status = if ids.is_empty() {
-                            "Không có tệp nào để tải".into()
+                            locale::text("download.nothing_to_download").into()
                         } else {
-                            format!("Đang tải xuống {} tệp", ids.len()).into()
+                            locale::text_n("status.downloading_files", ids.len()).into()
                         }
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 this.start_ticking(cx);
                 cx.notify();
@@ -4613,7 +4705,7 @@ impl Browser {
     fn open_inspector(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.inspection_key_for_selection() else {
             if !self.selection.is_empty() {
-                self.report("Thư mục không có metadata".into());
+                self.report(locale::text("inspector.folder_no_metadata").into());
             }
             return;
         };
@@ -4648,6 +4740,27 @@ impl Browser {
             versions: Vec::new(),
         });
         self.load_inspection(key, cx);
+        cx.notify();
+    }
+
+    /// Opens the ACL permission table for `key`, from wherever a caller other
+    /// than the inspector itself needs it — right now, the share dialog's own
+    /// "permission table" button, since a presigned link is only as private
+    /// as the object's ACL.
+    ///
+    /// Reuses whatever inspector is already open for `key` rather than
+    /// re-fetching: `render_acl_popup` reads `self.inspector`, so this only
+    /// has to make sure that inspector is pointed at the right object before
+    /// the popup opens over whatever else is on screen.
+    fn open_acl_table_for(&mut self, key: String, cx: &mut Context<Self>) {
+        if self
+            .inspector
+            .as_ref()
+            .is_none_or(|inspector| inspector.key != key)
+        {
+            self.inspect_key(key, cx);
+        }
+        self.acl_popup_open = true;
         cx.notify();
     }
 
@@ -4704,7 +4817,10 @@ impl Browser {
                             inspector.acl = acl;
                         }
                         Ok(Err(error)) => this.report(format!("{error:?}")),
-                        Err(error) => this.report(format!("Task lỗi: {error}")),
+                        Err(error) => this.report(locale::text_with(
+                            "error.task_join",
+                            &[("{error}", &error.to_string())],
+                        )),
                     }
                 }
                 cx.notify();
@@ -4781,17 +4897,19 @@ impl Browser {
         let refusal = match kind {
             // Not a byte fetched: a PDF, an archive. Pulling eight megabytes
             // of one to end up drawing a label is paying for nothing.
-            PreviewKind::None => Some(Preview::Handoff("Không xem trước được kiểu này".into())),
+            PreviewKind::None => Some(Preview::Handoff(
+                locale::text("preview.unsupported_kind").into(),
+            )),
             PreviewKind::Image if size > self.settings.preview_limit_bytes() as i64 => {
                 Some(Preview::Handoff(
-                    format!(
-                        "Ảnh lớn hơn mức xem trước {} MB",
-                        self.settings.preview_limit_bytes() / (1024 * 1024)
+                    locale::text_n(
+                        "preview.image_too_large",
+                        self.settings.preview_limit_bytes() / (1024 * 1024),
                     )
                     .into(),
                 ))
             }
-            _ if size <= 0 => Some(Preview::Handoff("Tệp rỗng".into())),
+            _ if size <= 0 => Some(Preview::Handoff(locale::text("preview.empty_file").into())),
             _ => None,
         };
         if let Some(refusal) = refusal {
@@ -4827,7 +4945,10 @@ impl Browser {
                         }
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -4908,7 +5029,8 @@ impl Browser {
         if let Some(previewing) = self.previewing.as_mut() {
             previewing.saving = true;
         }
-        self.status = format!("Đang lưu {}…", entry_name_of(&key)).into();
+        self.status =
+            locale::text_with("status.saving_name", &[("{name}", &entry_name_of(&key))]).into();
 
         let target = key.clone();
         let writing = Tokio::spawn(cx, async move {
@@ -4937,7 +5059,11 @@ impl Browser {
                 }
                 match outcome {
                     Ok(Ok(())) => {
-                        this.status = format!("Đã lưu {}", entry_name_of(&key)).into();
+                        this.status = locale::text_with(
+                            "status.saved_name",
+                            &[("{name}", &entry_name_of(&key))],
+                        )
+                        .into();
                         this.previewing = None;
                         // The size and date on the row are now the old ones.
                         if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
@@ -4945,7 +5071,10 @@ impl Browser {
                         }
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &format!("{error:?}"))],
+                    )),
                 }
                 cx.notify();
             });
@@ -4957,6 +5086,19 @@ impl Browser {
         self.previewing = None;
         self.preview_task = None;
         cx.notify();
+    }
+
+    /// Whether the docked inspector panel belongs on screen right now.
+    ///
+    /// Hidden rather than left underneath once a preview is open: the preview
+    /// draws its own copy of the same metadata in its own side panel, and the
+    /// docked one showing dimly through the modal's scrim was two surfaces
+    /// answering the same question at once. `self.inspector` itself stays
+    /// put — the preview reads it for that side panel too — so this is purely
+    /// which panel gets drawn, not a data change, and the docked one is back
+    /// the moment the preview closes.
+    fn shows_docked_inspector(&self) -> bool {
+        self.screen == Screen::Objects && self.previewing.is_none()
     }
 
     /// Downloads to a temporary file and hands it to whatever the system opens
@@ -5065,7 +5207,7 @@ impl Browser {
                     let shown = path.display().to_string();
                     Self::hand_to_the_system(
                         path.into_os_string(),
-                        format!("Đã mở {shown}"),
+                        locale::text_with("status.opened_path", &[("{path}", &shown)]),
                         this,
                         cx,
                     )
@@ -5079,7 +5221,10 @@ impl Browser {
                 }
                 Err(error) => {
                     _ = this.update(cx, |this, cx| {
-                        this.report(format!("Task lỗi: {error}"));
+                        this.report(locale::text_with(
+                            "error.task_join",
+                            &[("{error}", &error.to_string())],
+                        ));
                         cx.notify();
                     });
                 }
@@ -5144,7 +5289,10 @@ impl Browser {
                         this.status = success.into();
                     }
                 }
-                Err(error) => this.report(format!("Không mở được: {error}")),
+                Err(error) => this.report(locale::text_with(
+                    "error.open_failed",
+                    &[("{error}", &error.to_string())],
+                )),
             }
             cx.notify();
         });
@@ -5167,8 +5315,10 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match found {
                     Ok(Some(update)) => {
-                        this.status =
-                            SharedString::from(format!("Có bản {} trên GitHub", update.version));
+                        this.status = SharedString::from(locale::text_with(
+                            "update.available_on_github",
+                            &[("{version}", &update.version)],
+                        ));
                         this.update = Some(update);
                     }
                     Ok(None) => {
@@ -5177,13 +5327,18 @@ impl Browser {
                         // that has been pulled is worse than no button.
                         this.update = None;
                         if announce {
-                            this.status =
-                                SharedString::from(format!("Đang chạy bản mới nhất ({current})"));
+                            this.status = SharedString::from(locale::text_with(
+                                "update.running_latest",
+                                &[("{current}", current)],
+                            ));
                         }
                     }
                     Err(error) => {
                         if announce {
-                            this.report(format!("Không kiểm tra được bản cập nhật: {error:?}"));
+                            this.report(locale::text_with(
+                                "update.check_failed",
+                                &[("{error}", &format!("{error:?}"))],
+                            ));
                         }
                     }
                 }
@@ -5203,7 +5358,8 @@ impl Browser {
         // thing that gets opened by hand later and believed.
         self.open_task = None;
         _ = std::fs::remove_file(&opening.path);
-        self.status = format!("Đã huỷ tải {}", opening.name).into();
+        self.status =
+            locale::text_with("status.download_canceled", &[("{name}", &opening.name)]).into();
         cx.notify();
     }
 
@@ -5237,11 +5393,11 @@ impl Browser {
             return;
         };
         self.confirm = Some(Confirm {
-            title: format!("Dọn sạch {bucket}?").into(),
+            title: locale::text_with("empty_bucket.title", &[("{bucket}", &bucket)]).into(),
             detail: if self.bucket_versioned {
-                "Xoá mọi object và mọi phiên bản. Vĩnh viễn.".into()
+                locale::text("empty_bucket.detail_versioned").into()
             } else {
-                "Xoá mọi object. Không hoàn tác được.".into()
+                locale::text("empty_bucket.detail").into()
             },
             doomed: Vec::new(),
             version: None,
@@ -5255,7 +5411,7 @@ impl Browser {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.status = format!("Đang dọn {bucket}…").into();
+        self.status = locale::text_with("empty_bucket.emptying", &[("{bucket}", &bucket)]).into();
         let reopen = bucket.clone();
 
         let emptying = Tokio::spawn(
@@ -5268,16 +5424,24 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(report)) if report.errors.is_empty() => {
-                        this.status = format!("Đã xoá {} mục", report.deleted).into();
+                        this.status = locale::text_n("empty_bucket.deleted", report.deleted).into();
                     }
-                    Ok(Ok(report)) => this.report(format!(
-                        "Xoá {} mục, {} lỗi: {}",
-                        report.deleted,
-                        report.errors.len(),
-                        report.errors.first().cloned().unwrap_or_default()
+                    Ok(Ok(report)) => this.report(locale::text_with(
+                        "empty_bucket.partial",
+                        &[
+                            ("{ok}", &report.deleted.to_string()),
+                            ("{failed}", &report.errors.len().to_string()),
+                            (
+                                "{first_error}",
+                                &report.errors.first().cloned().unwrap_or_default(),
+                            ),
+                        ],
                     )),
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 this.open(reopen, String::new(), cx);
                 cx.notify();
@@ -5305,11 +5469,14 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => {
-                        this.status = "Đã khôi phục version, bản cũ vẫn còn trong lịch sử".into();
+                        this.status = locale::text("version.restored").into();
                         this.load_inspection(reload, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -5325,11 +5492,11 @@ impl Browser {
             "version"
         };
         self.confirm = Some(Confirm {
-            title: format!("Xoá hẳn {what} này?").into(),
+            title: locale::text_with("version.delete_confirm_title", &[("{what}", what)]).into(),
             detail: if version.is_delete_marker {
-                "Xoá delete marker sẽ làm object hiện lại như trước khi bị xoá.".into()
+                locale::text("version.delete_marker_detail").into()
             } else {
-                "Version bị xoá là mất hẳn, khác với xoá thường trong bucket versioning.".into()
+                locale::text("version.delete_detail").into()
             },
             doomed: Vec::new(),
             version: Some((version.key, version.version_id)),
@@ -5354,11 +5521,14 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => {
-                        this.status = "Đã xoá version".into();
+                        this.status = locale::text("version.deleted").into();
                         this.load_inspection(reload, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -5387,11 +5557,14 @@ impl Browser {
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(())) => {
-                        this.status = "Đã yêu cầu khôi phục, có thể mất vài giờ".into();
+                        this.status = locale::text("restore.requested").into();
                         this.load_inspection(reload, cx);
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -5423,7 +5596,7 @@ impl Browser {
             return;
         };
 
-        self.status = format!("Đang liệt kê {prefix}…").into();
+        self.status = locale::text_with("acl.listing_folder", &[("{prefix}", &prefix)]).into();
         let listing_bucket = bucket.clone();
         let listing_prefix = prefix.clone();
         let listing = Tokio::spawn(cx, async move {
@@ -5459,15 +5632,26 @@ impl Browser {
                             // partial pass over permissions is the kind of
                             // half-done nobody should find out about later.
                             this.fail(Failure::known(
-                                "Thư mục quá lớn, chỉ đổi quyền phần đã liệt kê",
-                                format!("{prefix}: {} object đầu tiên", keys.len()),
+                                locale::text("acl.folder_too_large"),
+                                locale::text_with(
+                                    "acl.folder_too_large_detail",
+                                    &[("{prefix}", &prefix), ("{n}", &keys.len().to_string())],
+                                ),
                                 None,
                             ));
                         }
-                        this.start_bulk("Đổi quyền", keys, BulkOp::Acl(canned), cx);
+                        this.start_bulk(
+                            locale::text("bulk.change_permissions"),
+                            keys,
+                            BulkOp::Acl(canned),
+                            cx,
+                        );
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error:?}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &format!("{error:?}"))],
+                    )),
                 }
                 cx.notify();
             });
@@ -5495,7 +5679,12 @@ impl Browser {
                     .map(|inspector| inspector.key.clone()),
             );
         }
-        self.start_bulk("Đổi quyền", keys, BulkOp::Acl(canned), cx);
+        self.start_bulk(
+            locale::text("bulk.change_permissions"),
+            keys,
+            BulkOp::Acl(canned),
+            cx,
+        );
     }
 
     fn remove_tag(&mut self, tag_key: String, cx: &mut Context<Self>) {
@@ -5526,7 +5715,10 @@ impl Browser {
                 match outcome {
                     Ok(Ok(())) => this.load_inspection(reload, cx),
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -5542,7 +5734,7 @@ impl Browser {
             return;
         };
         let Some((name, value)) = parse_tag(&text) else {
-            self.report("Thẻ phải có dạng khoá=giá trị".into());
+            self.report(locale::text("tags.format_hint").into());
             return;
         };
 
@@ -5563,7 +5755,10 @@ impl Browser {
                 match outcome {
                     Ok(Ok(())) => this.load_inspection(reload, cx),
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -5578,7 +5773,7 @@ impl Browser {
             return;
         };
         if key.ends_with('/') {
-            self.report("Không tạo được link cho thư mục".into());
+            self.report(locale::text("share.folder_unsupported").into());
             return;
         }
 
@@ -5610,7 +5805,7 @@ impl Browser {
             return;
         };
         if key.ends_with('/') {
-            self.report("Không tạo được link cho thư mục".into());
+            self.report(locale::text("share.folder_unsupported").into());
             return;
         }
 
@@ -5659,7 +5854,10 @@ impl Browser {
                         }
                     }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 cx.notify();
             });
@@ -5668,7 +5866,7 @@ impl Browser {
 
     fn copy_to_clipboard(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        self.status = format!("Đã chép {what}").into();
+        self.status = locale::text_with("status.copied", &[("{what}", what)]).into();
         cx.notify();
     }
 
@@ -5707,7 +5905,11 @@ impl Browser {
         };
         let text = location_text(&bucket, &keys, as_path);
 
-        let what = if as_path { "đường dẫn" } else { "key" };
+        let what = if as_path {
+            locale::text("common.path")
+        } else {
+            "key"
+        };
         self.copy_to_clipboard(text, what, cx);
     }
 
@@ -5735,7 +5937,7 @@ impl Browser {
             relaxed_checksums: profile.relaxed_checksums,
         };
         let url = s3core::public_url(&profile, &bucket, &share.key);
-        self.copy_to_clipboard(url, "URL công khai", cx);
+        self.copy_to_clipboard(url, locale::text("share.public_url"), cx);
     }
 
     /// Opens the rename prompt, but only for a single entry: renaming several
@@ -5836,10 +6038,13 @@ impl Browser {
             return;
         }
 
-        self.status = format!(
-            "{} {} mục",
-            if cut { "Đã cắt" } else { "Đã chép" },
-            entries.len()
+        self.status = locale::text_with(
+            if cut {
+                "status.cut_items"
+            } else {
+                "status.copied_items"
+            },
+            &[("{n}", &entries.len().to_string())],
         )
         .into();
         self.clipboard = Some(Clipboard {
@@ -5872,7 +6077,7 @@ impl Browser {
                 .iter()
                 .all(|entry| parent_prefix_of(&entry.key) == prefix)
         {
-            self.report("Đã ở đúng thư mục này".into());
+            self.report(locale::text("paste.already_here").into());
             return;
         }
 
@@ -5880,7 +6085,7 @@ impl Browser {
         let source_bucket = clipboard.bucket.to_string();
         let target_bucket = bucket.to_string();
         let entries = clipboard.entries.clone();
-        self.status = format!("Đang dán {} mục…", entries.len()).into();
+        self.status = locale::text_n("status.pasting_items", entries.len()).into();
 
         let pasting = Tokio::spawn(cx, async move {
             let mut moved = 0usize;
@@ -5937,17 +6142,23 @@ impl Browser {
             let (moved, errors) = pasting.await.unwrap_or((0, Vec::new()));
             _ = this.update(cx, |this, cx| {
                 if errors.is_empty() {
-                    this.status = format!("Đã dán {moved} mục").into();
+                    this.status = locale::text_n("status.pasted_items", moved).into();
                     // A cut is spent once pasted; a copy stays for pasting again,
                     // which is what both Finder and Explorer do.
                     if cut {
                         this.clipboard = None;
                     }
                 } else {
-                    this.report(format!(
-                        "Dán {moved} mục, {} lỗi: {}",
-                        errors.len(),
-                        errors.first().cloned().unwrap_or_default()
+                    this.report(locale::text_with(
+                        "status.pasted_items_partial",
+                        &[
+                            ("{moved}", &moved.to_string()),
+                            ("{failed}", &errors.len().to_string()),
+                            (
+                                "{first_error}",
+                                &errors.first().cloned().unwrap_or_default(),
+                            ),
+                        ],
                     ));
                 }
                 if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
@@ -5978,18 +6189,19 @@ impl Browser {
             return;
         };
         let Some(target) = renamed_key(&key, &new_name) else {
-            self.report("Tên không hợp lệ".into());
+            self.report(locale::text("validation.invalid_name").into());
             return;
         };
         if target == key {
-            self.report("Tên bản sao phải khác tên gốc".into());
+            self.report(locale::text("duplicate.name_must_differ").into());
             return;
         }
 
         let bucket_name = bucket.to_string();
         let source = key.clone();
         let destination = target.clone();
-        self.status = format!("Đang sao chép {}…", entry_name_of(&key)).into();
+        self.status =
+            locale::text_with("status.duplicating", &[("{name}", &entry_name_of(&key))]).into();
 
         let copying = Tokio::spawn(cx, async move {
             client
@@ -6001,9 +6213,16 @@ impl Browser {
             let outcome = copying.await;
             _ = this.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok(())) => this.status = format!("Đã sao chép thành {new_name}").into(),
+                    Ok(Ok(())) => {
+                        this.status =
+                            locale::text_with("status.duplicated_as", &[("{name}", &new_name)])
+                                .into()
+                    }
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
                     this.open(bucket, prefix, cx);
@@ -6023,7 +6242,7 @@ impl Browser {
             return;
         };
         if key.ends_with('/') {
-            self.report("Chưa hỗ trợ sao chép thư mục".into());
+            self.report(locale::text("duplicate.folder_unsupported").into());
             return;
         }
         let key = key.clone();
@@ -6037,7 +6256,7 @@ impl Browser {
             return;
         };
         let Some(target) = renamed_key(&key, &new_name) else {
-            self.report("Tên mới không hợp lệ".into());
+            self.report(locale::text("rename.invalid_name").into());
             return;
         };
         if target == key {
@@ -6063,23 +6282,33 @@ impl Browser {
             }
         });
 
-        self.status = format!("Đang đổi tên {}…", entry_name_of(&key)).into();
+        self.status =
+            locale::text_with("status.renaming", &[("{name}", &entry_name_of(&key))]).into();
         let task = cx.spawn(async move |this, cx| {
             let outcome = renaming.await;
             _ = this.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(errors)) if errors.is_empty() => {
-                        this.status = format!("Đã đổi tên thành {new_name}").into();
+                        this.status =
+                            locale::text_with("status.renamed_to", &[("{name}", &new_name)]).into();
                     }
                     // A partial move leaves keys on both sides; saying "done"
                     // would send the user away from the ones still stuck.
-                    Ok(Ok(errors)) => this.report(format!(
-                        "Đổi tên chưa xong: {} mục lỗi. {}",
-                        errors.len(),
-                        errors.first().cloned().unwrap_or_default()
+                    Ok(Ok(errors)) => this.report(locale::text_with(
+                        "rename.partial",
+                        &[
+                            ("{failed}", &errors.len().to_string()),
+                            (
+                                "{first_error}",
+                                &errors.first().cloned().unwrap_or_default(),
+                            ),
+                        ],
                     )),
                     Ok(Err(error)) => this.report(format!("{error:?}")),
-                    Err(error) => this.report(format!("Task lỗi: {error}")),
+                    Err(error) => this.report(locale::text_with(
+                        "error.task_join",
+                        &[("{error}", &error.to_string())],
+                    )),
                 }
                 this.selection.clear();
                 if let (Some(bucket), prefix) = (this.bucket.clone(), this.prefix.clone()) {
@@ -7164,23 +7393,29 @@ impl Browser {
                                         .flex_col()
                                         .gap_1()
                                         .text_color(theme.text)
-                                        .child(SharedString::from(format!(
-                                            "Lỗi ({failure_count})"
+                                        .child(SharedString::from(locale::text_n(
+                                            "failures.title",
+                                            failure_count,
                                         )))
                                         .when(distinct_count < failure_count, |this| {
                                             this.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.text_faint)
-                                                    .child(SharedString::from(format!(
-                                                        "{distinct_count} loại lỗi, đã gộp các lỗi trùng"
-                                                    ))),
+                                                div().text_xs().text_color(theme.text_faint).child(
+                                                    SharedString::from(locale::text_n(
+                                                        "failures.distinct_count",
+                                                        distinct_count,
+                                                    )),
+                                                ),
                                             )
                                         }),
                                 )
                                 .when(!self.failures.is_empty(), |this| {
                                     this.child(
-                                        action_button("failures-clear", "Xoá hết", theme).on_click(
+                                        action_button(
+                                            "failures-clear",
+                                            locale::text("common.clear_all"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.failures.clear();
                                                 this.failures_open = false;
@@ -7306,14 +7541,17 @@ impl Browser {
                                                             SharedString::from(format!(
                                                                 "failure-copy-{index}"
                                                             )),
-                                                            "Chép chi tiết".into(),
+                                                            locale::text("failures.copy_detail")
+                                                                .into(),
                                                             theme,
                                                         )
                                                         .on_click(cx.listener(
                                                             move |this, _event, _window, cx| {
                                                                 this.copy_to_clipboard(
                                                                     detail.clone(),
-                                                                    "chi tiết lỗi",
+                                                                    locale::text(
+                                                                        "failures.error_detail",
+                                                                    ),
                                                                     cx,
                                                                 )
                                                             },
@@ -7327,7 +7565,7 @@ impl Browser {
                                         div()
                                             .text_xs()
                                             .text_color(theme.text_faint)
-                                            .child("Chưa có lỗi nào"),
+                                            .child(locale::text("failures.none")),
                                     )
                                 }),
                         ),
@@ -7465,14 +7703,15 @@ impl Browser {
                             .min_w(px(0.))
                             .text_sm()
                             .text_color(theme.text)
-                            .child("Tất cả bucket"),
+                            .child(locale::text("nav.all_buckets")),
                     )
-                    .child(action_button("buckets-refresh", "Làm mới", theme).on_click(
-                        cx.listener(|this, _event, _window, cx| {
-                            this.bucket_cache_bypass = true;
-                            this.refresh_buckets(cx);
-                        }),
-                    ))
+                    .child(
+                        action_button("buckets-refresh", locale::text("buckets.refresh"), theme)
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.bucket_cache_bypass = true;
+                                this.refresh_buckets(cx);
+                            })),
+                    )
                     .child(
                         icon_button("buckets-close", "close", theme).on_click(cx.listener(
                             |this, _event, _window, cx| {
@@ -7496,8 +7735,17 @@ impl Browser {
                     .border_color(theme.border)
                     .text_xs()
                     .text_color(theme.text_faint)
-                    .child(div().flex_1().min_w(px(0.)).child("Tên"))
-                    .child(div().w(px(BUCKET_CREATED_WIDTH)).child("Ngày tạo")),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(locale::text("sort.name")),
+                    )
+                    .child(
+                        div()
+                            .w(px(BUCKET_CREATED_WIDTH))
+                            .child(locale::text("buckets.created")),
+                    ),
             )
             .when(buckets.is_empty(), |this| {
                 this.child(
@@ -7513,7 +7761,7 @@ impl Browser {
                             div()
                                 .text_sm()
                                 .text_color(theme.text_muted)
-                                .child("Chưa thấy bucket nào"),
+                                .child(locale::text("buckets.none_found")),
                         ),
                 )
             })
@@ -7646,12 +7894,15 @@ impl Browser {
                             .min_w(px(0.))
                             .text_sm()
                             .text_color(theme.text)
-                            .child("Gần đây"),
+                            .child(locale::text("nav.recent")),
                     )
                     .when(!recent.is_empty(), |this| {
-                        this.child(action_button("recent-clear", "Xoá hết", theme).on_click(
-                            cx.listener(|this, _event, _window, cx| this.clear_recent(cx)),
-                        ))
+                        this.child(
+                            action_button("recent-clear", locale::text("common.clear_all"), theme)
+                                .on_click(
+                                    cx.listener(|this, _event, _window, cx| this.clear_recent(cx)),
+                                ),
+                        )
                     })
                     .child(
                         icon_button("recent-close", "close", theme).on_click(cx.listener(
@@ -7676,13 +7927,13 @@ impl Browser {
                             div()
                                 .text_sm()
                                 .text_color(theme.text_muted)
-                                .child("Chưa đi đâu cả"),
+                                .child(locale::text("recent.none_yet")),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.text_faint)
-                                .child("Thư mục bạn mở sẽ hiện ở đây"),
+                                .child(locale::text("recent.none_yet_detail")),
                         ),
                 )
             })
@@ -7772,13 +8023,13 @@ impl Browser {
             Some(Preview::Text(_)) | Some(Preview::Table(_))
         ) && !self.preview_is_whole();
         let preview_note: SharedString = if truncated {
-            format!("Chỉ hiện {limit_mb} MB đầu — không sửa trực tiếp được").into()
+            locale::text_n("preview.note.truncated", limit_mb).into()
         } else if previewing.content.is_none() {
-            "Đang tải nội dung".into()
+            locale::text("preview.note.loading_content").into()
         } else if self.preview_is_whole() {
-            "Toàn bộ object".into()
+            locale::text("preview.note.whole_object").into()
         } else {
-            "Xem trước".into()
+            locale::text("command.preview").into()
         };
         let size_text: SharedString = format_size(previewing.size).into();
         let editable = previewing.editing.is_none()
@@ -7790,7 +8041,7 @@ impl Browser {
             .find(|entry| entry.key == previewing.key)
             .and_then(|entry| entry.modified_epoch)
             .map(format_timestamp)
-            .unwrap_or_else(|| "Không rõ".into());
+            .unwrap_or_else(|| locale::text("common.unknown").into());
         let content_type = self
             .inspector
             .as_ref()
@@ -7804,16 +8055,16 @@ impl Browser {
             .unwrap_or_else(|| {
                 kind.as_ref()
                     .map(SharedString::to_string)
-                    .unwrap_or_else(|| "Không rõ".into())
+                    .unwrap_or_else(|| locale::text("common.unknown").into())
             });
         let state_text: SharedString = if truncated {
-            format!("Giới hạn {limit_mb} MB").into()
+            locale::text_n("preview.state.limited", limit_mb).into()
         } else if previewing.content.is_none() {
-            "Đang tải".into()
+            locale::text("preview.state.loading").into()
         } else if self.preview_is_whole() {
-            "Đủ nội dung".into()
+            locale::text("preview.state.full_content").into()
         } else {
-            "Xem nhanh".into()
+            locale::text("preview.state.quick_view").into()
         };
         let preview_inspector = self
             .inspector
@@ -7841,7 +8092,7 @@ impl Browser {
                             .pt_2()
                             .text_xs()
                             .text_color(theme.text_muted)
-                            .child("Đang lưu…"),
+                            .child(locale::text("detail.saving")),
                     )
                 })
                 .into_any_element()
@@ -7854,7 +8105,7 @@ impl Browser {
                     .justify_center()
                     .text_xs()
                     .text_color(theme.text_faint)
-                    .child("Đang tải…")
+                    .child(locale::text("detail.loading_ellipsis"))
                     .into_any_element(),
                 Some(Preview::Image(image)) => div()
                     .relative()
@@ -7919,26 +8170,56 @@ impl Browser {
             .flex_col()
             .gap_2()
             .child(
-                preview_detail_section("THUỘC TÍNH", theme)
-                    .child(preview_detail_row("Loại", content_type, theme))
-                    .child(preview_detail_row("Cỡ", size_text.to_string(), theme))
-                    .child(preview_detail_row("Sửa đổi", modified_text, theme))
+                preview_detail_section(locale::text("detail.section.properties"), theme)
                     .child(preview_detail_row(
-                        "Trạng thái",
+                        locale::text("detail.type"),
+                        content_type,
+                        theme,
+                    ))
+                    .child(preview_detail_row(
+                        locale::text("detail.size"),
+                        size_text.to_string(),
+                        theme,
+                    ))
+                    .child(preview_detail_row(
+                        locale::text("detail.modified"),
+                        modified_text,
+                        theme,
+                    ))
+                    .child(preview_detail_row(
+                        locale::text("detail.status"),
                         state_text.to_string(),
                         theme,
                     ))
                     .when_some(
                         preview_head.and_then(|head| head.storage_class.clone()),
-                        |this, value| this.child(preview_detail_row("Lớp lưu trữ", value, theme)),
+                        |this, value| {
+                            this.child(preview_detail_row(
+                                locale::text("detail.storage_class"),
+                                value,
+                                theme,
+                            ))
+                        },
                     )
                     .when_some(
                         preview_head.and_then(|head| head.cache_control.clone()),
-                        |this, value| this.child(preview_detail_row("Cache", value, theme)),
+                        |this, value| {
+                            this.child(preview_detail_row(
+                                locale::text("detail.cache_control"),
+                                value,
+                                theme,
+                            ))
+                        },
                     )
                     .when_some(
                         preview_head.and_then(|head| head.content_disposition.clone()),
-                        |this, value| this.child(preview_detail_row("Trả về", value, theme)),
+                        |this, value| {
+                            this.child(preview_detail_row(
+                                locale::text("detail.content_disposition"),
+                                value,
+                                theme,
+                            ))
+                        },
                     )
                     .when_some(
                         preview_head
@@ -7950,13 +8231,13 @@ impl Browser {
                         this.child(
                             div()
                                 .text_color(theme.text_faint)
-                                .child("Đang đọc thêm metadata…"),
+                                .child(locale::text("detail.loading_more_metadata")),
                         )
                     }),
             )
             .when_some(acl_unavailable, |this, (summary, detail)| {
                 this.child(
-                    preview_detail_section("QUYỀN TRUY CẬP", theme)
+                    preview_detail_section(locale::text("detail.section.access"), theme)
                         .child(acl_unavailable_notice(summary, detail, theme)),
                 )
             })
@@ -7964,47 +8245,57 @@ impl Browser {
                 let public = preview_acl
                     .as_ref()
                     .is_some_and(|acl| acl.grants.iter().any(|grant| grant.public));
-                let section = preview_detail_section("QUYỀN TRUY CẬP", theme).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(acl_status_chip(public, theme))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(preview_acl_target.clone())),
-                        ),
-                );
+                let section = preview_detail_section(locale::text("detail.section.access"), theme)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(acl_status_chip(public, theme))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(preview_acl_target.clone())),
+                            ),
+                    );
 
                 let section = if let Some(acl) = preview_acl {
                     section
                         .child(preview_detail_row(
-                            "Chủ sở hữu",
+                            locale::text("acl.owner"),
                             elide_middle(&grantee_label(&acl.owner), 28),
                             theme,
                         ))
                         .child(
-                            action_button("preview-acl-table", "Bảng quyền", theme).on_click(
-                                cx.listener(|this, _event, _window, cx| {
+                            action_button(
+                                "preview-acl-table",
+                                locale::text("acl.table_button"),
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
                                     this.acl_popup_open = true;
                                     cx.notify();
-                                }),
-                            ),
+                                },
+                            )),
                         )
                 } else {
                     section.child(div().text_color(theme.text_faint).child(if head_loading {
-                        "Đang đọc ACL…"
+                        locale::text("acl.loading")
                     } else {
-                        "Chưa có ACL đọc được, vẫn có thể thử đặt ACL canned."
+                        locale::text("acl.unread_hint")
                     }))
                 };
 
                 this.child(
                     section
-                        .child(div().text_color(theme.text_faint).child("Preset nhanh"))
+                        .child(
+                            div()
+                                .text_color(theme.text_faint)
+                                .child(locale::text("acl.quick_presets")),
+                        )
                         .child(div().flex().flex_wrap().gap_1().children(
                             s3core::CANNED_ACLS.iter().map(|canned| {
                                 let canned = *canned;
@@ -8022,21 +8313,26 @@ impl Browser {
             })
             .when(self.supports(|caps| caps.tagging), |this| {
                 this.child(
-                    preview_detail_section("THẺ", theme)
-                        .child(div().flex().items_center().justify_end().child(
-                            action_button("preview-add-tag", "Thêm", theme).on_click(cx.listener(
-                                |this, _event, window, cx| {
-                                    this.open_form(FormKind::AddTag, window, cx)
-                                },
-                            )),
-                        ))
+                    preview_detail_section(locale::text("detail.section.tags"), theme)
+                        .child(
+                            div().flex().items_center().justify_end().child(
+                                action_button("preview-add-tag", locale::text("tags.add"), theme)
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.open_form(FormKind::AddTag, window, cx)
+                                    })),
+                            ),
+                        )
                         .children(preview_tags.iter().map(|(name, value)| {
                             div()
                                 .text_color(theme.text)
                                 .child(SharedString::from(format!("{name} = {value}")))
                         }))
                         .when(preview_tags.is_empty(), |this| {
-                            this.child(div().text_color(theme.text_faint).child("Chưa có thẻ nào"))
+                            this.child(
+                                div()
+                                    .text_color(theme.text_faint)
+                                    .child(locale::text("tags.empty")),
+                            )
                         }),
                 )
             });
@@ -8104,15 +8400,20 @@ impl Browser {
                                 )),
                             )
                             .child(
-                                detail_action_button("preview-share", "Chia sẻ", "link", theme)
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.start_share_current(cx)
-                                    })),
+                                detail_action_button(
+                                    "preview-share",
+                                    locale::text("detail.share"),
+                                    "link",
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| this.start_share_current(cx),
+                                )),
                             )
                             .child(
                                 detail_action_button(
                                     "preview-open-external",
-                                    "Mở app",
+                                    locale::text("detail.open_app"),
                                     "external",
                                     theme,
                                 )
@@ -8125,7 +8426,7 @@ impl Browser {
                             .child(
                                 detail_action_button(
                                     "preview-download",
-                                    "Tải xuống",
+                                    locale::text("command.download"),
                                     "download",
                                     theme,
                                 )
@@ -8189,7 +8490,12 @@ impl Browser {
                                 )
                                 .when(editable, |this| {
                                     this.child(
-                                        action_button("preview-edit", "Sửa", theme).on_click(
+                                        action_button(
+                                            "preview-edit",
+                                            locale::text("detail.edit"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(|this, _event, window, cx| {
                                                 this.start_editing(window, cx)
                                             }),
@@ -8198,14 +8504,24 @@ impl Browser {
                                 })
                                 .when(previewing.editing.is_some(), |this| {
                                     this.child(
-                                        action_button("preview-cancel", "Huỷ", theme).on_click(
+                                        action_button(
+                                            "preview-cancel",
+                                            locale::text("common.cancel"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.cancel_editing(cx)
                                             }),
                                         ),
                                     )
                                     .child(
-                                        action_button("preview-save", "Lưu", theme).on_click(
+                                        action_button(
+                                            "preview-save",
+                                            locale::text("common.save"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.save_edit(cx)
                                             }),
@@ -8963,12 +9279,11 @@ impl Browser {
             // nothing to go looking for.
             .when(!self.filter.is_empty() && self.bucket.is_some(), |this| {
                 this.child(
-                    action_button("search-run", "Tìm cả bucket", theme).on_click(cx.listener(
-                        |this, _event, _window, cx| {
+                    action_button("search-run", locale::text("toolbar.search_bucket"), theme)
+                        .on_click(cx.listener(|this, _event, _window, cx| {
                             let query = this.filter.clone();
                             this.start_search(query, cx);
-                        },
-                    )),
+                        })),
                 )
             })
             .when(bucket.is_some(), |this| {
@@ -8987,7 +9302,8 @@ impl Browser {
                                     this.bg(theme.selected)
                                 })
                                 .tooltip(|window, cx| {
-                                    Tooltip::new("Hiển thị dạng danh sách").build(window, cx)
+                                    Tooltip::new(locale::text("toolbar.list_view"))
+                                        .build(window, cx)
                                 })
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.layout = LayoutMode::List;
@@ -9002,7 +9318,8 @@ impl Browser {
                                     this.bg(theme.selected)
                                 })
                                 .tooltip(|window, cx| {
-                                    Tooltip::new("Hiển thị dạng lưới").build(window, cx)
+                                    Tooltip::new(locale::text("toolbar.grid_view"))
+                                        .build(window, cx)
                                 })
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.layout = LayoutMode::Grid;
@@ -9013,9 +9330,10 @@ impl Browser {
             })
             .when(bucket.is_some(), |this| {
                 this.child(
-                    action_button("new-folder", "Thư mục mới", theme).on_click(cx.listener(
-                        |this, _event, window, cx| this.open_form(FormKind::NewFolder, window, cx),
-                    )),
+                    action_button("new-folder", locale::text("command.new_folder"), theme)
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.open_form(FormKind::NewFolder, window, cx)
+                        })),
                 )
             })
             .when(!self.selection.is_empty(), |this| {
@@ -9025,7 +9343,8 @@ impl Browser {
                     this.child(
                         icon_button("selection-details", "info", theme)
                             .tooltip(|window, cx| {
-                                Tooltip::new("Chi tiết / phân quyền").build(window, cx)
+                                Tooltip::new(locale::text("toolbar.details_permissions"))
+                                    .build(window, cx)
                             })
                             .on_click(
                                 cx.listener(|this, _event, _window, cx| this.open_inspector(cx)),
@@ -9033,10 +9352,14 @@ impl Browser {
                     )
                 })
                 .child(
-                    danger_button("delete", SharedString::from(format!("Xoá {count}")), theme)
-                        .on_click(
-                            cx.listener(|this, _event, _window, cx| this.ask_delete_selection(cx)),
-                        ),
+                    danger_button(
+                        "delete",
+                        SharedString::from(locale::text_n("toolbar.delete_n", count)),
+                        theme,
+                    )
+                    .on_click(
+                        cx.listener(|this, _event, _window, cx| this.ask_delete_selection(cx)),
+                    ),
                 )
             })
             // Every command, reachable with a mouse. The palette holds the ones
@@ -9076,53 +9399,53 @@ impl Browser {
 
         if bucket_scoped {
             let known = self.known_bucket_shortcuts();
-            return Some(div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .w(px(520.))
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .rounded_xl()
-                        .bg(theme.modal)
-                        .border_1()
-                        .border_color(theme.border_strong)
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(sized_icon("bucket", 18., theme.accent))
-                                .child(
-                                    div()
-                                        .text_color(theme.text)
-                                        .child("Profile này không được liệt kê bucket"),
-                                ),
-                        )
-                        .child(div().text_xs().child(wrapped_text(
-                            "Kết nối đã thành công, nhưng token không có quyền ListBuckets. Nếu token được cấp quyền trên một vài bucket cụ thể, mở trực tiếp bằng tên bucket hoặc s3://bucket/prefix/.",
-                            68,
-                            theme.text_muted,
-                        )))
-                        .when(!known.is_empty(), |this| {
-                            this.child(
+            return Some(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(520.))
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .rounded_xl()
+                            .bg(theme.modal)
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .child(
                                 div()
                                     .flex()
-                                    .flex_col()
+                                    .items_center()
                                     .gap_2()
+                                    .child(sized_icon("bucket", 18., theme.accent))
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(theme.text_faint)
-                                            .child("Bucket đã biết"),
-                                    )
-                                    .child(
-                                        div().flex().flex_wrap().gap_2().children(
+                                            .text_color(theme.text)
+                                            .child(locale::text("scoped.title")),
+                                    ),
+                            )
+                            .child(div().text_xs().child(wrapped_text(
+                                locale::text("scoped.detail"),
+                                68,
+                                theme.text_muted,
+                            )))
+                            .when(!known.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_faint)
+                                                .child(locale::text("scoped.known_buckets")),
+                                        )
+                                        .child(div().flex().flex_wrap().gap_2().children(
                                             known.into_iter().map(|bucket| {
                                                 let target = bucket.clone();
                                                 action_button_dyn(
@@ -9134,44 +9457,53 @@ impl Browser {
                                                 )
                                                 .on_click(cx.listener(
                                                     move |this, _event, _window, cx| {
-                                                        this.open(
-                                                            target.clone(),
-                                                            String::new(),
-                                                            cx,
-                                                        )
+                                                        this.open(target.clone(), String::new(), cx)
                                                     },
                                                 ))
                                             }),
+                                        )),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        action_button(
+                                            "scoped-open-bucket",
+                                            locale::text("fix.open_bucket_by_name"),
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.open_form(FormKind::OpenBucket, window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        action_button(
+                                            "scoped-errors",
+                                            locale::text("command.errors"),
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.failures_open = true;
+                                                cx.notify();
+                                            }),
                                         ),
                                     ),
-                            )
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    action_button("scoped-open-bucket", "Mở bucket theo tên", theme)
-                                        .on_click(cx.listener(|this, _event, window, cx| {
-                                            this.open_form(FormKind::OpenBucket, window, cx)
-                                        })),
-                                )
-                                .child(action_button("scoped-errors", "Xem lỗi", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.failures_open = true;
-                                        cx.notify();
-                                    }),
-                                )),
-                        ),
-                )
-                .transition_opacity_and_offset(
-                    "scoped-bucket-state-in",
-                    smooth_transition(MOTION_QUICK_MS),
-                    0.0,
-                    1.0,
-                    motion_offset(0.0, 6.0),
-                    motion_offset(0.0, 0.0),
-                ));
+                            ),
+                    )
+                    .transition_opacity_and_offset(
+                        "scoped-bucket-state-in",
+                        smooth_transition(MOTION_QUICK_MS),
+                        0.0,
+                        1.0,
+                        motion_offset(0.0, 6.0),
+                        motion_offset(0.0, 0.0),
+                    ),
+            );
         }
 
         Some(
@@ -9184,7 +9516,7 @@ impl Browser {
                 .gap_3()
                 .child(div().text_color(theme.text).child(match &failure {
                     Some(failure) => failure.summary.clone(),
-                    None => SharedString::from("Chọn một bucket"),
+                    None => SharedString::from(locale::text("empty_state.choose_bucket")),
                 }))
                 // Not the raw error here. The provider's chain runs for eight
                 // lines and buries its one useful sentence in the middle, which
@@ -9193,8 +9525,8 @@ impl Browser {
                 // rest for whoever needs to paste it somewhere.
                 .child(div().max_w(px(440.)).text_xs().child(wrapped_text(
                     match &failure {
-                        Some(_) => "Bấm Xem lỗi để đọc nguyên văn từ provider.",
-                        None => "Chọn ở cột bên trái.",
+                        Some(_) => locale::text("empty_state.view_errors_hint"),
+                        None => locale::text("empty_state.choose_from_sidebar"),
                     },
                     56,
                     theme.text_muted,
@@ -9229,18 +9561,31 @@ impl Browser {
                         // opened by name works for a scoped token, and does no
                         // harm when the cause was something else.
                         .child(
-                            action_button("empty-open-bucket", "Mở bucket theo tên", theme)
-                                .on_click(cx.listener(|this, _event, window, cx| {
+                            action_button(
+                                "empty-open-bucket",
+                                locale::text("fix.open_bucket_by_name"),
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                |this, _event, window, cx| {
                                     this.open_form(FormKind::OpenBucket, window, cx)
-                                })),
+                                },
+                            )),
                         )
                         .when(has_failure, |this| {
-                            this.child(action_button("empty-errors", "Xem lỗi", theme).on_click(
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.failures_open = true;
-                                    cx.notify();
-                                }),
-                            ))
+                            this.child(
+                                action_button(
+                                    "empty-errors",
+                                    locale::text("command.errors"),
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.failures_open = true;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
                         }),
                 )
                 .transition_opacity_and_offset(
@@ -9278,14 +9623,14 @@ impl Browser {
                 .border_color(theme.border_strong)
                 .text_xs()
                 .text_color(theme.text_faint)
-                .child("Sắp xếp")
-                .child(chip(SortKey::Name, "Tên"))
-                .child(chip(SortKey::Size, "Kích thước"))
-                .child(chip(SortKey::Modified, "Sửa đổi"))
+                .child(locale::text("grid.sort_by"))
+                .child(chip(SortKey::Name, locale::text("sort.name")))
+                .child(chip(SortKey::Size, locale::text("sort.size")))
+                .child(chip(SortKey::Modified, locale::text("sort.modified")))
                 .child(div().flex_1())
-                .child(SharedString::from(format!(
-                    "{} cột",
-                    self.settings.grid_step().columns
+                .child(SharedString::from(locale::text_n(
+                    "grid.columns",
+                    self.settings.grid_step().columns,
                 )));
         }
         let all_selected = !self.visible.is_empty()
@@ -9363,7 +9708,7 @@ impl Browser {
             )
             .child(div().w(px(22.)))
             .child(div().flex_1().min_w(px(NAME_MIN_WIDTH)).child(
-                header(SortKey::Name, "Tên").on_click(
+                header(SortKey::Name, locale::text("sort.name")).on_click(
                     cx.listener(|this, _event, _window, cx| this.toggle_sort(SortKey::Name, cx)),
                 ),
             ))
@@ -9372,22 +9717,20 @@ impl Browser {
                     .w(px(TYPE_WIDTH))
                     .text_xs()
                     .text_color(theme.text_faint)
-                    .child("Loại"),
+                    .child(locale::text("list.type_header")),
             )
-            .child(
-                div()
-                    .w(px(84.))
-                    .child(header(SortKey::Size, "Kích thước").on_click(cx.listener(
-                        |this, _event, _window, cx| this.toggle_sort(SortKey::Size, cx),
-                    ))),
-            )
-            .child(
-                div()
-                    .w(px(132.))
-                    .child(header(SortKey::Modified, "Sửa đổi").on_click(cx.listener(
-                        |this, _event, _window, cx| this.toggle_sort(SortKey::Modified, cx),
-                    ))),
-            )
+            .child(div().w(px(84.)).child(
+                header(SortKey::Size, locale::text("sort.size")).on_click(
+                    cx.listener(|this, _event, _window, cx| this.toggle_sort(SortKey::Size, cx)),
+                ),
+            ))
+            .child(div().w(px(132.)).child(
+                header(SortKey::Modified, locale::text("sort.modified")).on_click(
+                    cx.listener(|this, _event, _window, cx| {
+                        this.toggle_sort(SortKey::Modified, cx)
+                    }),
+                ),
+            ))
             .child(
                 div()
                     .w(px(ACTIONS_WIDTH))
@@ -9395,7 +9738,7 @@ impl Browser {
                     .justify_end()
                     .text_xs()
                     .text_color(theme.text_faint)
-                    .child("Thao tác"),
+                    .child(locale::text("list.actions_header")),
             )
     }
 
@@ -9453,18 +9796,27 @@ impl Browser {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.text_faint)
-            .child(SharedString::from(format!("{} mục", self.visible.len())))
-            .child(SharedString::from(format!(
-                "{folders} thư mục, {files} tệp"
+            .child(SharedString::from(locale::text_n(
+                "list.footer_count",
+                self.visible.len(),
+            )))
+            .child(SharedString::from(locale::text_with(
+                "list.footer_breakdown",
+                &[
+                    ("{folders}", &folders.to_string()),
+                    ("{files}", &files.to_string()),
+                ],
             )))
             .when(self.loading_more, |this| {
                 this.child(status_divider(theme)).child(
-                    div().child("Đang tải thêm…").transition_opacity(
-                        "list-loading-more",
-                        smooth_transition(MOTION_QUICK_MS),
-                        0.35,
-                        1.0,
-                    ),
+                    div()
+                        .child(locale::text("list.loading_more"))
+                        .transition_opacity(
+                            "list-loading-more",
+                            smooth_transition(MOTION_QUICK_MS),
+                            0.35,
+                            1.0,
+                        ),
                 )
             })
     }
@@ -9486,35 +9838,45 @@ impl Browser {
                 .items_center()
                 .justify_center()
                 .gap_3()
-                .child(div().text_color(theme.text_muted).child(
-                    if search.capped {
-                        "Chưa thấy gì, và đã quét tới mức trần"
-                    } else if complete {
-                        "Không có object nào khớp"
-                    } else if search.running {
-                        "Đang quét…"
-                    } else {
-                        "Chưa thấy gì, và đã dừng giữa chừng"
-                    },
-                ))
-                .child(div().text_xs().text_color(theme.text_faint).child(
-                    SharedString::from(if complete {
-                        format!(
-                            "Đã quét hết bucket: {} mục trong {} yêu cầu.",
-                            search.scanned, search.requests
-                        )
-                    } else if search.capped {
-                        format!(
-                            "Đã quét {} mục trong {} yêu cầu rồi dừng theo mức trần. Thu hẹp prefix rồi tìm lại.",
-                            search.scanned, search.requests
-                        )
-                    } else {
-                        format!(
-                            "Mới quét {} mục trong {} yêu cầu, chưa hết bucket.",
-                            search.scanned, search.requests
-                        )
-                    }),
-                ))
+                .child(div().text_color(theme.text_muted).child(if search.capped {
+                    locale::text("search.nothing_capped")
+                } else if complete {
+                    locale::text("search.nothing_matched")
+                } else if search.running {
+                    locale::text("search.scanning")
+                } else {
+                    locale::text("search.nothing_stopped")
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(if complete {
+                            locale::text_with(
+                                "search.scanned_complete",
+                                &[
+                                    ("{n}", &search.scanned.to_string()),
+                                    ("{requests}", &search.requests.to_string()),
+                                ],
+                            )
+                        } else if search.capped {
+                            locale::text_with(
+                                "search.scanned_capped",
+                                &[
+                                    ("{n}", &search.scanned.to_string()),
+                                    ("{requests}", &search.requests.to_string()),
+                                ],
+                            )
+                        } else {
+                            locale::text_with(
+                                "search.scanned_partial",
+                                &[
+                                    ("{n}", &search.scanned.to_string()),
+                                    ("{requests}", &search.requests.to_string()),
+                                ],
+                            )
+                        })),
+                )
                 .transition_opacity_and_offset(
                     "search-empty-state-in",
                     smooth_transition(MOTION_QUICK_MS),
@@ -9536,27 +9898,34 @@ impl Browser {
             .justify_center()
             .gap_3()
             .child(div().text_color(theme.text_muted).child(if filtered_out {
-                "Không có mục nào khớp"
+                locale::text("list.no_items_match")
             } else {
-                "Thư mục trống"
+                locale::text("list.folder_empty")
             }))
             .child(
                 div()
                     .text_xs()
                     .text_color(theme.text_faint)
                     .child(SharedString::from(if filtered_out {
-                        format!(
-                            "Bộ lọc “{}” không khớp mục nào trong {} mục đã tải",
-                            self.filter,
-                            self.entries.len()
+                        locale::text_with(
+                            "list.filter_no_match",
+                            &[
+                                ("{filter}", &self.filter),
+                                ("{n}", &self.entries.len().to_string()),
+                            ],
                         )
                     } else {
-                        "Kéo tệp vào đây để tải lên".to_string()
+                        locale::text("list.drag_to_upload").to_string()
                     })),
             )
             .when(filtered_out, |this| {
                 this.child(
-                    action_button("empty-clear-filter", "Xoá bộ lọc", theme).on_click(
+                    action_button(
+                        "empty-clear-filter",
+                        locale::text("list.clear_filter"),
+                        theme,
+                    )
+                    .on_click(
                         cx.listener(|this, _event, window, cx| this.clear_filter(window, cx)),
                     ),
                 )
@@ -9597,7 +9966,10 @@ impl Browser {
                 .child(
                     div()
                         .text_color(theme.text)
-                        .child(SharedString::from(format!("Tìm “{}”", search.query))),
+                        .child(SharedString::from(locale::text_with(
+                            "search.title",
+                            &[("{query}", &search.query)],
+                        ))),
                 )
                 .child(div().flex_1())
                 .child(
@@ -9609,13 +9981,13 @@ impl Browser {
                 // and a dead button is one more thing to read past.
                 .when(running, |this| {
                     this.child(
-                        action_button("search-stop", "Dừng", theme).on_click(
+                        action_button("search-stop", locale::text("common.stop"), theme).on_click(
                             cx.listener(|this, _event, _window, cx| this.stop_search(cx)),
                         ),
                     )
                 })
                 .child(
-                    action_button("search-exit", "Thoát", theme)
+                    action_button("search-exit", locale::text("common.exit"), theme)
                         .on_click(cx.listener(|this, _event, _window, cx| this.exit_search(cx))),
                 )
                 .transition_opacity_and_offset(
@@ -9696,7 +10068,7 @@ impl Browser {
                                         row_action(
                                             ("row-open-tab", position),
                                             "external",
-                                            "Mở trong tab mới",
+                                            locale::text("command.open_in_new_tab"),
                                             theme,
                                         )
                                         .on_click(
@@ -9711,7 +10083,7 @@ impl Browser {
                                         row_action(
                                             ("row-download", position),
                                             "download",
-                                            "Tải xuống",
+                                            locale::text("command.download"),
                                             theme,
                                         )
                                         .on_click(
@@ -9723,14 +10095,19 @@ impl Browser {
                                         ),
                                     )
                                     .child(
-                                        row_action(("row-delete", position), "trash", "Xoá", theme)
-                                            .on_click(cx.listener(
-                                                move |this, _event, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.select_only(position, cx);
-                                                    this.ask_delete_selection(cx);
-                                                },
-                                            )),
+                                        row_action(
+                                            ("row-delete", position),
+                                            "trash",
+                                            locale::text("row.delete"),
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.ask_delete_selection(cx);
+                                            }),
+                                        ),
                                     )
                             } else {
                                 actions
@@ -9738,7 +10115,7 @@ impl Browser {
                                         row_action(
                                             ("row-info", position),
                                             "info",
-                                            "Chi tiết",
+                                            locale::text("command.inspect"),
                                             theme,
                                         )
                                         .on_click(
@@ -9753,7 +10130,7 @@ impl Browser {
                                         row_action(
                                             ("row-preview", position),
                                             "eye",
-                                            "Xem trước",
+                                            locale::text("command.preview"),
                                             theme,
                                         )
                                         .on_click(
@@ -9768,7 +10145,7 @@ impl Browser {
                                         row_action(
                                             ("row-open-external", position),
                                             "external",
-                                            "Mở bằng app",
+                                            locale::text("row.open_externally"),
                                             theme,
                                         )
                                         .on_click(
@@ -9783,7 +10160,7 @@ impl Browser {
                                         row_action(
                                             ("row-share", position),
                                             "link",
-                                            "Chia sẻ",
+                                            locale::text("row.share"),
                                             theme,
                                         )
                                         .on_click(
@@ -9798,7 +10175,7 @@ impl Browser {
                                         row_action(
                                             ("row-download", position),
                                             "download",
-                                            "Tải xuống",
+                                            locale::text("command.download"),
                                             theme,
                                         )
                                         .on_click(
@@ -9810,14 +10187,19 @@ impl Browser {
                                         ),
                                     )
                                     .child(
-                                        row_action(("row-delete", position), "trash", "Xoá", theme)
-                                            .on_click(cx.listener(
-                                                move |this, _event, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.select_only(position, cx);
-                                                    this.ask_delete_selection(cx);
-                                                },
-                                            )),
+                                        row_action(
+                                            ("row-delete", position),
+                                            "trash",
+                                            locale::text("row.delete"),
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.select_only(position, cx);
+                                                this.ask_delete_selection(cx);
+                                            }),
+                                        ),
                                     )
                             };
 
@@ -9986,7 +10368,7 @@ impl Browser {
                                                 row_action(
                                                     ("grid-open-tab", position),
                                                     "external",
-                                                    "Mở trong tab mới",
+                                                    locale::text("command.open_in_new_tab"),
                                                     theme,
                                                 )
                                                 .on_click(cx.listener(
@@ -10001,7 +10383,7 @@ impl Browser {
                                                 row_action(
                                                     ("grid-download", position),
                                                     "download",
-                                                    "Tải xuống",
+                                                    locale::text("command.download"),
                                                     theme,
                                                 )
                                                 .on_click(cx.listener(
@@ -10018,7 +10400,7 @@ impl Browser {
                                                 row_action(
                                                     ("grid-info", position),
                                                     "info",
-                                                    "Chi tiết",
+                                                    locale::text("command.inspect"),
                                                     theme,
                                                 )
                                                 .on_click(cx.listener(
@@ -10033,7 +10415,7 @@ impl Browser {
                                                 row_action(
                                                     ("grid-preview", position),
                                                     "eye",
-                                                    "Xem trước",
+                                                    locale::text("command.preview"),
                                                     theme,
                                                 )
                                                 .on_click(cx.listener(
@@ -10048,7 +10430,7 @@ impl Browser {
                                                 row_action(
                                                     ("grid-download", position),
                                                     "download",
-                                                    "Tải xuống",
+                                                    locale::text("command.download"),
                                                     theme,
                                                 )
                                                 .on_click(cx.listener(
@@ -10240,7 +10622,9 @@ impl Browser {
                         .child(
                             small_icon_button("opening-cancel".into(), "close", 10., theme)
                                 .size(px(18.))
-                                .tooltip(move |window, cx| Tooltip::new("Huỷ").build(window, cx))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(locale::text("common.cancel")).build(window, cx)
+                                })
                                 .on_click(
                                     cx.listener(|this, _event, _window, cx| this.cancel_open(cx)),
                                 ),
@@ -10290,13 +10674,24 @@ impl Browser {
             let speed = if stats.bytes_per_second > 0 {
                 let eta = stats
                     .seconds_remaining()
-                    .map(|secs| format!("  còn {}", format_duration(secs)))
+                    .map(|secs| {
+                        locale::text_with("queue.status.eta", &[("{t}", &format_duration(secs))])
+                    })
                     .unwrap_or_default();
                 format!("  {}/s{eta}", format_size(stats.bytes_per_second as i64))
             } else {
                 String::new()
             };
-            format!("{} đang chạy, {} chờ{speed}", stats.active, stats.queued)
+            format!(
+                "{}{speed}",
+                locale::text_with(
+                    "queue.status.running_queued",
+                    &[
+                        ("{a}", &stats.active.to_string()),
+                        ("{q}", &stats.queued.to_string())
+                    ],
+                )
+            )
         } else {
             // Nothing while idle. "24 xong" sat in the bar for the rest of the
             // session after one download, and the sidebar's queue row carries
@@ -10354,7 +10749,13 @@ impl Browser {
                     .text_color(theme.danger)
                     .hover(|this| this.bg(theme.hover))
                     .child(SharedString::from(if self.failures.len() > 1 {
-                        format!("{} ({} lỗi)", failure.summary, self.failures.len())
+                        locale::text_with(
+                            "status.failure_with_count",
+                            &[
+                                ("{summary}", &failure.summary),
+                                ("{n}", &self.failures.len().to_string()),
+                            ],
+                        )
                     } else {
                         failure.summary.to_string()
                     }))
@@ -10388,7 +10789,7 @@ impl Browser {
                 self.bulk.as_ref().filter(|bulk| bulk.running).map(|_| ()),
                 |this, ()| {
                     this.child(
-                        action_button("bulk-stop", "Dừng", theme)
+                        action_button("bulk-stop", locale::text("common.stop"), theme)
                             .on_click(cx.listener(|this, _event, _window, cx| this.stop_bulk(cx))),
                     )
                 },
@@ -10400,9 +10801,12 @@ impl Browser {
             .when_some(
                 self.completing.as_ref().filter(|c| c.running).map(|_| ()),
                 |this, ()| {
-                    this.child(action_button("complete-stop", "Dừng", theme).on_click(
-                        cx.listener(|this, _event, _window, cx| this.stop_completing(cx)),
-                    ))
+                    this.child(
+                        action_button("complete-stop", locale::text("common.stop"), theme)
+                            .on_click(
+                                cx.listener(|this, _event, _window, cx| this.stop_completing(cx)),
+                            ),
+                    )
                 },
             )
             // One pointer instead of four hints. The old strip listed ⌘F, ⌘N,
@@ -10421,9 +10825,9 @@ impl Browser {
                     .cursor_pointer()
                     .text_color(theme.text_faint)
                     .hover(|this| this.bg(theme.hover).text_color(theme.text_muted))
-                    .child(SharedString::from(format!(
-                        "{}K lệnh",
-                        platform::primary_modifier()
+                    .child(SharedString::from(locale::text_with(
+                        "status.commands_shortcut",
+                        &[("{modifier}", platform::primary_modifier())],
                     )))
                     .on_click(
                         cx.listener(|this, _event, window, cx| this.open_palette(window, cx)),
@@ -10466,9 +10870,12 @@ impl Browser {
                         .cursor_pointer()
                         .bg(theme.accent.opacity(0.16))
                         .text_color(theme.accent)
-                        .child(SharedString::from(format!("Có bản {}", update.version)))
+                        .child(SharedString::from(locale::text_with(
+                            "update.available_short",
+                            &[("{version}", &update.version)],
+                        )))
                         .tooltip(|window, cx| {
-                            Tooltip::new("Mở trang phát hành trên GitHub").build(window, cx)
+                            Tooltip::new(locale::text("update.open_release_page")).build(window, cx)
                         })
                         .on_click(cx.listener(move |this, _event, _window, cx| {
                             this.open_url_externally(url.clone(), cx);
@@ -10489,8 +10896,8 @@ impl Browser {
             .and_then(|profile| self.bucket_cache.get(&profile.id))
             .map(|(_, at)| format_age(s3core::now_epoch() - at));
         match age {
-            Some(age) => format!("bộ nhớ tạm · {age}"),
-            None => "bộ nhớ tạm".to_string(),
+            Some(age) => locale::text_with("cache.note_with_age", &[("{age}", &age)]),
+            None => locale::text("cache.note").to_string(),
         }
     }
 
@@ -10519,12 +10926,16 @@ impl Browser {
                         .px_3()
                         .text_xs()
                         .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("HÀNG ĐỢI {}", jobs.len())))
+                        .child(SharedString::from(format!(
+                            "{} {}",
+                            locale::text("nav.queue").to_uppercase(),
+                            jobs.len()
+                        )))
                         .child(div().flex_1())
                         .child(
                             setting_chip(
                                 "bandwidth",
-                                "Băng thông",
+                                locale::text("queue.bandwidth"),
                                 bandwidth_label(self.transfers.bandwidth_limit()),
                                 theme,
                             )
@@ -10538,13 +10949,18 @@ impl Browser {
                             )),
                         )
                         .child(
-                            action_button("clear-finished", "Xoá đã xong", theme).on_click(
-                                cx.listener(|this, _event, _window, cx| {
+                            action_button(
+                                "clear-finished",
+                                locale::text("queue.clear_finished"),
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
                                     this.transfers.clear_finished();
                                     this.prune_expanded_folders();
                                     cx.notify();
-                                }),
-                            ),
+                                },
+                            )),
                         ),
                 )
                 .child(if jobs.is_empty() {
@@ -10555,7 +10971,7 @@ impl Browser {
                         .justify_center()
                         .text_xs()
                         .text_color(theme.text_faint)
-                        .child("Kéo tệp vào danh sách để tải lên")
+                        .child(locale::text("queue.drop_hint"))
                         .into_any_element()
                 } else {
                     // Laid out once and moved into the closure. Building it
@@ -10610,7 +11026,7 @@ impl Browser {
                 .p_3()
                 .text_xs()
                 .text_color(theme.text_faint)
-                .child("Không đọc được metadata")
+                .child(locale::text("detail.metadata_unreadable"))
                 .into_any_element(),
             (Some(head), _) => {
                 let class = head.storage_class.as_deref().unwrap_or("STANDARD");
@@ -10632,17 +11048,21 @@ impl Browser {
                     .gap_3()
                     .text_xs()
                     .child(
-                        inspector_section("THUỘC TÍNH", theme)
-                            .child(detail_row("Kích thước", format_size(head.size), theme))
+                        inspector_section(locale::text("detail.section.properties"), theme)
                             .child(detail_row(
-                                "Sửa đổi",
+                                locale::text("detail.size"),
+                                format_size(head.size),
+                                theme,
+                            ))
+                            .child(detail_row(
+                                locale::text("detail.modified"),
                                 head.modified_epoch
                                     .map(format_timestamp)
                                     .unwrap_or_default(),
                                 theme,
                             ))
                             .child(detail_row(
-                                "Kiểu",
+                                locale::text("detail.type"),
                                 head.content_type.clone().unwrap_or_default(),
                                 theme,
                             ))
@@ -10650,20 +11070,32 @@ impl Browser {
                             // are not, and two permanently blank rows push the
                             // ones that say something out of the panel.
                             .when_some(head.cache_control.clone(), |this, value| {
-                                this.child(detail_row("Cache", value, theme))
+                                this.child(detail_row(
+                                    locale::text("detail.cache_control"),
+                                    value,
+                                    theme,
+                                ))
                             })
                             .when_some(head.content_disposition.clone(), |this, value| {
-                                this.child(detail_row("Trả về", value, theme))
+                                this.child(detail_row(
+                                    locale::text("detail.content_disposition"),
+                                    value,
+                                    theme,
+                                ))
                             })
-                            .child(detail_row("Lớp lưu trữ", class.to_string(), theme))
                             .child(detail_row(
-                                "Mã hoá",
+                                locale::text("detail.storage_class"),
+                                class.to_string(),
+                                theme,
+                            ))
+                            .child(detail_row(
+                                locale::text("detail.encryption"),
                                 match (&head.encryption, &head.kms_key_id) {
                                     (Some(kind), Some(key)) => format!("{kind} ({key})"),
                                     (Some(kind), None) => kind.clone(),
                                     // Not the same as "unknown": S3 omits the
                                     // header exactly when nothing encrypts it.
-                                    (None, _) => "không".into(),
+                                    (None, _) => locale::text("detail.encryption_none").into(),
                                 },
                                 theme,
                             ))
@@ -10679,15 +11111,18 @@ impl Browser {
                     // Next to the headers it edits. These three decide whether a
                     // shared link renders in a tab or lands in the downloads
                     // folder, which is not something to go hunting for.
-                    .child(action_button("edit-headers", "Sửa header", theme).on_click(
-                        cx.listener(|this, _event, window, cx| this.start_edit_headers(window, cx)),
-                    ))
+                    .child(
+                        action_button("edit-headers", locale::text("command.edit_headers"), theme)
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.start_edit_headers(window, cx)
+                            })),
+                    )
                     // Only archived objects get the restore control, and its
                     // label says which of the three states it is in.
                     .when(state != RestoreState::NotArchived, |this| {
                         this.child(match state {
                             RestoreState::Archived => {
-                                action_button("restore", "Khôi phục (3 ngày)", theme)
+                                action_button("restore", locale::text("restore.action"), theme)
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.restore_inspected(cx)
                                     }))
@@ -10695,17 +11130,17 @@ impl Browser {
                             }
                             RestoreState::InProgress => div()
                                 .text_color(theme.text_muted)
-                                .child("Đang khôi phục, chưa đọc được")
+                                .child(locale::text("restore.in_progress"))
                                 .into_any_element(),
                             _ => div()
                                 .text_color(theme.text_muted)
-                                .child("Đã khôi phục, đọc được tạm thời")
+                                .child(locale::text("restore.completed"))
                                 .into_any_element(),
                         })
                     })
                     .when_some(acl_unavailable, |this, (summary, detail)| {
                         this.child(
-                            inspector_section("QUYỀN TRUY CẬP", theme)
+                            inspector_section(locale::text("detail.section.access"), theme)
                                 .child(acl_unavailable_notice(summary, detail, theme)),
                         )
                     })
@@ -10716,31 +11151,37 @@ impl Browser {
                             let public = acl
                                 .as_ref()
                                 .is_some_and(|acl| acl.grants.iter().any(|grant| grant.public));
-                            let section = inspector_section("QUYỀN TRUY CẬP", theme)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(acl_status_chip(public, theme))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .text_color(theme.text_faint)
-                                                .child(SharedString::from(acl_target)),
-                                        ),
-                                );
+                            let section =
+                                inspector_section(locale::text("detail.section.access"), theme)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(acl_status_chip(public, theme))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .text_color(theme.text_faint)
+                                                    .child(SharedString::from(acl_target)),
+                                            ),
+                                    );
 
                             let section = if let Some(acl) = acl {
                                 section
                                     .child(detail_row(
-                                        "Chủ sở hữu",
+                                        locale::text("acl.owner"),
                                         elide_middle(&grantee_label(&acl.owner), 30),
                                         theme,
                                     ))
                                     .child(
-                                        action_button("acl-table", "Bảng quyền", theme).on_click(
+                                        action_button(
+                                            "acl-table",
+                                            locale::text("acl.table_button"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(|this, _event, _window, cx| {
                                                 this.acl_popup_open = true;
                                                 cx.notify();
@@ -10751,12 +11192,16 @@ impl Browser {
                                 section.child(
                                     div()
                                         .text_color(theme.text_faint)
-                                        .child("Provider không trả ACL đọc được, vẫn có thể thử đặt ACL canned."),
+                                        .child(locale::text("acl.unread_hint")),
                                 )
                             };
 
                             section
-                                .child(div().text_color(theme.text_faint).child("Preset nhanh"))
+                                .child(
+                                    div()
+                                        .text_color(theme.text_faint)
+                                        .child(locale::text("acl.quick_presets")),
+                                )
                                 .child(div().flex().flex_wrap().gap_1().children(
                                     s3core::CANNED_ACLS.iter().map(|canned| {
                                         let canned = *canned;
@@ -10765,26 +11210,25 @@ impl Browser {
                                             SharedString::from(canned_acl_label(canned)),
                                             theme,
                                         )
-                                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                                            this.set_acl(canned, cx)
-                                        }))
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.set_acl(canned, cx)
+                                            }),
+                                        )
                                     }),
                                 ))
                         })
                     })
                     .when(self.supports(|caps| caps.tagging), |this| {
                         this.child(
-                            inspector_section("THẺ", theme)
+                            inspector_section(locale::text("detail.section.tags"), theme)
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_end()
-                                        .child(action_button("add-tag", "Thêm", theme).on_click(
-                                            cx.listener(|this, _event, window, cx| {
+                                    div().flex().items_center().justify_end().child(
+                                        action_button("add-tag", locale::text("tags.add"), theme)
+                                            .on_click(cx.listener(|this, _event, window, cx| {
                                                 this.open_form(FormKind::AddTag, window, cx)
-                                            }),
-                                        )),
+                                            })),
+                                    ),
                                 )
                                 .children(inspector.tags.iter().map(|(name, value)| {
                                     let name = name.clone();
@@ -10813,7 +11257,9 @@ impl Browser {
                                 }))
                                 .when(inspector.tags.is_empty(), |this| {
                                     this.child(
-                                        div().text_color(theme.text_faint).child("Chưa có thẻ nào"),
+                                        div()
+                                            .text_color(theme.text_faint)
+                                            .child(locale::text("tags.empty")),
                                     )
                                 }),
                         )
@@ -10823,13 +11269,14 @@ impl Browser {
                         |this| {
                             this.child(
                                 inspector_section(
-                                    SharedString::from(format!(
-                                        "PHIÊN BẢN {}",
-                                        inspector.versions.len()
+                                    SharedString::from(locale::text_n(
+                                        "detail.section.versions",
+                                        inspector.versions.len(),
                                     )),
                                     theme,
                                 )
-                                    .children(inspector.versions.iter().map(|version| {
+                                .children(
+                                    inspector.versions.iter().map(|version| {
                                         let for_restore = version.version_id.clone();
                                         let for_delete = version.clone();
                                         let when = version
@@ -10855,15 +11302,25 @@ impl Browser {
                                                     })
                                                     .child(SharedString::from(
                                                         if version.is_delete_marker {
-                                                            format!("{when}   delete marker")
+                                                            format!(
+                                                                "{when}   {}",
+                                                                locale::text(
+                                                                    "version.delete_marker"
+                                                                )
+                                                            )
                                                         } else {
                                                             format!(
                                                                 "{when}   {}{}",
                                                                 format_size(version.size),
                                                                 if version.is_latest {
-                                                                    "   hiện tại"
+                                                                    format!(
+                                                                        "   {}",
+                                                                        locale::text(
+                                                                            "version.current"
+                                                                        )
+                                                                    )
                                                                 } else {
-                                                                    ""
+                                                                    String::new()
                                                                 }
                                                             )
                                                         },
@@ -10877,7 +11334,9 @@ impl Browser {
                                                             SharedString::from(format!(
                                                                 "restore-{for_restore}"
                                                             )),
-                                                            "Khôi phục".into(),
+                                                            SharedString::from(locale::text(
+                                                                "version.restore_action",
+                                                            )),
                                                             theme,
                                                         )
                                                         .on_click(cx.listener(
@@ -10909,19 +11368,19 @@ impl Browser {
                                                     },
                                                 )),
                                             )
-                                    })),
+                                    }),
+                                ),
                             )
                         },
                     )
                     .when(!head.metadata.is_empty(), |this| {
-                        this.child(
-                            inspector_section("METADATA", theme)
-                                .children(head.metadata.iter().map(|(name, value)| {
-                                    div()
-                                        .text_color(theme.text)
-                                        .child(SharedString::from(format!("{name} = {value}")))
-                                })),
-                        )
+                        this.child(inspector_section("METADATA", theme).children(
+                            head.metadata.iter().map(|(name, value)| {
+                                div()
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(format!("{name} = {value}")))
+                            }),
+                        ))
                     })
                     .into_any_element()
             }
@@ -10930,12 +11389,16 @@ impl Browser {
         let detail_is_multi = selected_object_count > 1;
         let inspected_name = entry_name_of(&inspector.key);
         let detail_title: SharedString = if detail_is_multi {
-            format!("{selected_object_count} tệp đã chọn").into()
+            locale::text_n("detail.title_multi", selected_object_count).into()
         } else {
             SharedString::from(inspected_name.clone())
         };
         let detail_subtitle = detail_is_multi.then(|| {
-            SharedString::from(format!("Đang xem: {}", elide_middle(&inspected_name, 28)))
+            SharedString::from(format!(
+                "{}: {}",
+                locale::text("detail.viewing"),
+                elide_middle(&inspected_name, 28)
+            ))
         });
         // Built at the render site rather than folded into one string here:
         // the two cases are different shapes, not two values of one shape.
@@ -11030,10 +11493,17 @@ impl Browser {
                                 .gap_1()
                                 .when(!detail_is_multi, |this| {
                                     this.child(
-                                        detail_action_button("detail-preview", "Xem", "eye", theme)
-                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                        detail_action_button(
+                                            "detail-preview",
+                                            locale::text("detail.view"),
+                                            "eye",
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _event, _window, cx| {
                                                 this.open_preview(cx)
-                                            })),
+                                            }),
+                                        ),
                                     )
                                 })
                                 .child(
@@ -11057,7 +11527,7 @@ impl Browser {
                                     this.child(
                                         detail_action_button(
                                             "detail-share",
-                                            "Chia sẻ",
+                                            locale::text("detail.share"),
                                             "link",
                                             theme,
                                         )
@@ -11071,7 +11541,7 @@ impl Browser {
                                 .child(
                                     detail_action_button(
                                         "detail-download",
-                                        "Tải xuống",
+                                        locale::text("command.download"),
                                         "download",
                                         theme,
                                     )
@@ -11089,7 +11559,7 @@ impl Browser {
                                     this.child(
                                         detail_action_button(
                                             "detail-open-external",
-                                            "Mở app",
+                                            locale::text("detail.open_app"),
                                             "external",
                                             theme,
                                         )
@@ -11118,6 +11588,9 @@ impl Browser {
         let share = self.share.as_ref()?;
         let theme = self.theme;
         let name = entry_name_of(&share.key);
+        let share_key = share.key.clone();
+        let acl_support = self.acl_support();
+        let acl_supported = acl_support.map(Support::is_usable).unwrap_or(true);
 
         Some(
             div()
@@ -11145,11 +11618,9 @@ impl Browser {
                         .border_1()
                         .border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .text_color(theme.text)
-                                .child(SharedString::from(format!("Chia sẻ {name}"))),
-                        )
+                        .child(div().text_color(theme.text).child(SharedString::from(
+                            locale::text_with("share.title", &[("{name}", &name)]),
+                        )))
                         .child(div().flex().gap_2().children(PRESIGN_PRESETS.iter().map(
                             |(label, expires)| {
                                 let expires = *expires;
@@ -11157,7 +11628,7 @@ impl Browser {
                                 let active = share.chosen == label;
                                 action_button_dyn(
                                     SharedString::from(format!("presign-{label}")),
-                                    SharedString::from(label),
+                                    SharedString::from(presign_label(label)),
                                     theme,
                                 )
                                 // The active preset has to look chosen, or
@@ -11178,7 +11649,7 @@ impl Browser {
                                 div()
                                     .text_xs()
                                     .text_color(theme.danger)
-                                    .child("Credential tạm: link chết khi session hết hạn."),
+                                    .child(locale::text("share.credential_warning")),
                             )
                         })
                         .child(match &share.url {
@@ -11196,7 +11667,7 @@ impl Browser {
                             None => div()
                                 .text_xs()
                                 .text_color(theme.text_faint)
-                                .child("Đang ký…")
+                                .child(locale::text("share.signing"))
                                 .into_any_element(),
                         })
                         .child(
@@ -11205,26 +11676,64 @@ impl Browser {
                                 .gap_2()
                                 .justify_end()
                                 .child(
-                                    action_button("copy-public", "Chép URL công khai", theme)
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.copy_public_url(cx)
-                                        })),
+                                    action_button(
+                                        "copy-public",
+                                        locale::text("share.copy_public_url"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| this.copy_public_url(cx),
+                                    )),
                                 )
                                 .when_some(share.url.clone(), |this, url| {
                                     this.child(
-                                        action_button("copy-signed", "Chép link", theme).on_click(
+                                        action_button(
+                                            "copy-signed",
+                                            locale::text("share.copy_link"),
+                                            theme,
+                                        )
+                                        .on_click(
                                             cx.listener(move |this, _event, _window, cx| {
                                                 this.copy_to_clipboard(url.to_string(), "link", cx)
                                             }),
                                         ),
                                     )
                                 })
-                                .child(action_button("share-close", "Đóng", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.share = None;
-                                        cx.notify();
-                                    }),
-                                )),
+                                // A link is only as private as the object's own
+                                // ACL — a "chép link" someone expects to be
+                                // gated by the presign expiry is still a public
+                                // read if the object itself grants one. Opening
+                                // the table from right here, rather than making
+                                // someone close this dialog and go find the
+                                // inspector, is the difference between checking
+                                // and assuming.
+                                .when(acl_supported, |this| {
+                                    this.child(
+                                        action_button(
+                                            "share-acl-table",
+                                            locale::text("acl.table_button"),
+                                            theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.open_acl_table_for(share_key.clone(), cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    action_button(
+                                        "share-close",
+                                        locale::text("common.close"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| {
+                                            this.share = None;
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
                         ),
                 )
                 .transition_opacity_and_offset(
@@ -11247,9 +11756,13 @@ impl Browser {
         let selected_object_count = self.selected_object_keys().len();
         let detail_is_multi = selected_object_count > 1;
         let title = if detail_is_multi {
-            format!("Quyền truy cập của {selected_object_count} tệp")
+            locale::text_n("acl.popup.title_multi", selected_object_count)
         } else {
-            format!("Quyền truy cập {}", entry_name_of(&inspector.key))
+            format!(
+                "{} {}",
+                locale::text("acl.popup.access_to"),
+                entry_name_of(&inspector.key)
+            )
         };
         let target = acl_target_label(selected_object_count);
 
@@ -11336,13 +11849,17 @@ impl Browser {
                                 .when(inspector.acl.is_none(), |this| {
                                     this.child(div().text_color(theme.text_faint).child(
                                         if inspector.loading {
-                                            "Đang đọc ACL…"
+                                            locale::text("acl.loading")
                                         } else {
-                                            "Provider không trả ACL đọc được."
+                                            locale::text("acl.unread")
                                         },
                                     ))
                                 })
-                                .child(div().text_color(theme.text_faint).child("Preset nhanh"))
+                                .child(
+                                    div()
+                                        .text_color(theme.text_faint)
+                                        .child(locale::text("acl.quick_presets")),
+                                )
                                 .child(div().flex().flex_wrap().gap_1().children(
                                     s3core::CANNED_ACLS.iter().map(|canned| {
                                         let canned = *canned;
@@ -11737,7 +12254,11 @@ impl Browser {
                         .bg(theme.modal)
                         .border_1()
                         .border_color(theme.border_strong)
-                        .child(div().text_color(theme.text).child("Đăng nhập AWS SSO"))
+                        .child(
+                            div()
+                                .text_color(theme.text)
+                                .child(locale::text("sso.title")),
+                        )
                         .when(flow.waiting, |this| {
                             this
                                 // The browser may not have opened, or opened the
@@ -11746,7 +12267,7 @@ impl Browser {
                                     div()
                                         .text_xs()
                                         .text_color(theme.text_muted)
-                                        .child("Duyệt trong trình duyệt:"),
+                                        .child(locale::text("sso.browse_to")),
                                 )
                                 .child(
                                     div()
@@ -11797,19 +12318,20 @@ impl Browser {
                                             div()
                                                 .text_xs()
                                                 .text_color(theme.text_faint)
-                                                .child("Tài khoản này không có role nào"),
+                                                .child(locale::text("sso.no_roles")),
                                         )
                                     }),
                             )
                         })
-                        .child(div().flex().justify_end().child(
-                            action_button("sso-cancel", "Huỷ", theme).on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.sso = None;
-                                    cx.notify();
-                                },
-                            )),
-                        )),
+                        .child(
+                            div().flex().justify_end().child(
+                                action_button("sso-cancel", locale::text("common.cancel"), theme)
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.sso = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                        ),
                 )
                 .transition_opacity_and_offset(
                     "sso-scrim-in",
@@ -11876,7 +12398,7 @@ impl Browser {
                                             theme.text
                                         })
                                         .child(SharedString::from(if query.is_empty() {
-                                            "Gõ để tìm lệnh…".to_string()
+                                            locale::text("palette.placeholder").to_string()
                                         } else {
                                             query.clone()
                                         })),
@@ -11903,7 +12425,7 @@ impl Browser {
                                             .justify_center()
                                             .text_sm()
                                             .text_color(theme.text_faint)
-                                            .child("Không có lệnh nào khớp"),
+                                            .child(locale::text("palette.no_match")),
                                     )
                                 })
                                 // A uniform list rather than a scrolling div,
@@ -11987,8 +12509,11 @@ impl Browser {
                                 .border_color(theme.border)
                                 .text_xs()
                                 .text_color(theme.text_faint)
-                                .child("↑↓ chọn   ↵ chạy   esc đóng")
-                                .child(SharedString::from(format!("{} lệnh", matches.len()))),
+                                .child(locale::text("palette.key_hints"))
+                                .child(SharedString::from(locale::text_n(
+                                    "palette.command_count",
+                                    matches.len(),
+                                ))),
                         ),
                 )
                 .transition_opacity_and_offset(
@@ -12044,16 +12569,26 @@ impl Browser {
                                 .flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(action_button("confirm-cancel", "Huỷ", theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.cancel_confirm(cx)
-                                    }),
-                                ))
-                                .child(danger_button("confirm-ok", "Xoá".into(), theme).on_click(
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.commit_confirm(cx)
-                                    }),
-                                )),
+                                .child(
+                                    action_button(
+                                        "confirm-cancel",
+                                        locale::text("common.cancel"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| this.cancel_confirm(cx),
+                                    )),
+                                )
+                                .child(
+                                    danger_button(
+                                        "confirm-ok",
+                                        locale::text("row.delete").into(),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| this.commit_confirm(cx),
+                                    )),
+                                ),
                         ),
                 )
                 .transition_opacity_and_offset(
@@ -12099,11 +12634,11 @@ impl Browser {
                     .min_w(px(0.))
                     .text_xs()
                     .text_color(theme.text_faint)
-                    .child("Tên"),
+                    .child(locale::text("queue.col_name")),
             )
-            .child(cell("Kích thước", size_w))
-            .child(cell("Tiến trình", progress_w))
-            .child(cell("Trạng thái", state_w))
+            .child(cell(locale::text("detail.size"), size_w))
+            .child(cell(locale::text("queue.col_progress"), progress_w))
+            .child(cell(locale::text("detail.status"), state_w))
             // Matches the two action buttons on a row.
             .child(div().w(px(actions_w)))
     }
@@ -12203,11 +12738,9 @@ impl Browser {
                     )
                     // The count is what says this row stands for more than one
                     // thing; without it a folder row reads as a single file.
-                    .child(
-                        div()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(format!("{} tệp", folder.count))),
-                    ),
+                    .child(div().text_color(theme.text_faint).child(SharedString::from(
+                        locale::text_n("queue.folder_file_count", folder.count),
+                    ))),
             )
             .child(
                 div()
@@ -12350,14 +12883,15 @@ impl Browser {
             transfer::Direction::Upload => "upload",
             transfer::Direction::Download => "download",
         };
-        let (state_label, state_color) = match job.state {
-            JobState::Queued => ("chờ", theme.text_faint),
-            JobState::Running => ("đang chạy", theme.accent),
-            JobState::Paused => ("tạm dừng", theme.text_muted),
-            JobState::Done => ("xong", theme.text_muted),
-            JobState::Failed => ("lỗi", theme.danger),
-            JobState::Canceled => ("đã huỷ", theme.text_faint),
+        let state_color = match job.state {
+            JobState::Queued => theme.text_faint,
+            JobState::Running => theme.accent,
+            JobState::Paused => theme.text_muted,
+            JobState::Done => theme.text_muted,
+            JobState::Failed => theme.danger,
+            JobState::Canceled => theme.text_faint,
         };
+        let state_label = job_state_text(job.state);
 
         div()
             .id(("job", id as usize))
@@ -12642,7 +13176,7 @@ impl Render for Browser {
                                         ),
                                 )
                             })
-                            .when(self.screen == Screen::Objects, |this| {
+                            .when(self.shows_docked_inspector(), |this| {
                                 this.children(self.render_inspector(cx))
                             }),
                     )
@@ -12869,15 +13403,33 @@ fn preview_veil(theme: Theme) -> gpui::Hsla {
     }
 }
 
+/// What a failed ACL write says about the capability, if anything.
+///
+/// Mirrors `s3core::capability::classify`, which only ever runs against a
+/// read probe (`GetBucketAcl`). A provider can answer that and still refuse
+/// the object-level write — see the doc comment on `Capabilities::acl` — so
+/// this is the other half: what the *write* itself just proved. `None` means
+/// the write reported something the failure list should show but that says
+/// nothing about the capability (a transient error, a bad key).
+fn classify_acl_write_error(detail: &str) -> Option<Support> {
+    if detail.contains("AccessControlListNotSupported") {
+        Some(Support::No)
+    } else if detail.contains("AccessDenied") || detail.contains("Forbidden") {
+        Some(Support::Forbidden)
+    } else {
+        None
+    }
+}
+
 fn acl_unavailable_copy(support: Option<Support>) -> Option<(&'static str, &'static str)> {
     match support {
         Some(Support::No) => Some((
-            "Bucket này đã tắt ACL",
-            "Bucket/provider không hỗ trợ chỉnh ACL. Dùng bucket policy, IAM hoặc policy của provider để phân quyền.",
+            locale::text("acl.unavailable.disabled_summary"),
+            locale::text("acl.unavailable.disabled_detail"),
         )),
         Some(Support::Forbidden) => Some((
-            "Token không có quyền ACL",
-            "Token hiện tại không đọc được ACL. Cấp quyền ACL tương ứng hoặc dùng policy thay thế.",
+            locale::text("acl.unavailable.forbidden_summary"),
+            locale::text("acl.unavailable.forbidden_detail"),
         )),
         _ => None,
     }
@@ -12888,15 +13440,15 @@ fn acl_unavailable_notice(
     detail: &'static str,
     theme: Theme,
 ) -> impl IntoElement {
+    // A plain row, not a card: this always sits inside `preview_detail_section`
+    // or `inspector_section`, which already draw the card. Giving it its own
+    // `bg`/`border`/`rounded_lg` used to nest a second box — same background
+    // as the parent in one place, a mismatched one in the other — inside a
+    // panel where every sibling row is bare text.
     div()
-        .p_2()
         .flex()
         .flex_col()
-        .gap_1()
-        .rounded_lg()
-        .bg(theme.hover)
-        .border_1()
-        .border_color(theme.border)
+        .gap_0p5()
         .child(div().text_color(theme.text).child(summary))
         .child(
             div()
@@ -12916,13 +13468,17 @@ fn acl_status_chip(public: bool, theme: Theme) -> impl IntoElement {
         } else {
             theme.text
         })
-        .child(if public { "Công khai" } else { "Riêng tư" })
+        .child(if public {
+            locale::text("acl.public")
+        } else {
+            locale::text("acl.private")
+        })
 }
 
 fn acl_target_label(selected_objects: usize) -> String {
     match selected_objects {
-        0 | 1 => "Áp dụng cho object này".to_string(),
-        count => format!("Áp dụng cho {count} tệp đã chọn"),
+        0 | 1 => locale::text("acl.target.single").to_string(),
+        count => locale::text_n("acl.target.multi", count),
     }
 }
 
@@ -13009,10 +13565,15 @@ fn acl_permission_header(theme: Theme) -> impl IntoElement {
         .items_center()
         .gap_1()
         .text_color(theme.text_faint)
-        .child(div().flex_1().min_w(px(0.)).child("Ai"))
-        .child(acl_permission_heading("Đọc"))
-        .child(acl_permission_heading("Ghi"))
-        .child(acl_permission_heading("Toàn"))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .child(locale::text("acl.table.who")),
+        )
+        .child(acl_permission_heading(locale::text("acl.table.read")))
+        .child(acl_permission_heading(locale::text("acl.table.write")))
+        .child(acl_permission_heading(locale::text("acl.table.full")))
 }
 
 fn acl_permission_heading(label: &'static str) -> impl IntoElement {
@@ -13093,10 +13654,16 @@ fn acl_permission_cell(checked: bool, public: bool, theme: Theme) -> impl IntoEl
 /// past an hour are noise, and "3600 giây" makes the reader do the arithmetic.
 fn format_duration(seconds: u64) -> String {
     match seconds {
-        s if s < 60 => format!("{s} giây"),
-        s if s < 3600 => format!("{} phút", s / 60),
-        s if s < 86_400 => format!("{} giờ {} phút", s / 3600, (s % 3600) / 60),
-        s => format!("{} ngày", s / 86_400),
+        s if s < 60 => locale::text_n("duration.seconds", s),
+        s if s < 3600 => locale::text_n("duration.minutes", s / 60),
+        s if s < 86_400 => locale::text_with(
+            "duration.hours_minutes",
+            &[
+                ("{h}", &(s / 3600).to_string()),
+                ("{m}", &((s % 3600) / 60).to_string()),
+            ],
+        ),
+        s => locale::text_n("duration.days", s / 86_400),
     }
 }
 
@@ -13119,10 +13686,10 @@ fn format_duration(seconds: u64) -> String {
 /// the clock.
 fn format_age(seconds: i64) -> String {
     match seconds.max(0) {
-        s if s < 60 => "vừa xong".to_string(),
-        s if s < 3600 => format!("{} phút trước", s / 60),
-        s if s < 86_400 => format!("{} giờ trước", s / 3600),
-        s => format!("{} ngày trước", s / 86_400),
+        s if s < 60 => locale::text("age.just_now").to_string(),
+        s if s < 3600 => locale::text_n("age.minutes_ago", s / 60),
+        s if s < 86_400 => locale::text_n("age.hours_ago", s / 3600),
+        s => locale::text_n("age.days_ago", s / 86_400),
     }
 }
 
@@ -13501,7 +14068,7 @@ fn sidebar_blocked_reason(connected: bool) -> Option<&'static str> {
     if connected {
         None
     } else {
-        Some("Chưa kết nối tới profile nào")
+        Some(locale::text("sidebar.not_connected"))
     }
 }
 
@@ -13612,7 +14179,10 @@ fn queue_badge(stats: &transfer::Stats) -> Option<SharedString> {
     // Failures outlive the transfer that produced them, and they are the one
     // idle state worth a mark: nothing is moving, and something needs looking at.
     if stats.failed > 0 {
-        return Some(SharedString::from(format!("{} lỗi", stats.failed)));
+        return Some(SharedString::from(locale::text_n(
+            "queue.badge_failed",
+            stats.failed,
+        )));
     }
     None
 }
@@ -14385,10 +14955,10 @@ impl QueueSection {
     /// a value the Trạng thái column already prints.
     fn label(self) -> &'static str {
         match self {
-            QueueSection::Active => "ĐANG CHẠY",
-            QueueSection::Done => "XONG",
-            QueueSection::Failed => "HỎNG",
-            QueueSection::Canceled => "ĐÃ HUỶ",
+            QueueSection::Active => locale::text("queue.section.active"),
+            QueueSection::Done => locale::text("queue.section.done"),
+            QueueSection::Failed => locale::text("queue.section.failed"),
+            QueueSection::Canceled => locale::text("queue.section.canceled"),
         }
     }
 }
@@ -14480,6 +15050,23 @@ fn folder_display_name(group_key: &str, plain_counts: &HashMap<String, usize>) -
     format!("{bucket}/{prefix}{direction}")
 }
 
+/// The word for one job state, in the user's language.
+///
+/// The single home for these six words: `render_job`'s state cell and
+/// `folder_state_label` below used to each spell them out by hand, and having
+/// two copies is how one of them stays untranslated after the other gets
+/// fixed.
+fn job_state_text(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => locale::text("queue.job_state.queued"),
+        JobState::Running => locale::text("queue.job_state.running"),
+        JobState::Paused => locale::text("queue.job_state.paused"),
+        JobState::Done => locale::text("queue.job_state.done"),
+        JobState::Failed => locale::text("queue.job_state.failed"),
+        JobState::Canceled => locale::text("queue.job_state.canceled"),
+    }
+}
+
 /// What a folder row prints in the Trạng thái column.
 ///
 /// Not the section heading's word. A folder of files that have not started is
@@ -14490,17 +15077,17 @@ fn folder_display_name(group_key: &str, plain_counts: &HashMap<String, usize>) -
 fn folder_state_label(members: &[Job]) -> &'static str {
     let any = |wanted: JobState| members.iter().any(|job| job.state == wanted);
     if any(JobState::Running) {
-        "đang chạy"
+        job_state_text(JobState::Running)
     } else if any(JobState::Queued) {
-        "chờ"
+        job_state_text(JobState::Queued)
     } else if any(JobState::Paused) {
-        "tạm dừng"
+        job_state_text(JobState::Paused)
     } else if any(JobState::Failed) {
-        "lỗi"
+        job_state_text(JobState::Failed)
     } else if any(JobState::Canceled) {
-        "đã huỷ"
+        job_state_text(JobState::Canceled)
     } else {
-        "xong"
+        job_state_text(JobState::Done)
     }
 }
 
@@ -14660,11 +15247,24 @@ fn queue_rows(jobs: &[Job], expanded: &HashSet<String>) -> Vec<QueueRow> {
 /// Expiry choices for a presigned URL. Capped per-credential-type at sign time,
 /// so a temporary-credential profile silently gets the shorter of the two.
 const PRESIGN_PRESETS: [(&str, Duration); 4] = [
-    ("15 phút", Duration::from_secs(900)),
-    ("1 giờ", Duration::from_secs(3600)),
-    ("24 giờ", Duration::from_secs(24 * 3600)),
-    ("7 ngày", Duration::from_secs(7 * 24 * 3600)),
+    ("15m", Duration::from_secs(900)),
+    ("1h", Duration::from_secs(3600)),
+    ("24h", Duration::from_secs(24 * 3600)),
+    ("7d", Duration::from_secs(7 * 24 * 3600)),
 ];
+
+/// The localized label for a [`PRESIGN_PRESETS`] id. The id itself stays a
+/// stable, language-neutral identifier — it is compared for equality and
+/// stored in [`Share::chosen`] — while this is what actually gets drawn.
+fn presign_label(id: &'static str) -> &'static str {
+    match id {
+        "15m" => locale::text("presign.15m"),
+        "1h" => locale::text("presign.1h"),
+        "24h" => locale::text("presign.24h"),
+        "7d" => locale::text("presign.7d"),
+        _ => id,
+    }
+}
 
 /// Turns fetched bytes into something renderable. Text that is not valid UTF-8
 /// is treated as unsupported rather than shown as replacement characters —
@@ -14843,9 +15443,18 @@ fn table_column_widths(table: &Table) -> Vec<f32> {
 fn hidden_note(table: &Table) -> String {
     match (table.hidden_rows, table.hidden_columns) {
         (0, 0) => String::new(),
-        (rows, 0) => format!("còn {rows} dòng nữa"),
-        (0, columns) => format!("còn {columns} cột nữa"),
-        (rows, columns) => format!("còn {rows} dòng và {columns} cột nữa"),
+        (rows, 0) => locale::text_with("preview.hidden_rows", &[("{rows}", &rows.to_string())]),
+        (0, columns) => locale::text_with(
+            "preview.hidden_columns",
+            &[("{columns}", &columns.to_string())],
+        ),
+        (rows, columns) => locale::text_with(
+            "preview.hidden_rows_and_columns",
+            &[
+                ("{rows}", &rows.to_string()),
+                ("{columns}", &columns.to_string()),
+            ],
+        ),
     }
 }
 
@@ -14855,18 +15464,18 @@ fn build_preview(kind: PreviewKind, key: &str, bytes: Vec<u8>) -> Preview {
             Some(format) => {
                 Preview::Image(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
             }
-            None => Preview::Handoff("Không nhận ra định dạng ảnh".into()),
+            None => Preview::Handoff(locale::text("preview.unrecognized_image_format").into()),
         },
         PreviewKind::Text => match String::from_utf8(bytes) {
             Ok(text) => Preview::Text(text.into()),
-            Err(_) => Preview::Handoff("Tệp không phải văn bản UTF-8".into()),
+            Err(_) => Preview::Handoff(locale::text("preview.not_utf8_text").into()),
         },
         PreviewKind::Table(delimiter) => match String::from_utf8(bytes) {
             Ok(text) => Preview::Table(parse_table(&text, delimiter)),
-            Err(_) => Preview::Handoff("Tệp không phải văn bản UTF-8".into()),
+            Err(_) => Preview::Handoff(locale::text("preview.not_utf8_text").into()),
         },
         // Never reached with bytes in hand: nothing is fetched for these.
-        PreviewKind::None => Preview::Handoff("Không xem trước được kiểu này".into()),
+        PreviewKind::None => Preview::Handoff(locale::text("preview.unsupported_kind").into()),
     }
 }
 
@@ -15128,12 +15737,20 @@ fn search_summary(progress: SearchProgress) -> String {
     // A cap is checked before completion: a scan that hit the ceiling on its
     // last page did not cover the bucket, whatever the continuation token says.
     let state = match (capped, complete, running) {
-        (true, _, _) => "chạm trần",
-        (_, true, _) => "xong",
-        (_, false, true) => "đang quét",
-        (_, false, false) => "đã dừng",
+        (true, _, _) => locale::text("search.state_capped"),
+        (_, true, _) => locale::text("search.state_done"),
+        (_, false, true) => locale::text("search.state_scanning"),
+        (_, false, false) => locale::text("search.state_stopped"),
     };
-    format!("{found} kết quả, quét {scanned} mục trong {requests} yêu cầu ({state})")
+    locale::text_with(
+        "search.summary",
+        &[
+            ("{found}", &found.to_string()),
+            ("{scanned}", &scanned.to_string()),
+            ("{requests}", &requests.to_string()),
+            ("{state}", state),
+        ],
+    )
 }
 
 /// What a deep search will spend before it gives up on its own.
@@ -15927,18 +16544,20 @@ fn validate_profile(
 }
 
 fn profile_probe_bucket_ok(bucket: &str, prefix: &str, entries: usize) -> String {
-    if locale::language() == Language::Vietnamese {
-        return if prefix.is_empty() {
-            format!("Kết nối được tới {bucket}, thấy {entries} mục trang đầu")
-        } else {
-            format!("Kết nối được tới s3://{bucket}/{prefix}, thấy {entries} mục trang đầu")
-        };
-    }
-
     if prefix.is_empty() {
-        format!("Connection successful to {bucket}; first-page items: {entries}")
+        locale::text_with(
+            "probe.connected_bucket",
+            &[("{bucket}", bucket), ("{n}", &entries.to_string())],
+        )
     } else {
-        format!("Connection successful to s3://{bucket}/{prefix}; first-page items: {entries}")
+        locale::text_with(
+            "probe.connected_bucket_prefix",
+            &[
+                ("{bucket}", bucket),
+                ("{prefix}", prefix),
+                ("{n}", &entries.to_string()),
+            ],
+        )
     }
 }
 
@@ -16127,8 +16746,11 @@ fn fold(text: &str) -> String {
 /// because "Xoá 1 mục" tells the user nothing about what they are about to lose.
 fn delete_title(doomed: &[Entry]) -> String {
     match doomed {
-        [only] => format!("Xoá {}?", entry_name_of(&only.key)),
-        many => format!("Xoá {} mục?", many.len()),
+        [only] => locale::text_with(
+            "delete.title_single",
+            &[("{name}", &entry_name_of(&only.key))],
+        ),
+        many => locale::text_n("delete.title_many", many.len()),
     }
 }
 
@@ -16139,7 +16761,7 @@ fn delete_detail(doomed: &[Entry], versioned: bool) -> String {
     let folders = doomed.iter().filter(|entry| entry.is_folder).count();
 
     let mut detail = if folders > 0 {
-        format!("Gồm {folders} thư mục, kể cả nội dung bên trong. ")
+        locale::text_n("delete.includes_folders", folders)
     } else {
         String::new()
     };
@@ -16147,9 +16769,9 @@ fn delete_detail(doomed: &[Entry], versioned: bool) -> String {
     detail.push_str(if versioned {
         // A delete marker is not a deletion; saying "permanent" here would be a
         // lie, and saying nothing would leave the user thinking data is gone.
-        "Bucket này bật versioning: thao tác tạo delete marker, bản cũ vẫn còn và vẫn tính tiền lưu trữ."
+        locale::text("delete.versioned_detail")
     } else {
-        "Không hoàn tác được."
+        locale::text("delete.no_undo")
     });
     detail
 }
@@ -16793,46 +17415,48 @@ mod tests {
 
     #[test]
     fn durations_use_the_coarsest_unit_that_still_informs() {
-        assert_eq!(format_duration(0), "0 giây");
-        assert_eq!(format_duration(45), "45 giây");
+        // English defaults: `Language` defaults to English and this test
+        // never switches it.
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(45), "45s");
         // Past a minute the seconds are noise.
-        assert_eq!(format_duration(60), "1 phút");
-        assert_eq!(format_duration(3_599), "59 phút");
+        assert_eq!(format_duration(60), "1m");
+        assert_eq!(format_duration(3_599), "59m");
         // Past an hour, minutes still matter but seconds do not.
-        assert_eq!(format_duration(3_600), "1 giờ 0 phút");
-        assert_eq!(format_duration(7_380), "2 giờ 3 phút");
+        assert_eq!(format_duration(3_600), "1h 0m");
+        assert_eq!(format_duration(7_380), "2h 3m");
         // A transfer measured in days does not need the hours.
-        assert_eq!(format_duration(90_000), "1 ngày");
+        assert_eq!(format_duration(90_000), "1d");
     }
 
     #[test]
     fn an_age_is_one_unit_and_never_negative() {
         // No number under a minute: this is computed during a repaint and
         // nothing schedules another, so a seconds figure would be true for one
-        // instant and wrong from then on.
-        assert_eq!(format_age(0), "vừa xong");
-        assert_eq!(format_age(59), "vừa xong");
-        assert_eq!(format_age(60), "1 phút trước");
-        assert_eq!(format_age(300), "5 phút trước");
-        assert_eq!(format_age(3_599), "59 phút trước");
+        // instant and wrong from then on. English defaults, as above.
+        assert_eq!(format_age(0), "just now");
+        assert_eq!(format_age(59), "just now");
+        assert_eq!(format_age(60), "1m ago");
+        assert_eq!(format_age(300), "5m ago");
+        assert_eq!(format_age(3_599), "59m ago");
 
         // One unit past the hour, unlike `format_duration`: the second unit
         // there would claim the age is exact when it only moves on a redraw.
-        assert_eq!(format_age(3_600), "1 giờ trước");
-        assert_eq!(format_age(7_380), "2 giờ trước");
-        assert_eq!(format_age(86_399), "23 giờ trước");
-        assert_eq!(format_age(90_000), "1 ngày trước");
+        assert_eq!(format_age(3_600), "1h ago");
+        assert_eq!(format_age(7_380), "2h ago");
+        assert_eq!(format_age(86_399), "23h ago");
+        assert_eq!(format_age(90_000), "1d ago");
 
-        // Every arm says "trước". A bare duration in this app already means
-        // time remaining — the queue pill three lines away renders "còn 2 phút".
+        // Every arm says "ago". A bare duration in this app already means
+        // time remaining — the queue pill three lines away renders "2m left".
         for seconds in [60, 3_600, 90_000] {
-            assert!(format_age(seconds).ends_with("trước"), "{seconds}");
+            assert!(format_age(seconds).ends_with("ago"), "{seconds}");
         }
 
-        // The clock moving backwards between the fetch and now. "-3 phút" in
+        // The clock moving backwards between the fetch and now. "-3m" in
         // the status bar reads as a broken app rather than a broken clock.
-        assert_eq!(format_age(-1), "vừa xong");
-        assert_eq!(format_age(i64::MIN), "vừa xong");
+        assert_eq!(format_age(-1), "just now");
+        assert_eq!(format_age(i64::MIN), "just now");
     }
 
     #[test]
@@ -16917,18 +17541,19 @@ mod tests {
             })
         };
 
-        // The whole point of saying anything at all. "Không tìm thấy" from a
+        // The whole point of saying anything at all. "No results" from a
         // scan that covered a tenth of the bucket is a claim the app has no
         // basis for, and it is the claim that sends someone looking for a file
-        // somewhere else entirely.
-        assert!(line(true, false, false).contains("xong"));
-        assert!(line(false, false, true).contains("đang quét"));
-        assert!(line(false, false, false).contains("đã dừng"));
-        assert!(line(false, true, false).contains("chạm trần"));
+        // somewhere else entirely. English defaults, as `Language` never
+        // switches away from it in this test.
+        assert!(line(true, false, false).contains("done"));
+        assert!(line(false, false, true).contains("scanning"));
+        assert!(line(false, false, false).contains("stopped"));
+        assert!(line(false, true, false).contains("hit the cap"));
 
         // A cap reached on the very last page did not cover the bucket, whatever
         // the continuation token happened to say.
-        assert!(line(true, true, false).contains("chạm trần"));
+        assert!(line(true, true, false).contains("hit the cap"));
 
         // The request count is there because that is the line item on the bill,
         // not the key count.
@@ -16940,9 +17565,9 @@ mod tests {
             capped: false,
             running: true,
         });
-        assert!(line.contains("9 yêu cầu"), "{line}");
-        assert!(line.contains("9000 mục"), "{line}");
-        assert!(line.starts_with("0 kết quả"), "{line}");
+        assert!(line.contains("9 requests"), "{line}");
+        assert!(line.contains("9000 items"), "{line}");
+        assert!(line.starts_with("0 results"), "{line}");
     }
 
     #[test]
@@ -17092,7 +17717,7 @@ mod tests {
         // that `open` and `refresh_buckets` both refuse to do.
         assert_eq!(
             sidebar_blocked_reason(false),
-            Some("Chưa kết nối tới profile nào")
+            Some(locale::text("sidebar.not_connected"))
         );
     }
 
@@ -17404,20 +18029,24 @@ mod tests {
 
     #[test]
     fn acl_panel_names_the_multi_file_target() {
-        assert_eq!(acl_target_label(0), "Áp dụng cho object này");
-        assert_eq!(acl_target_label(1), "Áp dụng cho object này");
-        assert_eq!(acl_target_label(3), "Áp dụng cho 3 tệp đã chọn");
+        // These route through `locale::text`, whose global default is
+        // English (`Settings::default().language`), same as every other
+        // locale-backed string this test module checks — see
+        // `acl_permission_table_expands_full_control`'s `"Everyone"`.
+        assert_eq!(acl_target_label(0), "Applies to this object");
+        assert_eq!(acl_target_label(1), "Applies to this object");
+        assert_eq!(acl_target_label(3), "Applies to 3 selected files");
     }
 
     #[test]
     fn acl_unavailable_copy_separates_bucket_support_from_permissions() {
         assert_eq!(
             acl_unavailable_copy(Some(Support::No)).map(|(summary, _)| summary),
-            Some("Bucket này đã tắt ACL")
+            Some("ACLs are off on this bucket")
         );
         assert_eq!(
             acl_unavailable_copy(Some(Support::Forbidden)).map(|(summary, _)| summary),
-            Some("Token không có quyền ACL")
+            Some("Token lacks ACL permission")
         );
         assert!(acl_unavailable_copy(Some(Support::Yes)).is_none());
         assert!(acl_unavailable_copy(None).is_none());
@@ -17477,7 +18106,104 @@ mod tests {
 
             assert!(browser.bulk.is_none());
             assert_eq!(browser.failures.len(), 1);
-            assert_eq!(browser.failures[0].summary, "Bucket này đã tắt ACL");
+            assert_eq!(browser.failures[0].summary, "ACLs are off on this bucket");
+        });
+    }
+
+    #[test]
+    fn a_denied_acl_write_is_told_apart_from_an_unsupported_one() {
+        // `probe_acl` only confirms *read* access (`GetBucketAcl`); a bucket
+        // can allow that and still refuse `PutObjectAcl` for this token. The
+        // write failure is what actually tells the two cases apart, and they
+        // point at different fixes: a wider token versus no fix at all.
+        assert_eq!(
+            classify_acl_write_error("AccessControlListNotSupported"),
+            Some(Support::No)
+        );
+        assert_eq!(
+            classify_acl_write_error("AccessDenied"),
+            Some(Support::Forbidden)
+        );
+        // A transient failure says nothing about the capability either way.
+        assert_eq!(classify_acl_write_error("connection reset by peer"), None);
+    }
+
+    #[gpui::test]
+    fn the_share_dialogs_acl_button_opens_the_table_for_the_shared_object(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let entity = cx.new(|cx| offline(vec![entry("a.txt", false, 1)], cx));
+
+        entity.update(cx, |browser, cx| {
+            assert!(browser.inspector.is_none());
+            assert!(!browser.acl_popup_open);
+
+            browser.open_acl_table_for("a.txt".into(), cx);
+
+            // A presigned link is only as private as the object's own ACL, so
+            // the button has to point the popup at the object actually being
+            // shared — not whatever the inspector happened to be showing.
+            assert_eq!(
+                browser.inspector.as_ref().map(|i| i.key.as_str()),
+                Some("a.txt")
+            );
+            assert!(browser.acl_popup_open);
+        });
+
+        entity.update(cx, |browser, cx| {
+            // A second call for the same key must not clobber an inspector
+            // that has already finished loading — `render_acl_popup` reads
+            // `inspector.acl`, and resetting it back to `loading: true` would
+            // flash the table empty for a key it already had the answer for.
+            browser.inspector = Some(Inspection {
+                key: "a.txt".into(),
+                head: None,
+                tags: Vec::new(),
+                acl: None,
+                loading: false,
+                versions: Vec::new(),
+            });
+            browser.acl_popup_open = false;
+
+            browser.open_acl_table_for("a.txt".into(), cx);
+
+            assert!(!browser.inspector.as_ref().unwrap().loading);
+            assert!(browser.acl_popup_open);
+        });
+    }
+
+    #[gpui::test]
+    fn the_docked_inspector_yields_to_an_open_preview(cx: &mut gpui::TestAppContext) {
+        let entity = cx.new(|cx| offline(vec![entry("a.txt", false, 1)], cx));
+
+        entity.update(cx, |browser, _cx| {
+            browser.screen = Screen::Objects;
+            browser.inspector = Some(Inspection {
+                key: "a.txt".into(),
+                head: None,
+                tags: Vec::new(),
+                acl: None,
+                loading: false,
+                versions: Vec::new(),
+            });
+            // The docked panel and the preview's own side panel both read
+            // `self.inspector` — closing the preview must not have wiped it,
+            // or the preview's own metadata would go blank too.
+            assert!(browser.shows_docked_inspector());
+
+            browser.previewing = Some(Previewing {
+                key: "a.txt".into(),
+                name: "a.txt".into(),
+                content: None,
+                size: 1,
+                editing: None,
+                saving: false,
+            });
+            assert!(!browser.shows_docked_inspector());
+            assert!(browser.inspector.is_some());
+
+            browser.previewing = None;
+            assert!(browser.shows_docked_inspector());
         });
     }
 
@@ -17761,10 +18487,11 @@ mod tests {
             // of the ones that happen to have arrived", and the old code said
             // nothing at all about that.
             browser.continuation = Some("token".into());
+            // English default: `Language` never switches away from it here.
             assert!(
                 browser
                     .listing_summary()
-                    .contains("sắp xếp trên phần đã tải"),
+                    .contains("sorted on the part loaded"),
                 "{}",
                 browser.listing_summary()
             );
@@ -17881,7 +18608,8 @@ mod tests {
         let table = parse_table(&text, ',');
         assert_eq!(table.rows.len(), TABLE_ROWS);
         assert_eq!(table.hidden_rows, 5);
-        assert_eq!(hidden_note(&table), "còn 5 dòng nữa");
+        // English default: `Language` never switches away from it here.
+        assert_eq!(hidden_note(&table), "5 more rows");
 
         let wide: String = (0..TABLE_COLUMNS + 3)
             .map(|i| i.to_string())
@@ -17890,7 +18618,7 @@ mod tests {
         let table = parse_table(&wide, ',');
         assert_eq!(table.headers.len(), TABLE_COLUMNS);
         assert_eq!(table.hidden_columns, 3);
-        assert_eq!(hidden_note(&table), "còn 3 cột nữa");
+        assert_eq!(hidden_note(&table), "3 more columns");
     }
 
     #[test]
@@ -18332,35 +19060,37 @@ mod tests {
 
     #[test]
     fn delete_dialog_names_a_single_victim_but_counts_a_crowd() {
+        // English defaults: `Language` defaults to English and these tests
+        // never switch it.
         assert_eq!(
             delete_title(&[entry("a/report.txt", false, 0)]),
-            "Xoá report.txt?"
+            "Delete report.txt?"
         );
-        assert_eq!(delete_title(&[entry("a/logs", true, 0)]), "Xoá logs?");
+        assert_eq!(delete_title(&[entry("a/logs", true, 0)]), "Delete logs?");
         assert_eq!(
             delete_title(&[entry("a.txt", false, 0), entry("b.txt", false, 0)]),
-            "Xoá 2 mục?"
+            "Delete 2 items?"
         );
     }
 
     #[test]
     fn delete_dialog_warns_about_folders_and_tells_the_truth_about_versioning() {
-        // Plain objects in a plain bucket: gone means gone.
+        // Plain objects in a plain bucket: gone means gone. English default.
         let files = [entry("a.txt", false, 0)];
-        assert_eq!(delete_detail(&files, false), "Không hoàn tác được.");
+        assert_eq!(delete_detail(&files, false), locale::text("delete.no_undo"));
 
         // A folder stands for everything under it, which the listing does not show.
         let with_folder = [entry("a.txt", false, 0), entry("logs", true, 0)];
         let detail = delete_detail(&with_folder, false);
-        assert!(detail.starts_with("Gồm 1 thư mục"), "{detail}");
-        assert!(detail.contains("nội dung bên trong"), "{detail}");
+        assert!(detail.starts_with("Includes 1 folder"), "{detail}");
+        assert!(detail.contains("everything inside"), "{detail}");
 
         // Versioned buckets must not be told "cannot be undone" — it is false,
         // and it hides that the old versions keep costing money.
         let versioned = delete_detail(&files, true);
         assert!(versioned.contains("delete marker"), "{versioned}");
         assert!(
-            !versioned.contains("Không hoàn tác được"),
+            !versioned.contains(locale::text("delete.no_undo")),
             "a versioned delete is reversible: {versioned}"
         );
     }
@@ -18446,14 +19176,14 @@ mod tests {
         let closed = HashSet::new();
         assert_eq!(
             drawn(&queue_rows(&jobs, &closed)),
-            ["# ĐANG CHẠY", "[3] photos"]
+            ["# RUNNING", "[3] photos"]
         );
 
         let open = HashSet::from([folder_group_key(&jobs[0]).unwrap()]);
         assert_eq!(
             drawn(&queue_rows(&jobs, &open)),
             [
-                "# ĐANG CHẠY",
+                "# RUNNING",
                 "[3] photos",
                 "  photos/a.jpg",
                 "  photos/b.jpg",
@@ -18474,7 +19204,7 @@ mod tests {
 
         assert_eq!(
             drawn(&queue_rows(&jobs, &HashSet::new())),
-            ["# ĐANG CHẠY", "photos/only.jpg", "top.txt", "other.txt"]
+            ["# RUNNING", "photos/only.jpg", "top.txt", "other.txt"]
         );
     }
 
@@ -18533,14 +19263,14 @@ mod tests {
         assert_eq!(
             drawn(&queue_rows(&jobs, &HashSet::new())),
             [
-                "# ĐANG CHẠY",
+                "# RUNNING",
                 "running.txt",
                 "paused.txt",
-                "# XONG",
+                "# DONE",
                 "done.txt",
-                "# HỎNG",
+                "# FAILED",
                 "failed.txt",
-                "# ĐÃ HUỶ",
+                "# CANCELED",
                 "canceled.txt",
             ]
         );
@@ -18549,7 +19279,7 @@ mod tests {
         let only_done = [job(1, "done.txt", JobState::Done)];
         assert_eq!(
             drawn(&queue_rows(&only_done, &HashSet::new())),
-            ["# XONG", "done.txt"]
+            ["# DONE", "done.txt"]
         );
         assert!(queue_rows(&[], &HashSet::new()).is_empty());
     }
@@ -18573,7 +19303,7 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["# ĐANG CHẠY", "[2] backup/photos ↑", "[2] demo/photos ↑"]
+            ["# RUNNING", "[2] backup/photos ↑", "[2] demo/photos ↑"]
         );
 
         // Same bucket, opposite directions: the bucket cannot separate them, so
@@ -18586,7 +19316,7 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["# ĐANG CHẠY", "[2] demo/photos ↑", "[2] demo/photos ↓"]
+            ["# RUNNING", "[2] demo/photos ↑", "[2] demo/photos ↓"]
         );
 
         // And with nothing to collide with, the row stays short.
@@ -18596,7 +19326,7 @@ mod tests {
         ];
         assert_eq!(
             drawn(&queue_rows(&alone, &HashSet::new())),
-            ["# ĐANG CHẠY", "[2] photos"]
+            ["# RUNNING", "[2] photos"]
         );
     }
 
@@ -18612,30 +19342,40 @@ mod tests {
             job(2, "photos/b.jpg", JobState::Queued),
         ];
         assert_eq!(folder_section(&queued), QueueSection::Active);
-        assert_eq!(folder_state_label(&queued), "chờ");
+        assert_eq!(
+            folder_state_label(&queued),
+            job_state_text(JobState::Queued)
+        );
 
         // One file moving is enough to call the folder moving.
         let mixed = [
             job(1, "photos/a.jpg", JobState::Queued),
             job(2, "photos/b.jpg", JobState::Running),
         ];
-        assert_eq!(folder_state_label(&mixed), "đang chạy");
+        assert_eq!(
+            folder_state_label(&mixed),
+            job_state_text(JobState::Running)
+        );
 
-        // Nothing moving and something broken: the cell says "lỗi", the word a
-        // failed job's own row uses — not "hỏng", which is the heading's.
+        // Nothing moving and something broken: the cell says "failed", the
+        // word a failed job's own row uses — not "FAILED", which is the
+        // heading's.
         let broken = [
             job(1, "photos/a.jpg", JobState::Done),
             job(2, "photos/b.jpg", JobState::Failed),
         ];
         assert_eq!(folder_section(&broken), QueueSection::Failed);
-        assert_eq!(folder_state_label(&broken), "lỗi");
+        assert_eq!(
+            folder_state_label(&broken),
+            job_state_text(JobState::Failed)
+        );
 
-        // "xong" only when the whole folder arrived.
+        // "done" only when the whole folder arrived.
         let done = [
             job(1, "photos/a.jpg", JobState::Done),
             job(2, "photos/b.jpg", JobState::Done),
         ];
-        assert_eq!(folder_state_label(&done), "xong");
+        assert_eq!(folder_state_label(&done), job_state_text(JobState::Done));
     }
 
     #[test]
@@ -18652,7 +19392,7 @@ mod tests {
 
         assert_eq!(
             drawn(&queue_rows(&jobs, &HashSet::new())),
-            ["# ĐANG CHẠY", "[2] trip", "[2] trip/raw"]
+            ["# RUNNING", "[2] trip", "[2] trip/raw"]
         );
     }
 }

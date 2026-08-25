@@ -1,0 +1,8 @@
+// gpui's `load_icon()` (vendor/gpui/src/platform/windows/platform.rs) loads
+// the running .exe's own icon resource with `LoadImageW(module, PCWSTR(1), IMAGE_ICON, ...)` --
+// resource ID 1, from whatever module GetModuleHandleW(None) resolves to, which
+// for a statically-linked binary is s3browser.exe itself, not gpui.dll. gpui's
+// own .rc (resources/windows/gpui.rc) embeds only the manifest, so unless this
+// binary embeds its own `1 ICON`, that load finds nothing and every window,
+// the taskbar entry and Explorer all show a blank icon.
+1 ICON "s3browser.ico"
