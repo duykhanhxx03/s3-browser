@@ -84,7 +84,10 @@ cp "$BINARY" "$DEB/usr/bin/s3browser"
 chmod 755 "$DEB/usr/bin/s3browser"
 cp "$ROOT/LICENSE" "$DEB/usr/share/doc/s3browser/copyright"
 
-SIZE=$(du -sk "$DEB" --exclude=DEBIAN | cut -f1)
+# `du --exclude` is GNU-only; BSD `du` (macOS) has no equivalent flag, so the
+# DEBIAN control directory's own size is subtracted out instead, which works
+# on both.
+SIZE=$(( $(du -sk "$DEB" | cut -f1) - $(du -sk "$DEB/DEBIAN" | cut -f1) ))
 cat > "$DEB/DEBIAN/control" <<EOF
 Package: s3browser
 Version: ${VERSION}
