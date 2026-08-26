@@ -15,6 +15,7 @@ mod crash;
 mod failure;
 #[cfg(target_os = "macos")]
 mod glass_check;
+mod http_client;
 mod locale;
 mod platform;
 mod settings;
@@ -36,6 +37,11 @@ fn main() {
 
     Application::new()
         .with_assets(assets::Assets)
+        // Without this, `cx.http_client()` answers with gpui's own
+        // `NullHttpClient`, which fails every request with "No HttpClient
+        // available" — the update checker is the only thing in the app that
+        // calls it, so leaving this unset meant that feature never worked.
+        .with_http_client(http_client::ReqwestClient::new())
         .run(|cx: &mut App| {
             gpui_tokio::init(cx);
             // Brings the component library's key bindings and theme with it. The

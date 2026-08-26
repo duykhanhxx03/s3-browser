@@ -20,9 +20,25 @@ opener.workspace = true
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+http = "1"
+bytes = "1"
+futures = "0.3"
+
+# The exact fork gpui's own HttpClient plumbing already expects — see
+# `AsyncBody`'s `TryFrom<reqwest::Body>` in `gpui_http_client`, which names
+# this same package. Needed because `Application::new()` otherwise wires up
+# `NullHttpClient`, whose every request fails with "No HttpClient available":
+# nothing before this made the update check use a client that could actually
+# reach the network.
+[dependencies.reqwest]
+version = "0.12.15-zed"
+package = "zed-reqwest"
+default-features = false
+features = ["rustls-tls-native-roots"]
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["macros"] }
 
 # Not host-gated: `cfg()` on a build-dependency is evaluated against the host,
 # so gating it on Windows makes it vanish exactly when cross-compiling to

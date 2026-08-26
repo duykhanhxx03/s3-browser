@@ -3149,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_tokio"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "gpui",
@@ -6181,14 +6181,17 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3browser"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
+ "bytes",
  "dirs 6.0.0",
  "embed-resource",
+ "futures",
  "gpui",
  "gpui-component",
  "gpui_tokio",
+ "http 1.5.0",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -6196,13 +6199,15 @@ dependencies = [
  "s3core",
  "serde",
  "serde_json",
+ "tokio",
  "transfer",
  "vault",
+ "zed-reqwest",
 ]
 
 [[package]]
 name = "s3core"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -7509,7 +7514,7 @@ dependencies = [
 
 [[package]]
 name = "transfer"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -7826,7 +7831,7 @@ dependencies = [
 
 [[package]]
 name = "vault"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",

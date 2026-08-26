@@ -6938,18 +6938,20 @@ impl Browser {
                     // the 40px button, not necessarily over the 14px of glyph.
                     .group_hover(group, move |style| style.text_color(hovered)),
             )
-            // Windows never delivers this click: once the hit test names the
-            // button, the press is a non-client event the OS acts on itself.
-            .when(cfg!(target_os = "windows"), |this| {
-                this.window_control_area(button.area())
-            })
-            .when(!cfg!(target_os = "windows"), |this| {
-                this.on_click(cx.listener(move |_this, _event, window, _cx| match button {
-                    WindowButton::Minimize => window.minimize_window(),
-                    WindowButton::Maximize | WindowButton::Restore => window.zoom_window(),
-                    WindowButton::Close => window.remove_window(),
-                }))
-            })
+            .when(
+                window_control_is_native(button, cfg!(target_os = "windows")),
+                |this| this.window_control_area(button.area()),
+            )
+            .when(
+                !window_control_is_native(button, cfg!(target_os = "windows")),
+                |this| {
+                    this.on_click(cx.listener(move |_this, _event, window, _cx| match button {
+                        WindowButton::Minimize => window.minimize_window(),
+                        WindowButton::Maximize | WindowButton::Restore => window.zoom_window(),
+                        WindowButton::Close => window.remove_window(),
+                    }))
+                },
+            )
     }
 
     /// The tab bar.
@@ -16241,6 +16243,32 @@ impl WindowButton {
     }
 }
 
+/// Whether `button` should be wired as a native non-client hit-test area
+/// (`window_control_area`) rather than a plain client-side click, on the
+/// given platform.
+///
+/// A parameter rather than reading `cfg!(target_os = "windows")` directly, so
+/// both branches can be tested from either platform — the interesting one is
+/// by definition not the one running the test. Same reasoning as
+/// [`platform::decide_window_controls`].
+///
+/// Minimize and Maximize go through the OS on Windows: once the hit test
+/// names one of those, the press is a non-client event Windows acts on
+/// itself, and marking Maximize this way is what gets Windows 11's Snap
+/// Layout flyout on hover — something a plain `on_click` cannot reproduce.
+///
+/// Close gets no such benefit — there is no OS feature tied to `HTCLOSE` the
+/// way Snap Layout is tied to `HTMAXBUTTON` — and going through it cost Close
+/// its click entirely: `WM_NCLBUTTONDOWN`/`WM_NCLBUTTONUP` only fire the
+/// close if the hit test still answers `HTCLOSE` on *both* messages, so any
+/// drift between press and release on this 40px-wide target drops the click
+/// with no feedback at all, not even a hover. Close is wired the same way
+/// every other platform already handles it instead: a plain click on the
+/// client area.
+fn window_control_is_native(button: WindowButton, on_windows: bool) -> bool {
+    on_windows && button != WindowButton::Close
+}
+
 /// The file-type tile shown in the preview and detail headers.
 ///
 /// One helper for all three places that had it, because they were three copies
@@ -18391,6 +18419,27 @@ mod tests {
                     .is_some(),
                 "{path} không có trong bộ icon"
             );
+        }
+    }
+
+    #[test]
+    fn close_never_goes_through_the_native_hit_test() {
+        // The bug this exists for: wiring Close the same way as Minimize and
+        // Maximize made `WM_NCLBUTTONDOWN`/`WM_NCLBUTTONUP` the only path to
+        // closing the window on Windows, and that path silently drops the
+        // click if the cursor is a pixel off between press and release — no
+        // hover, no close, no error. Close must always take the plain
+        // client-side click instead, on every platform.
+        assert!(!window_control_is_native(WindowButton::Close, true));
+        assert!(!window_control_is_native(WindowButton::Close, false));
+
+        // Minimize and Maximize keep the native path on Windows — that is
+        // what gets Windows 11's Snap Layout flyout on Maximize — and never
+        // use it anywhere else, where there is no such non-client mechanism
+        // to hook into.
+        for button in [WindowButton::Minimize, WindowButton::Maximize] {
+            assert!(window_control_is_native(button, true));
+            assert!(!window_control_is_native(button, false));
         }
     }
 
