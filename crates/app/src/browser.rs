@@ -5310,18 +5310,25 @@ impl Browser {
     fn check_for_update(&mut self, announce: bool, cx: &mut Context<Self>) {
         let http = cx.http_client();
         let current = env!("CARGO_PKG_VERSION");
+        // On Tokio's runtime rather than gpui's own executor, like every other
+        // network call here: reqwest resolves the hostname through
+        // `spawn_blocking`, which panics with "there is no reactor running"
+        // when the future is polled anywhere else. `cx.spawn` runs it on the
+        // foreground executor, so the silent check on launch took the whole
+        // application down before the first frame.
+        let checking = Tokio::spawn(cx, async move { crate::update::check(http, current).await });
         self.update_task = Some(cx.spawn(async move |this, cx| {
-            let found = crate::update::check(http, current).await;
+            let found = checking.await;
             _ = this.update(cx, |this, cx| {
                 match found {
-                    Ok(Some(update)) => {
+                    Ok(Ok(Some(update))) => {
                         this.status = SharedString::from(locale::text_with(
                             "update.available_on_github",
                             &[("{version}", &update.version)],
                         ));
                         this.update = Some(update);
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         // Cleared, not left alone: a check that now says no is
                         // the newer answer, and a button offering a version
                         // that has been pulled is worse than no button.
@@ -5333,10 +5340,18 @@ impl Browser {
                             ));
                         }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         if announce {
                             this.report(locale::text_with(
                                 "update.check_failed",
+                                &[("{error}", &format!("{error:?}"))],
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if announce {
+                            this.report(locale::text_with(
+                                "error.task_join",
                                 &[("{error}", &format!("{error:?}"))],
                             ));
                         }
