@@ -6869,10 +6869,7 @@ impl Browser {
                     .h(px(34.))
                     .flex()
                     .items_center()
-                    .child(brand_logo(
-                        theme_mode(self.settings.theme, self.appearance),
-                        104.,
-                    )),
+                    .child(brand_logo(theme, 104.)),
             )
             .when_some(self.path_input.clone(), |this, input| {
                 this.child(
@@ -9294,7 +9291,6 @@ impl Browser {
             return None;
         }
         let theme = self.theme;
-        let mode = theme_mode(self.settings.theme, self.appearance);
         let crash_dir = crate::crash::report_dir();
 
         // Both paths get the same row: the button's label *is* the path, so it
@@ -9371,7 +9367,7 @@ impl Browser {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(brand_logo(mode, 156.))
+                                    .child(brand_logo(theme, 156.))
                                     .child(
                                         div()
                                             .text_xs()
@@ -12338,7 +12334,6 @@ impl Browser {
             return None;
         }
         let theme = self.theme;
-        let mode = theme_mode(self.settings.theme, self.appearance);
 
         Some(
             div()
@@ -12396,7 +12391,7 @@ impl Browser {
                                 .flex_col()
                                 .items_center()
                                 .gap_4()
-                                .child(brand_logo(mode, 188.))
+                                .child(brand_logo(theme, 188.))
                                 .child(
                                     div().w_full().flex().flex_col().gap_2().children(
                                         [
@@ -13454,7 +13449,10 @@ impl Render for Browser {
         self.perf.note_render();
         let theme = self.theme;
 
-        sync_component_theme(theme_mode(self.settings.theme, self.appearance), window, cx);
+        // The theme's own mode, not the setting's: a palette that cannot do
+        // the mode asked for overrides it, and the widgets must follow the
+        // window rather than the preference.
+        sync_component_theme(theme, theme.mode(), window, cx);
 
         // Read here rather than inside the title bar: the maximise button and
         // the restore button are the same button, and which one it is depends
@@ -13835,7 +13833,11 @@ fn inspector_section(title: impl Into<SharedString>, theme: Theme) -> gpui::Div 
 }
 
 fn preview_shell(theme: Theme) -> gpui::Hsla {
-    if theme.text.l > 0.5 {
+    // Asks the theme which side it is on rather than inferring it from how
+    // light the text looks in HSL. Every palette happens to answer the same
+    // either way today, but HSL lightness is not perceptual — it is what put
+    // white on a teal accent at 2.75:1 — so it has no business deciding this.
+    if theme.mode() == crate::theme::Mode::Dark {
         gpui::rgba(0x17191dde).into()
     } else {
         gpui::rgba(0xffffffd9).into()
@@ -13843,7 +13845,7 @@ fn preview_shell(theme: Theme) -> gpui::Hsla {
 }
 
 fn preview_veil(theme: Theme) -> gpui::Hsla {
-    if theme.text.l > 0.5 {
+    if theme.mode() == crate::theme::Mode::Dark {
         gpui::rgba(0xffffff0f).into()
     } else {
         gpui::rgba(0xffffff99).into()
@@ -14396,20 +14398,23 @@ fn menu_icon(name: &'static str) -> gpui_component::Icon {
     gpui_component::Icon::empty().path(SharedString::from(format!("icons/{name}.svg")))
 }
 
-fn brand_logo(mode: crate::theme::Mode, width: f32) -> impl IntoElement {
+/// The wordmark, coloured against the ground it is actually drawn on.
+///
+/// It used to hold two pairs of fixed hex values and pick between them by
+/// `Mode`, which broke twice over once palettes could set their own ground.
+/// The mild failure was contrast: `#1476f2` on the built-in light theme is
+/// 4.03:1, under AA for the 15px title-bar size. The severe one was that the
+/// mode it was handed came from the *setting*, while a palette that cannot do
+/// that mode overrides it — a light palette under a dark setting painted the
+/// near-white wordmark onto near-white at 1.02:1.
+///
+/// Both go away by reading the theme instead of guessing from a mode.
+fn brand_logo(theme: Theme, width: f32) -> impl IntoElement {
     let height = width * 144. / 440.;
     let font_size = width * 64. / 440.;
-    let (accent, foreground) = match mode {
-        crate::theme::Mode::Light => (gpui::rgb(0x1476f2), gpui::rgb(0x111827)),
-        crate::theme::Mode::Dark => (gpui::rgb(0x2f8cff), gpui::rgb(0xf8fafc)),
-    };
 
-    // Keep the wordmark in GPUI's text pipeline. The old SVG contained <text>
-    // whose font was resolved by usvg's separate, system-only font database;
-    // on a minimal Linux install none of its macOS/Windows families existed and
-    // the logo rasterized blank. This uses the embedded UI font registered at
-    // startup, so the title bar, onboarding and About dialog behave identically
-    // on every platform.
+    let (accent, foreground) = theme.wordmark(font_size);
+
     div()
         .w(px(width))
         .h(px(height))
@@ -16491,20 +16496,82 @@ fn theme_mode(choice: ThemeChoice, appearance: gpui::WindowAppearance) -> crate:
     }
 }
 
-/// Puts the component library on the same side of light and dark as the app.
+/// Puts the component library on the same colours as the app.
 ///
 /// It keeps its own palette for the widgets it draws — inputs, menus, the
-/// select — and nothing was ever telling it which one to use. So the text
-/// fields stayed dark while everything around them turned light: a black box
-/// with white text in the middle of a white toolbar.
-fn sync_component_theme(mode: crate::theme::Mode, window: &mut Window, cx: &mut App) {
+/// select, tooltips — and nothing was ever telling it which one to use. So the
+/// text fields stayed dark while everything around them turned light: a black
+/// box with white text in the middle of a white toolbar.
+///
+/// Switching its light/dark mode fixed that much, but only that much: once a
+/// colour palette could set the app's own ground, the widgets were still
+/// painting the library's stock greys onto it. A text field on Mint Glass had
+/// no relation to the window it sat in, and its contrast was whatever the two
+/// unrelated palettes happened to produce. So the app's tokens are pushed
+/// across as well, and the widgets inherit the same guarantees the rest of the
+/// interface has.
+fn sync_component_theme(theme: Theme, mode: crate::theme::Mode, window: &mut Window, cx: &mut App) {
     let mode = match mode {
         crate::theme::Mode::Light => gpui_component::ThemeMode::Light,
         crate::theme::Mode::Dark => gpui_component::ThemeMode::Dark,
     };
+    // Mode first: `change` resets every colour to the library's defaults for
+    // that side, so anything written before it would be thrown away.
     if gpui_component::Theme::global(cx).mode != mode {
         gpui_component::Theme::change(mode, Some(window), cx);
     }
+
+    // Checked before writing, and not merely as an optimisation: this runs
+    // from `render`, and gpui's `global_mut` queues a global-observer
+    // notification every time it is called — which schedules another render,
+    // which calls this again. Taking the mutable borrow unconditionally spins
+    // the app at full tilt on a window nobody is touching.
+    if !component_colors_match(&gpui_component::Theme::global(cx).colors, theme) {
+        apply_component_colors(&mut gpui_component::Theme::global_mut(cx).colors, theme);
+    }
+}
+
+/// The tokens the app hands to the component library.
+///
+/// Paired with [`component_colors_match`] below, which has to test exactly
+/// what this sets — a field written here and not checked there is written on
+/// every frame for ever.
+fn apply_component_colors(colors: &mut gpui_component::ThemeColor, theme: Theme) {
+    colors.background = theme.ground.alpha(1.0);
+    colors.foreground = theme.text;
+    colors.muted = theme.hover;
+    colors.muted_foreground = theme.text_muted;
+    colors.border = theme.border;
+    // The outline around a text field, which has to be visible against the
+    // panel it sits on rather than merely present.
+    colors.input = theme.border_strong;
+    colors.ring = theme.accent;
+    colors.selection = theme.selected;
+    // Menus and popovers are the app's modal, so a dropdown over the toolbar
+    // reads as the same material as a dialog.
+    colors.popover = theme.modal;
+    colors.popover_foreground = theme.text;
+    colors.accent = theme.hover;
+    colors.accent_foreground = theme.text;
+    colors.secondary = theme.panel;
+    colors.list_active = theme.selected;
+}
+
+fn component_colors_match(colors: &gpui_component::ThemeColor, theme: Theme) -> bool {
+    colors.background == theme.ground.alpha(1.0)
+        && colors.foreground == theme.text
+        && colors.muted == theme.hover
+        && colors.muted_foreground == theme.text_muted
+        && colors.border == theme.border
+        && colors.input == theme.border_strong
+        && colors.ring == theme.accent
+        && colors.selection == theme.selected
+        && colors.popover == theme.modal
+        && colors.popover_foreground == theme.text
+        && colors.accent == theme.hover
+        && colors.accent_foreground == theme.text
+        && colors.secondary == theme.panel
+        && colors.list_active == theme.selected
 }
 
 /// One row of the settings panel: what it is, why it matters, and the control.

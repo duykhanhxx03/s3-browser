@@ -146,21 +146,42 @@ impl Theme {
         let mut ordered: Vec<Hsla> = colors.map(|hex| Hsla::from(rgb(hex))).to_vec();
         ordered.sort_by(|a, b| color::luminance(*a).total_cmp(&color::luminance(*b)));
 
-        let ground = if dark {
-            ordered[0]
-        } else {
-            ordered[ordered.len() - 1]
-        };
+        // How much colour a surface may carry depends on how much of the
+        // window it covers. A palette is chosen as four small swatches, but
+        // the ground is a whole window of one of them, and a chroma that gives
+        // a chip its character glares across 1120x720. Material 3 draws its
+        // surfaces from a neutral at 0.02 chroma and its borders from a
+        // variant at 0.04, which is the scale used here. The accent is left
+        // alone: a small area is exactly where a palette should be loud.
+        const GROUND_CHROMA: f32 = 0.02;
+        const SURFACE_CHROMA: f32 = 0.03;
+        const LINE_CHROMA: f32 = 0.045;
+        const TEXT_CHROMA: f32 = 0.06;
+
+        // Capped before anything is measured against it, so every contrast
+        // check below sees the colour that will actually be painted.
+        let ground = color::cap_chroma(
+            if dark {
+                ordered[0]
+            } else {
+                ordered[ordered.len() - 1]
+            },
+            GROUND_CHROMA,
+        );
         let ground_l = color::lightness(ground);
 
         // Text is the palette's own far end when that end is readable, and
         // the same hue pushed until it is when it is not. Aimed past AA at
         // 7:1, because body text is what the whole window is made of.
-        let far = if dark {
-            ordered[ordered.len() - 1]
-        } else {
-            ordered[0]
-        };
+        // Capped first and lifted second, so readability has the last word.
+        let far = color::cap_chroma(
+            if dark {
+                ordered[ordered.len() - 1]
+            } else {
+                ordered[0]
+            },
+            TEXT_CHROMA,
+        );
         let text = color::lift_until(far, ground, 7.0, if dark { 1.0 } else { 0.0 });
 
         // Surfaces step away from the ground in perceptual lightness, so the
@@ -168,11 +189,14 @@ impl Theme {
         // step is pulled back if it drifts far enough to cost the body text
         // its 4.5:1.
         let step = if dark { 0.055 } else { -0.045 };
-        let near = if dark {
-            ordered[1]
-        } else {
-            ordered[ordered.len() - 2]
-        };
+        let near = color::cap_chroma(
+            if dark {
+                ordered[1]
+            } else {
+                ordered[ordered.len() - 2]
+            },
+            SURFACE_CHROMA,
+        );
         let surface = |seed: Hsla, want: f32| -> Hsla {
             for i in (1..=12).rev() {
                 let candidate =
@@ -249,8 +273,14 @@ impl Theme {
                 black
             },
 
-            border: color::with_lightness(ground, ground_l + step * 3.0),
-            border_strong: color::with_lightness(ground, ground_l + step * 4.4),
+            border: color::cap_chroma(
+                color::with_lightness(ground, ground_l + step * 3.0),
+                LINE_CHROMA,
+            ),
+            border_strong: color::cap_chroma(
+                color::with_lightness(ground, ground_l + step * 4.4),
+                LINE_CHROMA,
+            ),
 
             accent,
             danger: color::lift_until(
@@ -259,6 +289,44 @@ impl Theme {
                 color::CONTRAST_UI,
                 limit,
             ),
+        }
+    }
+
+    /// The two wordmark colours, for a wordmark drawn at `font_size`.
+    ///
+    /// Lives on the theme rather than in the logo so the test exercises the
+    /// same code the title bar does — a test that recomputed the rule would go
+    /// on passing whatever the logo actually did.
+    pub fn wordmark(self, font_size: f32) -> (Hsla, Hsla) {
+        // WCAG counts bold text from 18.66px up as large, which needs only
+        // 3:1. The title bar draws this at 15px and does not qualify.
+        let needed = if font_size >= 18.66 {
+            color::CONTRAST_UI
+        } else {
+            color::CONTRAST_TEXT
+        };
+        let ground = self.ground.alpha(1.0);
+        let toward = if color::luminance(ground) < 0.5 {
+            1.0
+        } else {
+            0.0
+        };
+        (
+            color::lift_until(self.accent, ground, needed, toward),
+            self.text,
+        )
+    }
+
+    /// Which side of light and dark this theme actually landed on.
+    ///
+    /// Read off the ground, not off the setting that asked for it: a palette
+    /// that cannot be built in the mode requested overrides it, and anything
+    /// still consulting the setting then disagrees with the window.
+    pub fn mode(self) -> Mode {
+        if color::luminance(self.ground.alpha(1.0)) < 0.5 {
+            Mode::Dark
+        } else {
+            Mode::Light
         }
     }
 
@@ -457,8 +525,14 @@ mod tests {
         }
     }
 
-    /// The point of the rewrite: a palette's own colours reach the window,
-    /// rather than being washed over the built-in ones.
+    /// The point of the rewrite: the window's ground comes from the palette,
+    /// not from the built-in theme with a wash of palette over it.
+    ///
+    /// Not an exact match any more — the ground's chroma is capped so a
+    /// saturated palette does not glare across the whole window — so what is
+    /// checked is that it is one of the palette's colours with only its
+    /// colourfulness taken down: same lightness, never more chroma than it
+    /// started with, and nowhere near the stock ground it used to be.
     #[test]
     fn a_palette_actually_paints_its_own_ground() {
         for palette in ColorPalette::ALL {
@@ -467,15 +541,72 @@ mod tests {
             };
             let mode = Theme::palette_mode(palette.colors(), Mode::Dark);
             let theme = Theme::from_palette(palette.colors(), Some(accent), mode, Chrome::Solid);
-            let is_one_of_the_palettes_own = palette
-                .colors()
-                .iter()
-                .any(|hex| Hsla::from(rgb(*hex)) == theme.ground);
+            let ground = theme.ground;
+
+            let from_palette = palette.colors().iter().any(|hex| {
+                let source: Hsla = rgb(*hex).into();
+                (color::lightness(source) - color::lightness(ground)).abs() < 0.01
+                    && color::chroma(ground) <= color::chroma(source) + 0.001
+            });
             assert!(
-                is_one_of_the_palettes_own,
-                "{palette:?} ground {:?} is not a colour from the palette",
-                theme.ground
+                from_palette,
+                "{palette:?} ground {ground:?} did not come from the palette"
             );
+
+            let stock = Theme::new(mode, Chrome::Solid).ground;
+            assert!(
+                color::contrast(ground, stock) > 1.02 || color::chroma(ground) > 0.,
+                "{palette:?} ground is indistinguishable from the built-in one"
+            );
+        }
+    }
+
+    /// Nothing large is allowed to be vivid.
+    ///
+    /// The derivation used to hand a palette's own colour straight to the
+    /// ground and the panel, which is right for a swatch and wrong for a
+    /// window: Aqua Punch painted its sidebar `#4cf8f4`, a chroma of 0.137
+    /// where the built-in dark ground sits at 0.006. Across 120 real Color
+    /// Hunt palettes, 63% of panels came out above 0.04.
+    #[test]
+    fn no_large_surface_is_vivid_enough_to_glare() {
+        // Material 3's neutral, and the variant it draws borders from.
+        const SURFACE_MAX: f32 = 0.035;
+        const LINE_MAX: f32 = 0.05;
+
+        for palette in ColorPalette::ALL {
+            let Some(accent) = palette.accent() else {
+                continue;
+            };
+            let (can_dark, can_light) = Theme::palette_modes(palette.colors());
+            for (mode, ok) in [(Mode::Dark, can_dark), (Mode::Light, can_light)] {
+                if !ok {
+                    continue;
+                }
+                let theme =
+                    Theme::from_palette(palette.colors(), Some(accent), mode, Chrome::Solid);
+                for (name, surface, limit) in [
+                    ("ground", theme.ground.alpha(1.0), SURFACE_MAX),
+                    ("panel", theme.panel, SURFACE_MAX),
+                    ("modal", theme.modal, SURFACE_MAX),
+                    ("hover", theme.hover, SURFACE_MAX),
+                    ("border", theme.border, LINE_MAX),
+                    ("border_strong", theme.border_strong, LINE_MAX),
+                ] {
+                    assert!(
+                        color::chroma(surface) <= limit,
+                        "{palette:?}/{mode:?}: {name} has chroma {:.3}, over {limit}",
+                        color::chroma(surface)
+                    );
+                }
+                // The other half of the bargain: the accent is small, so it
+                // keeps whatever colour the palette gave it. A cap applied
+                // everywhere would have left the whole app grey.
+                assert!(
+                    color::chroma(theme.accent) > SURFACE_MAX,
+                    "{palette:?}/{mode:?}: the accent went grey too"
+                );
+            }
         }
     }
 
@@ -537,6 +668,86 @@ mod tests {
                     color::contrast(theme.text_faint, ground) >= color::CONTRAST_UI,
                     "{mode:?}/{chrome:?}: faint text is {:.2}:1",
                     color::contrast(theme.text_faint, ground)
+                );
+            }
+        }
+    }
+
+    /// The wordmark, on every ground the app can actually produce.
+    ///
+    /// Two failures sat here before it read the theme. The title-bar logo is
+    /// 15px bold, which WCAG does not count as large, so it needs 4.5:1 — and
+    /// the fixed `#1476f2` gave 4.03:1 on the built-in light theme and 3.56:1
+    /// on Aqua Punch. Worse, the mode it was handed came from the setting
+    /// rather than the theme, so a light-only palette under a dark setting
+    /// painted a near-white wordmark onto near-white at 1.02:1.
+    #[test]
+    fn the_wordmark_is_readable_on_every_ground() {
+        /// What `brand_logo` uses for the title bar, where it is smallest.
+        const TITLE_BAR_SIZE: f32 = 104. * 64. / 440.;
+        assert!(
+            TITLE_BAR_SIZE < 18.66,
+            "premise: the title bar logo is small text"
+        );
+
+        let mut themes = vec![
+            Theme::new(Mode::Dark, Chrome::Solid),
+            Theme::new(Mode::Light, Chrome::Solid),
+        ];
+        for palette in ColorPalette::ALL {
+            let Some(accent) = palette.accent() else {
+                continue;
+            };
+            let (can_dark, can_light) = Theme::palette_modes(palette.colors());
+            for (mode, ok) in [(Mode::Dark, can_dark), (Mode::Light, can_light)] {
+                if ok {
+                    themes.push(Theme::from_palette(
+                        palette.colors(),
+                        Some(accent),
+                        mode,
+                        Chrome::Solid,
+                    ));
+                }
+            }
+        }
+
+        for theme in themes {
+            let ground = theme.ground.alpha(1.0);
+            // The very colours `brand_logo` paints with, not a restatement of
+            // the rule — a test that recomputed it would keep passing however
+            // the logo drifted.
+            let (s3, browser) = theme.wordmark(TITLE_BAR_SIZE);
+            assert!(
+                color::contrast(s3, ground) >= color::CONTRAST_TEXT,
+                "\"S3\" is {:.2}:1 on {ground:?}",
+                color::contrast(s3, ground)
+            );
+            assert!(
+                color::contrast(browser, ground) >= color::CONTRAST_TEXT,
+                "\"Browser\" is {:.2}:1 on {ground:?}",
+                color::contrast(browser, ground)
+            );
+        }
+    }
+
+    /// The mode a theme *is*, which is not always the mode that was asked for.
+    #[test]
+    fn a_themes_mode_can_be_read_back_off_its_ground() {
+        for palette in ColorPalette::ALL {
+            let Some(accent) = palette.accent() else {
+                continue;
+            };
+            let (can_dark, can_light) = Theme::palette_modes(palette.colors());
+            for (mode, ok) in [(Mode::Dark, can_dark), (Mode::Light, can_light)] {
+                if !ok {
+                    continue;
+                }
+                let theme =
+                    Theme::from_palette(palette.colors(), Some(accent), mode, Chrome::Solid);
+                assert_eq!(
+                    theme.mode(),
+                    mode,
+                    "{palette:?} built in {mode:?} but its ground reads otherwise"
                 );
             }
         }

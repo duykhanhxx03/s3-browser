@@ -58,6 +58,26 @@ pub fn lightness(color: Hsla) -> f32 {
     oklab(color).0
 }
 
+/// Pulls a colour toward grey until its chroma fits, keeping its lightness
+/// and its hue.
+///
+/// The size of a surface decides how much colour it can carry. A palette is
+/// picked as four small swatches, but the ground is 1120x720 of it, and a
+/// chroma that reads as characterful in a chip glares across a window.
+/// Material 3 draws its surfaces from a neutral at 0.02 chroma and its borders
+/// from a variant at 0.04, which is the scale used here.
+pub fn cap_chroma(color: Hsla, limit: f32) -> Hsla {
+    let (l, a, b) = oklab(color);
+    let c = a.hypot(b);
+    if c <= limit || c == 0. {
+        return color;
+    }
+    let k = limit / c;
+    let mut out = from_oklab(l, a * k, b * k);
+    out.a = color.a;
+    out
+}
+
 /// How colourful, regardless of how light. Zero for any grey.
 pub fn chroma(color: Hsla) -> f32 {
     let (_, a, b) = oklab(color);
@@ -90,21 +110,26 @@ fn oklab(color: Hsla) -> (f32, f32, f32) {
 #[allow(clippy::excessive_precision)]
 pub fn with_lightness(color: Hsla, lightness: f32) -> Hsla {
     let (_, a, b) = oklab(color);
-    let alpha = color.a;
+    let mut out = from_oklab(lightness, a, b);
+    out.a = color.a;
+    out
+}
 
+/// Back to a colour from OKLab's three channels.
+// Constants at Ottosson's published precision, as above.
+#[allow(clippy::excessive_precision)]
+fn from_oklab(lightness: f32, a: f32, b: f32) -> Hsla {
     let l_ = lightness + 0.3963377774 * a + 0.2158037573 * b;
     let m_ = lightness - 0.1055613458 * a - 0.0638541728 * b;
     let s_ = lightness - 0.0894841775 * a - 1.2914855480 * b;
     let (l, m, s) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
 
-    let mut out = Hsla::from(Rgba {
+    Hsla::from(Rgba {
         r: from_linear(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
         g: from_linear(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
         b: from_linear(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s),
         a: 1.0,
-    });
-    out.a = alpha;
-    out
+    })
 }
 
 /// Walks `color` toward `against` and stops at the last point that still
