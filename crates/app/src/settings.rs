@@ -14,7 +14,85 @@ use serde::{Deserialize, Serialize};
 
 use crate::locale::{self, Language};
 
-/// Which palette to paint, when the system's own answer is not wanted.
+/// Accent palettes, sourced from popular Color Hunt palettes and kept local so
+/// startup never depends on the network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColorPalette {
+    #[default]
+    Default,
+    CharcoalTeal,
+    MintGlass,
+    CloudBlue,
+    CoralCream,
+    LavenderNight,
+    AquaPunch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomColorPalette {
+    pub label: String,
+    pub colors: [u32; 4],
+}
+
+impl CustomColorPalette {
+    pub fn new(label: impl Into<String>, colors: [u32; 4]) -> Self {
+        Self {
+            label: label.into(),
+            colors,
+        }
+    }
+}
+
+impl ColorPalette {
+    pub const ALL: [ColorPalette; 7] = [
+        ColorPalette::Default,
+        ColorPalette::CharcoalTeal,
+        ColorPalette::MintGlass,
+        ColorPalette::CloudBlue,
+        ColorPalette::CoralCream,
+        ColorPalette::LavenderNight,
+        ColorPalette::AquaPunch,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorPalette::Default => "Default",
+            ColorPalette::CharcoalTeal => "Charcoal Teal",
+            ColorPalette::MintGlass => "Mint Glass",
+            ColorPalette::CloudBlue => "Cloud Blue",
+            ColorPalette::CoralCream => "Coral Cream",
+            ColorPalette::LavenderNight => "Lavender Night",
+            ColorPalette::AquaPunch => "Aqua Punch",
+        }
+    }
+
+    pub fn colors(self) -> [u32; 4] {
+        match self {
+            ColorPalette::Default => [0x0e0f12, 0xffffff, 0x3b82f6, 0xe5484d],
+            ColorPalette::CharcoalTeal => [0x222831, 0x393e46, 0x00adb5, 0xeeeeee],
+            ColorPalette::MintGlass => [0xe3fdfd, 0xcbf1f5, 0xa6e3e9, 0x71c9ce],
+            ColorPalette::CloudBlue => [0xf9f7f7, 0xdbe2ef, 0x3f72af, 0x112d4e],
+            ColorPalette::CoralCream => [0xfff5e4, 0xffe3e1, 0xffd1d1, 0xff9494],
+            ColorPalette::LavenderNight => [0xf4eeff, 0xdcd6f7, 0xa6b1e1, 0x424874],
+            ColorPalette::AquaPunch => [0x08d9d6, 0x252a34, 0xff2e63, 0xeaeaea],
+        }
+    }
+
+    pub fn accent(self) -> Option<u32> {
+        match self {
+            ColorPalette::Default => None,
+            ColorPalette::CharcoalTeal => Some(0x00adb5),
+            ColorPalette::MintGlass => Some(0x71c9ce),
+            ColorPalette::CloudBlue => Some(0x3f72af),
+            ColorPalette::CoralCream => Some(0xff9494),
+            ColorPalette::LavenderNight => Some(0x6f7fc8),
+            ColorPalette::AquaPunch => Some(0xff2e63),
+        }
+    }
+}
+
+/// Which light/dark mode to paint, when the system's own answer is not wanted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
@@ -144,6 +222,8 @@ pub const GRID_ZOOM_DEFAULT: usize = 3;
 pub struct Settings {
     pub language: Language,
     pub theme: ThemeChoice,
+    pub color_palette: ColorPalette,
+    pub custom_color_palette: Option<CustomColorPalette>,
     pub motion: MotionChoice,
     pub preview_limit_mb: u32,
     /// Bytes per second, zero for unlimited.
@@ -172,6 +252,8 @@ impl Default for Settings {
         Self {
             language: Language::English,
             theme: ThemeChoice::System,
+            color_palette: ColorPalette::Default,
+            custom_color_palette: None,
             motion: MotionChoice::System,
             preview_limit_mb: 8,
             bandwidth_limit: 0,
@@ -353,6 +435,11 @@ mod tests {
             // Not the default, so the round trip below proves the field is
             // written and read rather than quietly falling back both times.
             check_updates: false,
+            color_palette: ColorPalette::CloudBlue,
+            custom_color_palette: Some(CustomColorPalette::new(
+                "Color Hunt demo",
+                [0x222831, 0x393e46, 0x00adb5, 0xeeeeee],
+            )),
             list_zoom: 5,
             grid_zoom: 1,
         };
@@ -365,6 +452,11 @@ mod tests {
         std::fs::write(store.path(), r#"{"theme":"dark"}"#).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.theme, ThemeChoice::Dark);
+        assert_eq!(loaded.color_palette, Settings::default().color_palette);
+        assert_eq!(
+            loaded.custom_color_palette,
+            Settings::default().custom_color_palette
+        );
         assert_eq!(loaded.language, Settings::default().language);
         assert_eq!(loaded.motion, Settings::default().motion);
         assert_eq!(

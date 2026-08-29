@@ -11,6 +11,7 @@
 
 mod assets;
 mod browser;
+mod colorhunt;
 mod crash;
 mod failure;
 #[cfg(target_os = "macos")]

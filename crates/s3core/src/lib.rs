@@ -276,7 +276,10 @@ impl ObjectAcl {
     /// call returned — and it costs no extra request.
     pub fn is_meaningful(&self) -> bool {
         self.owner != Grantee::Unknown
-            || self.grants.iter().any(|grant| grant.grantee != Grantee::Unknown)
+            || self
+                .grants
+                .iter()
+                .any(|grant| grant.grantee != Grantee::Unknown)
     }
 }
 
@@ -1545,7 +1548,10 @@ impl S3Client {
         let head = self.head_object(bucket, key).await?;
         let size = head.size.max(0) as u64;
         if size > COPY_OBJECT_LIMIT {
-            anyhow::bail!("Object {} is larger than 5 GiB, cannot edit headers in place", key);
+            anyhow::bail!(
+                "Object {} is larger than 5 GiB, cannot edit headers in place",
+                key
+            );
         }
 
         let mut req = self
@@ -2161,14 +2167,26 @@ pub fn now_epoch() -> i64 {
 /// language and this crate does not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimestampParts {
-    Today { clock: String },
-    Yesterday { clock: String },
+    Today {
+        clock: String,
+    },
+    Yesterday {
+        clock: String,
+    },
     /// Within the current year: the year adds nothing and would only widen
     /// the column.
-    ThisYear { date: i64, month: i64, clock: String },
+    ThisYear {
+        date: i64,
+        month: i64,
+        clock: String,
+    },
     /// A different year drops the clock — nobody reads the minute of
     /// something from last year.
-    OtherYear { date: i64, month: i64, year: i64 },
+    OtherYear {
+        date: i64,
+        month: i64,
+        year: i64,
+    },
 }
 
 pub fn timestamp_parts(epoch: i64) -> TimestampParts {

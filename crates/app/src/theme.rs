@@ -8,6 +8,7 @@
 use gpui::{rgb, rgba, Hsla, WindowAppearance};
 
 use crate::platform::Chrome;
+use crate::settings::ColorPalette;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -122,6 +123,128 @@ impl Theme {
             },
         }
     }
+
+    pub fn with_color_palette(mut self, palette: ColorPalette, mode: Mode) -> Self {
+        let Some(accent) = palette.accent() else {
+            return self;
+        };
+        self.apply_palette(palette.colors(), Some(accent), mode);
+        self
+    }
+
+    pub fn with_custom_color_palette(mut self, colors: [u32; 4], mode: Mode) -> Self {
+        self.apply_palette(colors, None, mode);
+        self
+    }
+
+    fn apply_palette(&mut self, colors: [u32; 4], accent: Option<u32>, mode: Mode) {
+        let roles = PaletteRoles::new(colors, mode);
+
+        self.ground = self.ground.blend(roles.ground.alpha(match mode {
+            Mode::Dark => 0.1,
+            Mode::Light => 0.18,
+        }));
+        self.panel = self.panel.blend(roles.panel.alpha(match mode {
+            Mode::Dark => 0.5,
+            Mode::Light => 0.22,
+        }));
+        self.modal = self.modal.blend(roles.modal.alpha(match mode {
+            Mode::Dark => 0.16,
+            Mode::Light => 0.14,
+        }));
+        self.hover = self.hover.blend(roles.hover.alpha(match mode {
+            Mode::Dark => 0.48,
+            Mode::Light => 0.28,
+        }));
+        self.border = self.border.blend(roles.border.alpha(match mode {
+            Mode::Dark => 0.42,
+            Mode::Light => 0.3,
+        }));
+        self.border_strong = self.border_strong.blend(roles.border.alpha(match mode {
+            Mode::Dark => 0.5,
+            Mode::Light => 0.36,
+        }));
+
+        let accent = readable_accent(
+            rgb(accent.unwrap_or_else(|| accent_from_colors(colors))).into(),
+            mode,
+        );
+        self.accent = accent;
+        self.selected = accent.alpha(match mode {
+            Mode::Dark => 0.2,
+            Mode::Light => 0.17,
+        });
+        self.drop_target = accent.alpha(match mode {
+            Mode::Dark => 0.16,
+            Mode::Light => 0.14,
+        });
+        self.text_on_accent = if accent.l > 0.62 {
+            rgb(0x1c2024).into()
+        } else {
+            rgb(0xffffff).into()
+        };
+    }
+}
+
+fn readable_accent(mut color: Hsla, mode: Mode) -> Hsla {
+    if color.s < 0.28 {
+        color.s = 0.28;
+    }
+    match mode {
+        Mode::Light => color.l = color.l.clamp(0.32, 0.48),
+        Mode::Dark => color.l = color.l.clamp(0.52, 0.68),
+    }
+    color.a = 1.0;
+    color
+}
+
+#[derive(Clone, Copy)]
+struct PaletteRoles {
+    ground: Hsla,
+    panel: Hsla,
+    modal: Hsla,
+    hover: Hsla,
+    border: Hsla,
+}
+
+impl PaletteRoles {
+    fn new(colors: [u32; 4], mode: Mode) -> Self {
+        let mut colors = colors.map(|hex| Hsla::from(rgb(hex)));
+        colors.sort_by(|a, b| a.l.total_cmp(&b.l));
+
+        match mode {
+            Mode::Dark => Self {
+                ground: colors[0],
+                panel: colors[1],
+                modal: colors[1],
+                hover: colors[2],
+                border: colors[3],
+            },
+            Mode::Light => Self {
+                ground: colors[3],
+                panel: colors[2],
+                modal: colors[3],
+                hover: colors[1],
+                border: colors[0],
+            },
+        }
+    }
+}
+
+fn accent_from_colors(colors: [u32; 4]) -> u32 {
+    colors
+        .into_iter()
+        .max_by(|a, b| {
+            let a = Hsla::from(rgb(*a));
+            let b = Hsla::from(rgb(*b));
+            accent_score(a).total_cmp(&accent_score(b))
+        })
+        .unwrap_or(0x3b82f6)
+}
+
+fn accent_score(color: Hsla) -> f32 {
+    let balanced_lightness = 1.0 - (color.l - 0.5).abs() * 2.0;
+    color.s * 0.7 + balanced_lightness.max(0.0) * 0.3
 }
 
 #[cfg(test)]
@@ -206,6 +329,40 @@ mod tests {
             // The row highlight is the same hue, so a selected row and the
             // folder icon on it are one colour rather than two blues arguing.
             assert!((theme.selected.h - theme.accent.h).abs() < 0.02);
+        }
+    }
+
+    #[test]
+    fn color_palettes_keep_the_accent_readable() {
+        for palette in ColorPalette::ALL {
+            for mode in [Mode::Dark, Mode::Light] {
+                let theme = Theme::new(mode, Chrome::Solid).with_color_palette(palette, mode);
+                assert!(
+                    (theme.accent.l - theme.ground.l).abs() > 0.2,
+                    "{palette:?}/{mode:?} accent does not stand off its ground"
+                );
+                assert!((theme.selected.h - theme.accent.h).abs() < 0.02);
+                assert_eq!(theme.accent.a, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn color_palettes_affect_the_surfaces_too() {
+        for palette in ColorPalette::ALL {
+            if palette == ColorPalette::Default {
+                continue;
+            }
+            for mode in [Mode::Dark, Mode::Light] {
+                let base = Theme::new(mode, Chrome::Solid);
+                let themed = base.with_color_palette(palette, mode);
+                assert_ne!(themed.ground, base.ground, "{palette:?}/{mode:?} ground");
+                assert_ne!(themed.panel, base.panel, "{palette:?}/{mode:?} panel");
+                assert_ne!(themed.modal, base.modal, "{palette:?}/{mode:?} modal");
+                assert_ne!(themed.hover, base.hover, "{palette:?}/{mode:?} hover");
+                assert_ne!(themed.border, base.border, "{palette:?}/{mode:?} border");
+                assert_ne!(themed.accent, base.accent, "{palette:?}/{mode:?} accent");
+            }
         }
     }
 

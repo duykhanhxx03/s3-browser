@@ -32,11 +32,13 @@ use s3core::{
 use transfer::{Job, JobState, TransferEngine};
 use vault::{Place, PlaceStore, Places, ProfileStore, Provider, StoredProfile};
 
+use crate::colorhunt;
 use crate::failure::{Failure, Fix};
 use crate::locale::{self, Language};
 use crate::platform::{self, Chrome};
 use crate::settings::{
-    GridStep, MotionChoice, Settings, SettingsStore, ThemeChoice, GRID_STEPS, LIST_ROW_HEIGHTS,
+    ColorPalette, CustomColorPalette, GridStep, MotionChoice, Settings, SettingsStore, ThemeChoice,
+    GRID_STEPS, LIST_ROW_HEIGHTS,
 };
 use crate::theme::Theme;
 
@@ -163,6 +165,15 @@ const PREVIEW_SIDE_WIDTH: f32 = 276.;
 const PREVIEW_BODY_HEIGHT: f32 = PREVIEW_HEIGHT - PREVIEW_TITLE_HEIGHT;
 /// Right-hand inspector.
 const INSPECTOR_WIDTH: f32 = 320.;
+/// Dedicated colour picker for theme accents. It lives outside the settings
+/// row so a large catalogue scrolls without stretching the panel.
+const COLOR_PICKER_WIDTH: f32 = 640.;
+const COLOR_PICKER_HEIGHT: f32 = 460.;
+/// Left-hand list of Color Hunt categories (Default, New, Popular, Pastel...).
+const COLOR_PICKER_SIDEBAR_WIDTH: f32 = 168.;
+/// Sentinel `color_hunt_category` value for the built-in palettes tab — never
+/// a real Color Hunt category key, which are all non-empty.
+const DEFAULT_PALETTE_TAB: &str = "";
 /// Tall enough for every command without scrolling; it scrolls anyway once a
 /// filter is typed and more rows appear than fit.
 const PALETTE_HEIGHT: f32 = 452.;
@@ -951,6 +962,17 @@ pub struct Browser {
     language_select: Option<Entity<SelectState<Vec<&'static str>>>>,
     /// Whether the settings panel is open.
     settings_open: bool,
+    color_palette_picker_open: bool,
+    /// Which Color Hunt category tab is showing in the picker.
+    color_hunt_category: &'static str,
+    /// Fetched palettes, cached per category so switching tabs back and
+    /// forth doesn't refetch what's already there.
+    color_hunt_cache: HashMap<&'static str, Vec<CustomColorPalette>>,
+    /// Categories with a fetch in flight. Per-category rather than one flag,
+    /// so switching to a second tab while the first is still loading doesn't
+    /// drop the second request on the floor.
+    color_hunt_pending: HashSet<&'static str>,
+    color_hunt_error: Option<SharedString>,
     /// Whether the About dialog is open.
     about_open: bool,
 
@@ -1170,6 +1192,10 @@ pub struct Browser {
     search_task: Option<Task<()>>,
     /// Likewise for a bulk edit, which outlives several other operations.
     bulk_task: Option<Task<()>>,
+    /// One slot per category with a fetch in flight, so switching tabs
+    /// starts a genuinely concurrent fetch instead of cancelling whichever
+    /// category was mid-request.
+    color_hunt_tasks: HashMap<&'static str, Task<()>>,
     complete_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
     /// Kept alive, not read: dropping it would silently stop the filter from
@@ -1205,7 +1231,7 @@ impl Browser {
             let appearance = window.appearance();
             _ = weak.update(cx, |this: &mut Self, cx| {
                 this.appearance = appearance;
-                this.theme = theme_for(this.settings.theme, appearance, this.chrome);
+                this.theme = theme_for(&this.settings, appearance, this.chrome);
                 cx.notify();
             });
         });
@@ -1363,7 +1389,7 @@ impl Browser {
 
         let mut this = Self {
             focus,
-            theme: theme_for(settings.theme, window.appearance(), chrome),
+            theme: theme_for(&settings, window.appearance(), chrome),
             chrome,
             appearance: window.appearance(),
             ui_font: ui_font.clone(),
@@ -1377,6 +1403,11 @@ impl Browser {
             settings_store,
             language_select: Some(language_select),
             settings_open: false,
+            color_palette_picker_open: false,
+            color_hunt_category: DEFAULT_PALETTE_TAB,
+            color_hunt_cache: HashMap::new(),
+            color_hunt_pending: HashSet::new(),
+            color_hunt_error: None,
             about_open: false,
             client: None,
             buckets: Vec::new(),
@@ -1461,6 +1492,7 @@ impl Browser {
             tick_task: None,
             search_task: None,
             bulk_task: None,
+            color_hunt_tasks: HashMap::new(),
             complete_task: None,
             _appearance: Some(appearance),
             _filter_events: Some(filter_events),
@@ -2802,7 +2834,7 @@ impl Browser {
     fn update_settings(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
         change(&mut self.settings);
 
-        self.theme = theme_for(self.settings.theme, self.appearance, self.chrome);
+        self.theme = theme_for(&self.settings, self.appearance, self.chrome);
         locale::set_language(self.settings.language);
         set_reduce_motion(motion_choice_reduces(self.settings.motion));
         self.transfers
@@ -4384,6 +4416,7 @@ impl Browser {
             Command::Buckets => self.show_screen(Screen::Buckets, cx),
             Command::Settings => {
                 self.settings_open = true;
+                self.color_palette_picker_open = false;
                 cx.notify();
             }
             Command::About => self.open_about(cx),
@@ -5674,6 +5707,57 @@ impl Browser {
         cx.notify();
     }
 
+    /// Fetches a Color Hunt category's palettes, unless it's already cached
+    /// or already in flight. `force` re-fetches regardless, for the refresh
+    /// button. Fetches for different categories run concurrently — each gets
+    /// its own task slot, so switching tabs mid-fetch never drops a request.
+    fn fetch_color_hunt_category(
+        &mut self,
+        category: colorhunt::Category,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let already_in_flight = self.color_hunt_pending.contains(category.key);
+        if already_in_flight || (!force && self.color_hunt_cache.contains_key(category.key)) {
+            return;
+        }
+        self.color_hunt_pending.insert(category.key);
+        self.color_hunt_error = None;
+
+        let fetching = Tokio::spawn(cx, async move { colorhunt::fetch_category(category).await });
+        let task = cx.spawn(async move |this, cx| {
+            let result = fetching.await;
+            _ = this.update(cx, |this, cx| {
+                this.color_hunt_pending.remove(category.key);
+                this.color_hunt_tasks.remove(category.key);
+                match result {
+                    Ok(Ok(palettes)) => {
+                        if palettes.is_empty() {
+                            this.color_hunt_error =
+                                Some(locale::text("settings.color_palette.empty").into());
+                        }
+                        this.color_hunt_cache.insert(category.key, palettes);
+                    }
+                    Ok(Err(error)) => {
+                        this.color_hunt_error = Some(SharedString::from(locale::text_with(
+                            "settings.color_palette.fetch_failed",
+                            &[("{error}", &format!("{error:?}"))],
+                        )));
+                    }
+                    Err(error) => {
+                        this.color_hunt_error = Some(SharedString::from(locale::text_with(
+                            "error.task_join",
+                            &[("{error}", &format!("{error:?}"))],
+                        )));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.color_hunt_tasks.insert(category.key, task);
+        cx.notify();
+    }
+
     /// Sets a canned ACL on everything selected, or on the inspected object when
     /// nothing is.
     ///
@@ -6525,6 +6609,7 @@ impl Browser {
             match keystroke.key.as_str() {
                 "escape" => {
                     self.settings_open = false;
+                    self.color_palette_picker_open = false;
                     self.about_open = false;
                     self.profiles_open = false;
                     self.failures_open = false;
@@ -7276,6 +7361,7 @@ impl Browser {
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.settings_open = true;
+                    this.color_palette_picker_open = false;
                     cx.notify();
                 })),
             )
@@ -8606,12 +8692,15 @@ impl Browser {
                 .bg(gpui::hsla(0., 0., 0., 0.45))
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.settings_open = false;
+                    this.color_palette_picker_open = false;
                     cx.notify();
                 }))
                 .child(
                     div()
                         .id("settings")
                         .w(px(PROFILE_DIALOG_WIDTH))
+                        .max_h(px(660.))
+                        .overflow_y_scroll()
                         .p_4()
                         .flex()
                         .flex_col()
@@ -8665,6 +8754,17 @@ impl Browser {
                                         },
                                     ))
                                 })),
+                            theme,
+                        ))
+                        .child(setting_row(
+                            locale::text("settings.color_palette"),
+                            Some(locale::text("settings.color_palette.note")),
+                            current_palette_button(&settings, theme).on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.color_palette_picker_open = true;
+                                    cx.notify();
+                                },
+                            )),
                             theme,
                         ))
                         .child(setting_row(
@@ -8835,6 +8935,7 @@ impl Browser {
                                 action_button("settings-close", locale::text("common.done"), theme)
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.settings_open = false;
+                                        this.color_palette_picker_open = false;
                                         cx.notify();
                                     })),
                             ),
@@ -8851,6 +8952,314 @@ impl Browser {
         )
     }
 
+    fn render_color_palette_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.color_palette_picker_open {
+            return None;
+        }
+        let theme = self.theme;
+        let selected_builtin = self
+            .settings
+            .custom_color_palette
+            .is_none()
+            .then_some(self.settings.color_palette);
+        let selected_custom = self
+            .settings
+            .custom_color_palette
+            .as_ref()
+            .map(|palette| palette.colors);
+        let active_tab = self.color_hunt_category;
+        let on_default_tab = active_tab == DEFAULT_PALETTE_TAB;
+        let active_tab_loading = self.color_hunt_pending.contains(active_tab);
+        let color_hunt_error = self.color_hunt_error.clone();
+        // Cloned rather than borrowed so this closure-heavy tree doesn't have
+        // to carry `self`'s lifetime — the same reason `settings` above is
+        // cloned instead of referenced.
+        let color_hunt_palettes = self
+            .color_hunt_cache
+            .get(active_tab)
+            .cloned()
+            .unwrap_or_default();
+        let section_title = if on_default_tab {
+            SharedString::from(locale::text("settings.color_palette.default_section"))
+        } else {
+            SharedString::from(format!(
+                "{} · {}",
+                locale::text("settings.color_palette.color_hunt_section"),
+                color_hunt_category_label(active_tab)
+            ))
+        };
+
+        Some(
+            div()
+                .id("color-palette-picker-scrim")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.28))
+                .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.color_palette_picker_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("color-palette-picker")
+                        .w(px(COLOR_PICKER_WIDTH))
+                        .h(px(COLOR_PICKER_HEIGHT))
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .rounded_xl()
+                        .bg(theme.modal)
+                        .border_1()
+.border_color(theme.border_strong)
+                        .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
+                        .on_click(|_event, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_color(theme.text)
+                                        .child(locale::text("settings.color_palette")),
+                                )
+                                .when(!on_default_tab && !active_tab_loading, |this| {
+                                    let label =
+                                        SharedString::from(locale::text("settings.color_palette.refresh"));
+                                    this.child(
+                                        icon_button("refresh-color-hunt-category", "refresh", theme)
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(label.clone()).build(window, cx)
+                                            })
+                                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                                if let Some(category) = colorhunt::CATEGORIES
+                                                    .iter()
+                                                    .find(|c| c.key == this.color_hunt_category)
+                                                    .copied()
+                                                {
+                                                    this.fetch_color_hunt_category(category, true, cx);
+                                                }
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    icon_button("close-color-palette-picker", "close", theme)
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.color_palette_picker_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("color-palette-picker-body")
+                                .flex()
+                                .flex_1()
+                                .gap_3()
+                                .min_h(px(0.))
+                                .child(
+                                    div()
+                                        .id("color-palette-sidebar")
+                                        .w(px(COLOR_PICKER_SIDEBAR_WIDTH))
+                                        .flex_shrink_0()
+                                        .h_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .min_h(px(0.))
+                                        .child(
+                                            choice_chip(
+                                                "color-palette-tab-default".into(),
+                                                SharedString::from(locale::text(
+                                                    "settings.color_palette.default_section",
+                                                )),
+                                                on_default_tab,
+                                                theme,
+                                            )
+                                            .w_full()
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                this.color_hunt_category = DEFAULT_PALETTE_TAB;
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_faint)
+                                                .child(locale::text(
+                                                    "settings.color_palette.color_hunt_section",
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("color-palette-category-list")
+                                                .flex_1()
+                                                .min_h(px(0.))
+                                                .overflow_y_scroll()
+                                                .on_scroll_wheel(|_event, _window, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .children(colorhunt::CATEGORIES.iter().map(
+                                                    |category| {
+                                                        let category = *category;
+                                                        choice_chip(
+                                                            SharedString::from(format!(
+                                                                "color-palette-tab-{}",
+                                                                category.key
+                                                            )),
+                                                            color_hunt_category_label(category.key),
+                                                            active_tab == category.key,
+                                                            theme,
+                                                        )
+                                                        .w_full()
+                                                        .on_click(cx.listener(
+                                                            move |this, _event, _window, cx| {
+                                                                this.color_hunt_category = category.key;
+                                                                this.fetch_color_hunt_category(
+                                                                    category, false, cx,
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                    },
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("color-palette-content")
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .min_h(px(0.))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_faint)
+                                                .child(section_title),
+                                        )
+                                        .when_some(
+                                            color_hunt_error.filter(|_| !on_default_tab),
+                                            |this, error| {
+                                                this.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(theme.danger)
+                                                        .child(error),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            div()
+                                                .id("color-palette-grid")
+                                                .flex_1()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .min_h(px(0.))
+                                                .overflow_y_scroll()
+                                                .on_scroll_wheel(|_event, _window, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .when(on_default_tab, |this| {
+                                                    this.children(ColorPalette::ALL.into_iter().map(
+                                                        |palette| {
+                                                            palette_picker_tile(
+                                                                SharedString::from(format!(
+                                                                    "color-palette-built-in-{}",
+                                                                    palette.label()
+                                                                )),
+                                                                SharedString::from(palette.label()),
+                                                                palette.colors(),
+                                                                selected_builtin == Some(palette),
+                                                                theme,
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                move |this, _event, _window, cx| {
+                                                                    this.update_settings(
+                                                                        |s| {
+                                                                            s.color_palette = palette;
+                                                                            s.custom_color_palette = None;
+                                                                        },
+                                                                        cx,
+                                                                    );
+                                                                    this.color_palette_picker_open =
+                                                                        false;
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                        },
+                                                    ))
+                                                })
+                                                .when(!on_default_tab, |this| {
+                                                    // A cached-but-stale grid stays on screen during
+                                                    // a forced refresh; the skeleton is only for a
+                                                    // category that has nothing to show yet.
+                                                    if active_tab_loading && color_hunt_palettes.is_empty()
+                                                    {
+                                                        this.child(skeleton_palette_tiles(theme))
+                                                    } else {
+                                                        this.children(
+                                                            color_hunt_palettes
+                                                                .into_iter()
+                                                                .enumerate()
+                                                                .map(|(index, palette)| {
+                                                                    let selected = selected_custom
+                                                                        == Some(palette.colors);
+                                                                    palette_picker_tile(
+                                                                        SharedString::from(format!(
+                                                                            "color-hunt-palette-{active_tab}-{index}"
+                                                                        )),
+                                                                        SharedString::from(
+                                                                            palette.label.clone(),
+                                                                        ),
+                                                                        palette.colors,
+                                                                        selected,
+                                                                        theme,
+                                                                    )
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _event, _window, cx| {
+                                                                            this.update_settings(
+                                                                                |s| {
+                                                                                    s.custom_color_palette =
+                                                                                        Some(palette.clone());
+                                                                                },
+                                                                                cx,
+                                                                            );
+                                                                            this.color_palette_picker_open =
+                                                                                false;
+                                                                            cx.notify();
+                                                                        },
+                                                                    ))
+                                                                }),
+                                                        )
+                                                    }
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+                .transition_opacity_and_offset(
+                    "color-palette-picker-in",
+                    smooth_transition(MOTION_MODAL_MS),
+                    0.0,
+                    1.0,
+                    motion_offset(0.0, -8.0),
+                    motion_offset(0.0, 0.0),
+                ),
+        )
+    }
+
     /// Opens About, closing whatever else was open.
     ///
     /// The palette paints over every dialog, so ⌘K from inside Cài đặt could
@@ -8858,6 +9267,7 @@ impl Browser {
     /// settings panel still sitting underneath.
     fn open_about(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
+        self.color_palette_picker_open = false;
         self.profiles_open = false;
         self.about_open = true;
         cx.notify();
@@ -12389,7 +12799,7 @@ impl Browser {
                         .rounded_xl()
                         .bg(theme.modal)
                         .border_1()
-                        .border_color(theme.border_strong)
+.border_color(theme.border_strong)
                         .on_click(|_event, _window, cx| cx.stop_propagation())
                         // The search line, drawn as a search line: icon, text,
                         // a caret. It used to be a bare string jammed into the
@@ -13214,6 +13624,7 @@ impl Render for Browser {
             .children(self.render_failures(cx))
             .children(self.render_preview(cx))
             .children(self.render_settings(cx))
+            .children(self.render_color_palette_picker(cx))
             .children(self.render_about(cx))
             .children(self.render_acl_popup(cx))
             .children(self.render_path_suggestions(cx))
@@ -16018,10 +16429,17 @@ fn object_context_menu(
 }
 
 /// The palette to paint: the setting when it names one, the system otherwise.
-fn theme_for(choice: ThemeChoice, appearance: gpui::WindowAppearance, chrome: Chrome) -> Theme {
-    match theme_mode(choice, appearance) {
-        crate::theme::Mode::Light => Theme::new(crate::theme::Mode::Light, chrome),
-        crate::theme::Mode::Dark => Theme::new(crate::theme::Mode::Dark, chrome),
+/// Takes the whole `Settings` rather than one argument per token: the three
+/// call sites all have one in hand, and every future theme preference would
+/// otherwise widen this signature and all three of them again.
+fn theme_for(settings: &Settings, appearance: gpui::WindowAppearance, chrome: Chrome) -> Theme {
+    let mode = theme_mode(settings.theme, appearance);
+    let theme = Theme::new(mode, chrome);
+    // Palette first, then style: a style's colour moves are the ones it
+    // cannot do without, so they have the last word over the palette.
+    match &settings.custom_color_palette {
+        Some(custom) => theme.with_custom_color_palette(custom.colors, mode),
+        None => theme.with_color_palette(settings.color_palette, mode),
     }
 }
 
@@ -16148,6 +16566,115 @@ fn choice_chip(
         })
         .hover(|this| this.bg(theme.selected))
         .child(label)
+}
+
+fn current_palette_button(settings: &Settings, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    let (label, colors) = match &settings.custom_color_palette {
+        Some(custom) => (SharedString::from(custom.label.clone()), custom.colors),
+        None => (
+            SharedString::from(settings.color_palette.label()),
+            settings.color_palette.colors(),
+        ),
+    };
+    div()
+        .id("settings-current-color-palette")
+        .h(px(34.))
+        .w(px(240.))
+        .p(px(2.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border_strong)
+        .bg(theme.hover)
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.selected))
+        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+        .child(
+            div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .overflow_hidden()
+                .rounded_sm()
+                .children(palette_color_blocks(colors)),
+        )
+        .child(sized_icon("chevron-down", 12., theme.text_faint))
+}
+
+fn palette_picker_tile(
+    id: SharedString,
+    label: SharedString,
+    colors: [u32; 4],
+    selected: bool,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(54.))
+        .w(px(112.))
+        .p(px(3.))
+        .flex()
+        .rounded_md()
+        .border_1()
+        .border_color(if selected { theme.accent } else { theme.border })
+        .bg(if selected {
+            theme.selected
+        } else {
+            theme.hover
+        })
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.selected))
+        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .overflow_hidden()
+                .rounded_sm()
+                .children(palette_color_blocks(colors)),
+        )
+}
+
+fn palette_color_blocks(colors: [u32; 4]) -> impl Iterator<Item = gpui::Div> {
+    colors
+        .into_iter()
+        .map(|color| div().flex_1().h_full().bg(gpui::rgb(color)))
+}
+
+/// The localized name of a Color Hunt category, e.g. `"pastel"` -> "Pastel".
+fn color_hunt_category_label(key: &str) -> SharedString {
+    SharedString::from(locale::text(&format!(
+        "settings.color_palette.category.{key}"
+    )))
+}
+
+/// Placeholder tiles shaped like `palette_picker_tile`, shown in the grid
+/// while a Color Hunt category's palettes are still loading — the same
+/// "shaped rather than a centred loading message" idea as `skeleton_rows`.
+fn skeleton_palette_tiles(theme: Theme) -> impl IntoElement {
+    const COUNT: usize = 10;
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children((0..COUNT).map(|index| {
+            div()
+                .id(("color-palette-skeleton-tile", index))
+                .h(px(54.))
+                .w(px(112.))
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.hover)
+        }))
+        .transition_opacity(
+            "color-palette-skeleton",
+            smooth_transition(MOTION_MODAL_MS),
+            0.4,
+            0.85,
+        )
 }
 
 /// Whether a preview of an object that size holds all of it.
@@ -16982,6 +17509,11 @@ mod tests {
             settings_store: None,
             language_select: None,
             settings_open: false,
+            color_palette_picker_open: false,
+            color_hunt_category: DEFAULT_PALETTE_TAB,
+            color_hunt_cache: HashMap::new(),
+            color_hunt_pending: HashSet::new(),
+            color_hunt_error: None,
             about_open: false,
             client: None,
             buckets: Vec::new(),
@@ -17066,6 +17598,7 @@ mod tests {
             tick_task: None,
             search_task: None,
             bulk_task: None,
+            color_hunt_tasks: HashMap::new(),
             complete_task: None,
             _appearance: None,
             _filter_events: None,
