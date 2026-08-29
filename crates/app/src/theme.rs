@@ -7,8 +7,8 @@
 
 use gpui::{rgb, rgba, Hsla, WindowAppearance};
 
+use crate::color;
 use crate::platform::Chrome;
-use crate::settings::ColorPalette;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -124,132 +124,186 @@ impl Theme {
         }
     }
 
-    pub fn with_color_palette(mut self, palette: ColorPalette, mode: Mode) -> Self {
-        let Some(accent) = palette.accent() else {
-            return self;
-        };
-        self.apply_palette(palette.colors(), Some(accent), mode);
-        self
-    }
+    /// Builds the whole theme out of a palette.
+    ///
+    /// Not a tint over the built-in one, which is what this used to be: the
+    /// palette was blended in at a tenth alpha, so a chosen palette moved the
+    /// window ground by about five parts in 441 and, for one of them, by
+    /// nothing measurable at all. These four colours *are* the scheme, so the
+    /// scheme is built from them.
+    ///
+    /// Every derived colour is then checked against the surface it will sit
+    /// on and adjusted until it is legible — see [`crate::color`] for why the
+    /// old `Hsla::l` comparisons could not do that.
+    pub fn from_palette(
+        colors: [u32; 4],
+        accent_hint: Option<u32>,
+        mode: Mode,
+        chrome: Chrome,
+    ) -> Self {
+        let dark = mode == Mode::Dark;
 
-    pub fn with_custom_color_palette(mut self, colors: [u32; 4], mode: Mode) -> Self {
-        self.apply_palette(colors, None, mode);
-        self
-    }
+        let mut ordered: Vec<Hsla> = colors.map(|hex| Hsla::from(rgb(hex))).to_vec();
+        ordered.sort_by(|a, b| color::luminance(*a).total_cmp(&color::luminance(*b)));
 
-    fn apply_palette(&mut self, colors: [u32; 4], accent: Option<u32>, mode: Mode) {
-        let roles = PaletteRoles::new(colors, mode);
-
-        self.ground = self.ground.blend(roles.ground.alpha(match mode {
-            Mode::Dark => 0.1,
-            Mode::Light => 0.18,
-        }));
-        self.panel = self.panel.blend(roles.panel.alpha(match mode {
-            Mode::Dark => 0.5,
-            Mode::Light => 0.22,
-        }));
-        self.modal = self.modal.blend(roles.modal.alpha(match mode {
-            Mode::Dark => 0.16,
-            Mode::Light => 0.14,
-        }));
-        self.hover = self.hover.blend(roles.hover.alpha(match mode {
-            Mode::Dark => 0.48,
-            Mode::Light => 0.28,
-        }));
-        self.border = self.border.blend(roles.border.alpha(match mode {
-            Mode::Dark => 0.42,
-            Mode::Light => 0.3,
-        }));
-        self.border_strong = self.border_strong.blend(roles.border.alpha(match mode {
-            Mode::Dark => 0.5,
-            Mode::Light => 0.36,
-        }));
-
-        let accent = readable_accent(
-            rgb(accent.unwrap_or_else(|| accent_from_colors(colors))).into(),
-            mode,
-        );
-        self.accent = accent;
-        self.selected = accent.alpha(match mode {
-            Mode::Dark => 0.2,
-            Mode::Light => 0.17,
-        });
-        self.drop_target = accent.alpha(match mode {
-            Mode::Dark => 0.16,
-            Mode::Light => 0.14,
-        });
-        self.text_on_accent = if accent.l > 0.62 {
-            rgb(0x1c2024).into()
+        let ground = if dark {
+            ordered[0]
         } else {
-            rgb(0xffffff).into()
+            ordered[ordered.len() - 1]
         };
-    }
-}
+        let ground_l = color::lightness(ground);
 
-fn readable_accent(mut color: Hsla, mode: Mode) -> Hsla {
-    if color.s < 0.28 {
-        color.s = 0.28;
-    }
-    match mode {
-        Mode::Light => color.l = color.l.clamp(0.32, 0.48),
-        Mode::Dark => color.l = color.l.clamp(0.52, 0.68),
-    }
-    color.a = 1.0;
-    color
-}
+        // Text is the palette's own far end when that end is readable, and
+        // the same hue pushed until it is when it is not. Aimed past AA at
+        // 7:1, because body text is what the whole window is made of.
+        let far = if dark {
+            ordered[ordered.len() - 1]
+        } else {
+            ordered[0]
+        };
+        let text = color::lift_until(far, ground, 7.0, if dark { 1.0 } else { 0.0 });
 
-#[derive(Clone, Copy)]
-struct PaletteRoles {
-    ground: Hsla,
-    panel: Hsla,
-    modal: Hsla,
-    hover: Hsla,
-    border: Hsla,
-}
+        // Surfaces step away from the ground in perceptual lightness, so the
+        // ramp looks even whatever hue the palette happens to be — and each
+        // step is pulled back if it drifts far enough to cost the body text
+        // its 4.5:1.
+        let step = if dark { 0.055 } else { -0.045 };
+        let near = if dark {
+            ordered[1]
+        } else {
+            ordered[ordered.len() - 2]
+        };
+        let surface = |seed: Hsla, want: f32| -> Hsla {
+            for i in (1..=12).rev() {
+                let candidate =
+                    color::with_lightness(seed, ground_l + step * want * (i as f32 / 12.));
+                if color::contrast(text, candidate) >= color::CONTRAST_TEXT {
+                    return candidate;
+                }
+            }
+            ground
+        };
 
-impl PaletteRoles {
-    fn new(colors: [u32; 4], mode: Mode) -> Self {
-        let mut colors = colors.map(|hex| Hsla::from(rgb(hex)));
-        colors.sort_by(|a, b| a.l.total_cmp(&b.l));
+        // The accent is the most colourful of the four that is neither the
+        // ground nor the text, lifted only as far as 3:1 demands.
+        let accent = accent_hint
+            .map(|hex| Hsla::from(rgb(hex)))
+            .unwrap_or_else(|| {
+                ordered
+                    .iter()
+                    .copied()
+                    .filter(|c| *c != ground && *c != far)
+                    .chain(ordered.iter().copied().filter(|c| *c != ground))
+                    .max_by(|a, b| color::chroma(*a).total_cmp(&color::chroma(*b)))
+                    .unwrap_or(ordered[ordered.len() / 2])
+            });
+        let white: Hsla = rgb(0xffffff).into();
+        let black: Hsla = rgb(0x1c2024).into();
 
-        match mode {
-            Mode::Dark => Self {
-                ground: colors[0],
-                panel: colors[1],
-                modal: colors[1],
-                hover: colors[2],
-                border: colors[3],
+        // The accent has two jobs at once: stand off the ground it sits on,
+        // and carry a label. A mid-lightness accent can clear the first and
+        // still fail the second — Lavender Night's `#6f7fc8` reached 3:1 on
+        // its ground while leaving both black and white under 4.5:1 on top of
+        // it. Both constraints pull the same way, away from the ground, so
+        // one walk satisfies them together.
+        let limit = if dark { 1.0 } else { 0.0 };
+        let accent = {
+            let start = color::lightness(accent);
+            let mut chosen = accent;
+            for step in 0..=40 {
+                chosen =
+                    color::with_lightness(accent, start + (limit - start) * (step as f32 / 40.));
+                let stands_out = color::contrast(chosen, ground) >= color::CONTRAST_UI;
+                let carries_a_label = color::contrast(white, chosen)
+                    .max(color::contrast(black, chosen))
+                    >= color::CONTRAST_TEXT;
+                if stands_out && carries_a_label {
+                    break;
+                }
+            }
+            chosen
+        };
+
+        Self {
+            // Glass keeps the palette's ground but lets the compositor
+            // through, exactly as the built-in theme does.
+            ground: if chrome.is_glass() {
+                ground.alpha(if dark { 0.86 } else { 0.96 })
+            } else {
+                ground
             },
-            Mode::Light => Self {
-                ground: colors[3],
-                panel: colors[2],
-                modal: colors[3],
-                hover: colors[1],
-                border: colors[0],
+            panel: surface(near, 1.0),
+            modal: surface(near, 1.7),
+            hover: surface(ground, 2.1),
+            selected: accent.alpha(if dark { 0.24 } else { 0.20 }),
+            drop_target: accent.alpha(if dark { 0.18 } else { 0.15 }),
+
+            text,
+            // Measured down to a target rather than stepped down by a fixed
+            // amount, so neither tier can quietly fall under its minimum.
+            text_muted: color::fade_toward(text, ground, 5.5),
+            text_faint: color::fade_toward(text, ground, 3.4),
+            text_on_accent: if color::contrast(white, accent) >= color::contrast(black, accent) {
+                white
+            } else {
+                black
             },
+
+            border: color::with_lightness(ground, ground_l + step * 3.0),
+            border_strong: color::with_lightness(ground, ground_l + step * 4.4),
+
+            accent,
+            danger: color::lift_until(
+                rgb(if dark { 0xff6b6b } else { 0xc03a2b }).into(),
+                ground,
+                color::CONTRAST_UI,
+                limit,
+            ),
         }
     }
-}
 
-fn accent_from_colors(colors: [u32; 4]) -> u32 {
-    colors
-        .into_iter()
-        .max_by(|a, b| {
-            let a = Hsla::from(rgb(*a));
-            let b = Hsla::from(rgb(*b));
-            accent_score(a).total_cmp(&accent_score(b))
-        })
-        .unwrap_or(0x3b82f6)
-}
+    /// Which modes a palette can actually be built in.
+    ///
+    /// Not a matter of taste: a dark theme needs one of the four to be dark
+    /// enough to carry light text, and a light theme needs one light enough to
+    /// carry dark text. A pastel set has no dark end at all, and no amount of
+    /// setting can give it one — the honest answer is that it is a light
+    /// scheme, not that its dark mode is disappointing.
+    pub fn palette_modes(colors: [u32; 4]) -> (bool, bool) {
+        /// Dark enough to be a ground under light text.
+        const DARK_MAX: f32 = 0.15;
+        /// Light enough to be a ground under dark text.
+        const LIGHT_MIN: f32 = 0.55;
 
-fn accent_score(color: Hsla) -> f32 {
-    let balanced_lightness = 1.0 - (color.l - 0.5).abs() * 2.0;
-    color.s * 0.7 + balanced_lightness.max(0.0) * 0.3
+        let mut lums: Vec<f32> = colors
+            .iter()
+            .map(|hex| color::luminance(Hsla::from(rgb(*hex))))
+            .collect();
+        lums.sort_by(|a, b| a.total_cmp(b));
+        (lums[0] <= DARK_MAX, lums[lums.len() - 1] >= LIGHT_MIN)
+    }
+
+    /// The mode a palette will be painted in, given what the user asked for.
+    ///
+    /// The preference is honoured wherever the palette can do both, which is
+    /// about a third of them — so the light/dark setting keeps working rather
+    /// than being switched off the moment a palette is chosen.
+    pub fn palette_mode(colors: [u32; 4], preferred: Mode) -> Mode {
+        match Self::palette_modes(colors) {
+            (true, true) => preferred,
+            (true, false) => Mode::Dark,
+            (false, true) => Mode::Light,
+            // Neither end is usable on its own; go with the half it is
+            // closer to and let the derivation push a readable text colour.
+            (false, false) => preferred,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::ColorPalette;
 
     #[test]
     fn system_appearance_maps_to_a_mode() {
@@ -332,36 +386,158 @@ mod tests {
         }
     }
 
+    /// Every colour a palette produces, checked against the surface it is
+    /// actually drawn on.
+    ///
+    /// This is the test that would have caught the bug this rewrite fixes:
+    /// Charcoal Teal used to paint white on its `#00adb5` accent at 2.75:1,
+    /// under even the 3:1 floor for large text, because the decision was made
+    /// by comparing `Hsla::l` against a constant.
     #[test]
-    fn color_palettes_keep_the_accent_readable() {
+    fn every_palette_is_legible_on_every_surface_it_paints() {
         for palette in ColorPalette::ALL {
-            for mode in [Mode::Dark, Mode::Light] {
-                let theme = Theme::new(mode, Chrome::Solid).with_color_palette(palette, mode);
-                assert!(
-                    (theme.accent.l - theme.ground.l).abs() > 0.2,
-                    "{palette:?}/{mode:?} accent does not stand off its ground"
-                );
-                assert!((theme.selected.h - theme.accent.h).abs() < 0.02);
-                assert_eq!(theme.accent.a, 1.0);
+            let Some(accent) = palette.accent() else {
+                continue; // the default palette is not derived
+            };
+            let (can_dark, can_light) = Theme::palette_modes(palette.colors());
+            let modes: Vec<Mode> = [(Mode::Dark, can_dark), (Mode::Light, can_light)]
+                .into_iter()
+                .filter(|(_, ok)| *ok)
+                .map(|(m, _)| m)
+                .collect();
+            assert!(
+                !modes.is_empty(),
+                "{palette:?} can be built in no mode at all"
+            );
+
+            for chrome in [Chrome::Solid, Chrome::Glass] {
+                for mode in modes.iter().copied() {
+                    let theme = Theme::from_palette(palette.colors(), Some(accent), mode, chrome);
+                    let ground = theme.ground.alpha(1.0);
+
+                    for (name, surface) in [
+                        ("ground", ground),
+                        ("panel", theme.panel),
+                        ("modal", theme.modal),
+                        ("hover", theme.hover),
+                    ] {
+                        assert!(
+                            color::contrast(theme.text, surface) >= color::CONTRAST_TEXT,
+                            "{palette:?}/{chrome:?}: body text on {name} is {:.2}:1",
+                            color::contrast(theme.text, surface)
+                        );
+                    }
+                    assert!(
+                        color::contrast(theme.text_muted, ground) >= color::CONTRAST_TEXT,
+                        "{palette:?}: muted text is {:.2}:1",
+                        color::contrast(theme.text_muted, ground)
+                    );
+                    assert!(
+                        color::contrast(theme.text_faint, ground) >= color::CONTRAST_UI,
+                        "{palette:?}: faint text is {:.2}:1",
+                        color::contrast(theme.text_faint, ground)
+                    );
+                    assert!(
+                        color::contrast(theme.accent, ground) >= color::CONTRAST_UI,
+                        "{palette:?}: accent is {:.2}:1 on its ground",
+                        color::contrast(theme.accent, ground)
+                    );
+                    assert!(
+                        color::contrast(theme.text_on_accent, theme.accent) >= color::CONTRAST_TEXT,
+                        "{palette:?}: text on the accent is {:.2}:1",
+                        color::contrast(theme.text_on_accent, theme.accent)
+                    );
+                    assert!(
+                        color::contrast(theme.danger, ground) >= color::CONTRAST_UI,
+                        "{palette:?}: danger is {:.2}:1 on its ground",
+                        color::contrast(theme.danger, ground)
+                    );
+                }
             }
         }
     }
 
+    /// The point of the rewrite: a palette's own colours reach the window,
+    /// rather than being washed over the built-in ones.
     #[test]
-    fn color_palettes_affect_the_surfaces_too() {
+    fn a_palette_actually_paints_its_own_ground() {
         for palette in ColorPalette::ALL {
-            if palette == ColorPalette::Default {
+            let Some(accent) = palette.accent() else {
                 continue;
-            }
+            };
+            let mode = Theme::palette_mode(palette.colors(), Mode::Dark);
+            let theme = Theme::from_palette(palette.colors(), Some(accent), mode, Chrome::Solid);
+            let is_one_of_the_palettes_own = palette
+                .colors()
+                .iter()
+                .any(|hex| Hsla::from(rgb(*hex)) == theme.ground);
+            assert!(
+                is_one_of_the_palettes_own,
+                "{palette:?} ground {:?} is not a colour from the palette",
+                theme.ground
+            );
+        }
+    }
+
+    /// A palette can only be built in a mode it has the colours for.
+    #[test]
+    fn a_palette_only_offers_the_modes_it_can_actually_do() {
+        // Three darks and a highlight: works either way round.
+        assert_eq!(
+            Theme::palette_modes([0x222831, 0x393e46, 0x00adb5, 0xeeeeee]),
+            (true, true)
+        );
+        // All four pale — there is no dark ground in here to be had.
+        assert_eq!(
+            Theme::palette_modes([0xe3fdfd, 0xcbf1f5, 0xa6e3e9, 0x71c9ce]),
+            (false, true)
+        );
+        // All four deep.
+        assert_eq!(
+            Theme::palette_modes([0x000000, 0x111111, 0x1a1a1a, 0x222222]),
+            (true, false)
+        );
+    }
+
+    /// Where a palette can do both, the setting still decides — the whole
+    /// point of asking what it *can* do rather than what it *is*.
+    #[test]
+    fn the_setting_still_wins_on_a_palette_that_can_do_both() {
+        let versatile = [0x222831, 0x393e46, 0x00adb5, 0xeeeeee];
+        assert_eq!(Theme::palette_mode(versatile, Mode::Dark), Mode::Dark);
+        assert_eq!(Theme::palette_mode(versatile, Mode::Light), Mode::Light);
+
+        // And where it cannot, the palette wins whatever was asked for.
+        let pastel = [0xe3fdfd, 0xcbf1f5, 0xa6e3e9, 0x71c9ce];
+        assert_eq!(Theme::palette_mode(pastel, Mode::Dark), Mode::Light);
+        assert_eq!(Theme::palette_mode(pastel, Mode::Light), Mode::Light);
+    }
+
+    /// The built-in themes, held to the same bar as the derived ones.
+    ///
+    /// `text_faint` measured 2.69:1 on the light theme — under even the 3:1
+    /// floor for non-text UI — and the queue was drawing its percentage in it.
+    /// That label is small text, so it needs `text_muted` and 4.5:1.
+    #[test]
+    fn the_built_in_themes_have_a_readable_muted_tier() {
+        for chrome in [Chrome::Solid, Chrome::Glass] {
             for mode in [Mode::Dark, Mode::Light] {
-                let base = Theme::new(mode, Chrome::Solid);
-                let themed = base.with_color_palette(palette, mode);
-                assert_ne!(themed.ground, base.ground, "{palette:?}/{mode:?} ground");
-                assert_ne!(themed.panel, base.panel, "{palette:?}/{mode:?} panel");
-                assert_ne!(themed.modal, base.modal, "{palette:?}/{mode:?} modal");
-                assert_ne!(themed.hover, base.hover, "{palette:?}/{mode:?} hover");
-                assert_ne!(themed.border, base.border, "{palette:?}/{mode:?} border");
-                assert_ne!(themed.accent, base.accent, "{palette:?}/{mode:?} accent");
+                let theme = Theme::new(mode, chrome);
+                let ground = theme.ground.alpha(1.0);
+                for (name, surface) in [("ground", ground), ("modal", theme.modal)] {
+                    assert!(
+                        color::contrast(theme.text_muted, surface) >= color::CONTRAST_TEXT,
+                        "{mode:?}/{chrome:?}: muted text on {name} is {:.2}:1",
+                        color::contrast(theme.text_muted, surface)
+                    );
+                }
+                // Faint is allowed to be quieter, but never below the floor
+                // for anything a user has to make out at all.
+                assert!(
+                    color::contrast(theme.text_faint, ground) >= color::CONTRAST_UI,
+                    "{mode:?}/{chrome:?}: faint text is {:.2}:1",
+                    color::contrast(theme.text_faint, ground)
+                );
             }
         }
     }

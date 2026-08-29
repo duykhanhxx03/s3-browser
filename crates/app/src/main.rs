@@ -11,6 +11,7 @@
 
 mod assets;
 mod browser;
+mod color;
 mod colorhunt;
 mod crash;
 mod failure;

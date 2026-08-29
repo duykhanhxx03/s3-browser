@@ -8676,6 +8676,11 @@ impl Browser {
         }
         let theme = self.theme;
         let settings = self.settings.clone();
+        // Only when the palette genuinely cannot do both: about a third of
+        // them can, and those keep the setting live.
+        let palette_led = palette_colors(&settings)
+            .map(|(colors, _)| Theme::palette_modes(colors) != (true, true))
+            .unwrap_or(false);
         let config_dir = self
             .settings_store
             .as_ref()
@@ -8736,23 +8741,29 @@ impl Browser {
                         ))
                         .child(setting_row(
                             locale::text("settings.theme"),
-                            // No note: the chip itself names the system option.
-                            None,
+                            // A palette brings its own polarity, so say so
+                            // rather than leaving three dead chips behind.
+                            palette_led.then(|| locale::text("settings.theme.palette_decides")),
                             div()
                                 .flex()
                                 .gap_1()
+                                .when(palette_led, |this| this.opacity(0.4))
                                 .children(ThemeChoice::ALL.into_iter().map(|choice| {
-                                    choice_chip(
+                                    let chip = choice_chip(
                                         SharedString::from(format!("theme-{}", choice.label())),
                                         choice.label().into(),
-                                        settings.theme == choice,
+                                        !palette_led && settings.theme == choice,
                                         theme,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _event, _window, cx| {
-                                            this.update_settings(|s| s.theme = choice, cx)
-                                        },
-                                    ))
+                                    );
+                                    if palette_led {
+                                        chip.cursor_default()
+                                    } else {
+                                        chip.on_click(cx.listener(
+                                            move |this, _event, _window, cx| {
+                                                this.update_settings(|s| s.theme = choice, cx)
+                                            },
+                                        ))
+                                    }
                                 })),
                             theme,
                         ))
@@ -13200,7 +13211,11 @@ impl Browser {
                                 },
                             )),
                     )
-                    .child(div().w(px(36.)).text_color(theme.text_faint).child(
+                    // `text_muted`, not `text_faint`: this is small text, so
+                    // it needs 4.5:1, and faint only clears the 3:1 that
+                    // non-text UI has to. Faint measured 2.69:1 on the light
+                    // theme, which is under even that.
+                    .child(div().w(px(36.)).text_color(theme.text_muted).child(
                         SharedString::from(format!("{}%", (fraction * 100.0).round() as u32)),
                     )),
             )
@@ -13377,7 +13392,11 @@ impl Browser {
                                 },
                             )),
                     )
-                    .child(div().w(px(36.)).text_color(theme.text_faint).child(
+                    // `text_muted`, not `text_faint`: this is small text, so
+                    // it needs 4.5:1, and faint only clears the 3:1 that
+                    // non-text UI has to. Faint measured 2.69:1 on the light
+                    // theme, which is under even that.
+                    .child(div().w(px(36.)).text_color(theme.text_muted).child(
                         SharedString::from(format!("{}%", (fraction * 100.0).round() as u32)),
                     )),
             )
@@ -16429,17 +16448,38 @@ fn object_context_menu(
 }
 
 /// The palette to paint: the setting when it names one, the system otherwise.
+///
 /// Takes the whole `Settings` rather than one argument per token: the three
 /// call sites all have one in hand, and every future theme preference would
 /// otherwise widen this signature and all three of them again.
+///
+/// A chosen palette decides light or dark for itself. Four colours picked to
+/// work together already are a light scheme or a dark one — `222831 393e46
+/// 00adb5 eeeeee` is three darks and a highlight — and forcing that set
+/// through the opposite mode is what the old code was doing when it washed
+/// the palette in at a tenth alpha and left the window looking untouched. The
+/// light/dark setting still rules the default palette, which has both.
 fn theme_for(settings: &Settings, appearance: gpui::WindowAppearance, chrome: Chrome) -> Theme {
-    let mode = theme_mode(settings.theme, appearance);
-    let theme = Theme::new(mode, chrome);
-    // Palette first, then style: a style's colour moves are the ones it
-    // cannot do without, so they have the last word over the palette.
+    let preferred = theme_mode(settings.theme, appearance);
+    match palette_colors(settings) {
+        Some((colors, accent)) => Theme::from_palette(
+            colors,
+            accent,
+            Theme::palette_mode(colors, preferred),
+            chrome,
+        ),
+        None => Theme::new(preferred, chrome),
+    }
+}
+
+/// The palette in force, or `None` when the app is on its own colours.
+fn palette_colors(settings: &Settings) -> Option<([u32; 4], Option<u32>)> {
     match &settings.custom_color_palette {
-        Some(custom) => theme.with_custom_color_palette(custom.colors, mode),
-        None => theme.with_color_palette(settings.color_palette, mode),
+        Some(custom) => Some((custom.colors, None)),
+        None => settings
+            .color_palette
+            .accent()
+            .map(|accent| (settings.color_palette.colors(), Some(accent))),
     }
 }
 
