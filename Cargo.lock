@@ -3149,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_tokio"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "gpui",
@@ -6181,7 +6181,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3browser"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6207,7 +6207,7 @@ dependencies = [
 
 [[package]]
 name = "s3core"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -7514,7 +7514,7 @@ dependencies = [
 
 [[package]]
 name = "transfer"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -7831,7 +7831,7 @@ dependencies = [
 
 [[package]]
 name = "vault"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
