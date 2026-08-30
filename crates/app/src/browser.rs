@@ -2177,13 +2177,31 @@ impl Browser {
 
     /// A new tab at the root of whatever bucket is open, or empty if none is.
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not a duplicate of the current place: `open_in_tab` would jump back to
-        // this tab if the prefix happened to be the root already.
+        // A new-tab command is not "open this location if one is not already
+        // around"; it is a request for another workspace. `open_in_tab` keeps
+        // its dedupe for folder rows, but the tab button and Cmd-T must still
+        // work when the current tab is already empty.
         let bucket = self.bucket.clone();
-        if bucket.is_some() && self.prefix.is_empty() {
-            return self.open_in_tab(None, String::new(), window, cx);
-        }
-        self.open_in_tab(bucket, String::new(), window, cx)
+        let state = self.capture_tab();
+        self.tabs[self.active_tab].state = state;
+
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.insert(
+            self.active_tab + 1,
+            Tab {
+                id,
+                state: TabState {
+                    bucket,
+                    sort: self.sort,
+                    layout: self.layout,
+                    ..Default::default()
+                },
+            },
+        );
+        self.active_tab += 1;
+        let state = std::mem::take(&mut self.tabs[self.active_tab].state);
+        self.restore_tab(state, window, cx);
     }
 
     fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -6867,9 +6885,9 @@ impl Browser {
             .items_center()
             .gap_2()
             .pl(px(platform::toolbar_leading_inset()))
-            .bg(theme.panel)
+            .bg(theme.chrome)
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(theme.border_strong)
             .child(
                 div()
                     .flex_shrink_0()
@@ -6909,7 +6927,7 @@ impl Browser {
                     .gap_1p5()
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(theme.hover)
+                    .bg(theme.surface_high)
                     .hover(|this| this.bg(theme.selected))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.profiles_open = true;
@@ -7076,9 +7094,9 @@ impl Browser {
             .items_center()
             .gap_0p5()
             .px_1()
-            .bg(theme.panel)
+            .bg(theme.chrome)
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(theme.border_strong)
             .children(titles.into_iter().enumerate().map(|(index, title)| {
                 let selected = index == active;
                 let title_id = SharedString::from(format!("tab-title-{index}"));
@@ -7094,9 +7112,12 @@ impl Browser {
                     .text_xs()
                     .cursor_pointer()
                     .bg(if selected {
-                        theme.selected
+                        theme.surface_high
                     } else {
-                        theme.hover
+                        gpui::transparent_black()
+                    })
+                    .when(selected, |this| {
+                        this.border_1().border_color(theme.border_strong)
                     })
                     .text_color(if selected {
                         theme.text
@@ -7182,9 +7203,9 @@ impl Browser {
             .flex_col()
             .gap_1()
             .p_2()
-            .bg(theme.panel)
+            .bg(theme.chrome)
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(theme.border_strong)
             // Always here, with or without history behind it — a nav entry that
             // comes and goes is one nobody learns the position of. The page it
             // opens says so itself when there is nothing in it.
@@ -9597,6 +9618,7 @@ impl Browser {
             .items_center()
             .gap_1()
             .px_2()
+            .bg(theme.chrome_strong)
             .border_b_1()
             .border_color(theme.border)
             .child(
@@ -10061,6 +10083,7 @@ impl Browser {
                 .items_center()
                 .gap_2()
                 .px_3()
+                .bg(theme.chrome_strong)
                 .border_b_1()
                 .border_color(theme.border_strong)
                 .text_xs()
@@ -10115,6 +10138,7 @@ impl Browser {
             .items_center()
             .gap_2()
             .px_3()
+            .bg(theme.chrome_strong)
             .border_b_1()
             .border_color(theme.border_strong)
             .child(
@@ -10234,6 +10258,7 @@ impl Browser {
             .flex()
             .items_center()
             .gap_3()
+            .bg(theme.chrome_strong)
             .border_t_1()
             .border_color(theme.border)
             .text_xs()
@@ -11167,9 +11192,9 @@ impl Browser {
             .gap_2()
             .px_3()
             .text_xs()
-            .bg(theme.panel)
+            .bg(theme.chrome)
             .border_t_1()
-            .border_color(theme.border)
+            .border_color(theme.border_strong)
             // With nothing to report, which account this is. The same path
             // under two profiles is two different places, and that is worth a
             // permanent line rather than a thing to go and check.
@@ -11375,7 +11400,7 @@ impl Browser {
                 .h(px(PANEL_HEIGHT))
                 .flex()
                 .flex_col()
-                .bg(theme.panel)
+                .bg(theme.chrome)
                 .border_t_1()
                 .border_color(theme.border_strong)
                 .child(
@@ -11884,9 +11909,9 @@ impl Browser {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(theme.modal)
-                .border_1()
-                .border_color(theme.border)
+                .bg(theme.chrome)
+                .border_l_1()
+                .border_color(theme.border_strong)
                 .on_scroll_wheel(|_event, _window, cx| cx.stop_propagation())
                 .on_click(|_event, _window, cx| cx.stop_propagation())
                 .child(
@@ -13608,6 +13633,7 @@ impl Render for Browser {
                                         .h_full()
                                         .flex()
                                         .flex_col()
+                                        .bg(theme.workspace)
                                         .drag_over::<ExternalPaths>(
                                             move |style, _paths, _window, _cx| {
                                                 style.bg(theme.drop_target)
@@ -13696,9 +13722,8 @@ impl Render for Browser {
 fn section_header(text: &'static str, id: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .h(px(ROW_HEIGHT))
         .px_2()
-        .pt_2()
-        .pb_0p5()
         .flex()
         .items_center()
         .rounded_md()
@@ -13746,7 +13771,7 @@ fn action_button(id: &'static str, label: &'static str, theme: Theme) -> gpui::S
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(theme.hover)
+        .bg(theme.surface_high)
         .text_color(theme.text)
         .hover(|this| this.bg(theme.selected))
         .child(label)
@@ -13768,7 +13793,7 @@ fn detail_action_button(
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(theme.hover)
+        .bg(theme.surface_high)
         .text_color(theme.text)
         .hover(|this| this.bg(theme.selected))
         .child(sized_icon(icon_name, 12., theme.text_muted))
@@ -13793,7 +13818,7 @@ fn setting_chip(
         .rounded_md()
         .text_xs()
         .cursor_pointer()
-        .bg(theme.hover)
+        .bg(theme.surface_high)
         .hover(|this| this.bg(theme.selected))
         .child(div().text_color(theme.text_faint).child(label))
         .child(
@@ -13841,7 +13866,9 @@ fn preview_detail_section(title: impl Into<SharedString>, theme: Theme) -> gpui:
         .flex_col()
         .gap_2()
         .rounded_lg()
-        .bg(theme.hover)
+        .bg(theme.surface_high)
+        .border_1()
+        .border_color(theme.border)
         .child(div().text_xs().text_color(theme.text_faint).child(title))
 }
 
@@ -13853,7 +13880,7 @@ fn inspector_section(title: impl Into<SharedString>, theme: Theme) -> gpui::Div 
         .flex_col()
         .gap_2()
         .rounded_lg()
-        .bg(theme.modal)
+        .bg(theme.surface_high)
         .border_1()
         .border_color(theme.border)
         .child(div().text_xs().text_color(theme.text_faint).child(title))
@@ -14507,7 +14534,7 @@ fn action_button_dyn(
         .text_xs()
         .cursor_pointer()
         .text_color(theme.text)
-        .bg(theme.hover)
+        .bg(theme.surface_high)
         .hover(|style| style.bg(theme.selected))
         .child(label)
 }
@@ -14972,7 +14999,7 @@ fn object_grid_card(
     let media_bg = if entry.is_folder {
         gpui::transparent_black()
     } else if has_thumbnail {
-        theme.modal
+        theme.surface_high
     } else {
         preview_veil(theme)
     };
@@ -15021,6 +15048,8 @@ fn object_grid_card(
                 .justify_center()
                 .rounded_lg()
                 .bg(media_bg)
+                .border_1()
+                .border_color(theme.border)
                 .overflow_hidden()
                 .child(
                     div()
@@ -16748,7 +16777,7 @@ fn choice_chip(
         .bg(if selected {
             theme.selected
         } else {
-            theme.hover
+            theme.surface_high
         })
         .text_color(if selected {
             theme.text

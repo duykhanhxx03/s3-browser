@@ -1,9 +1,9 @@
 //! Colour tokens for light and dark, in glass and solid chrome.
 //!
-//! Only the window ground changes between chromes: in glass it is translucent so
-//! the compositor's blur shows through, in solid it is opaque. Every panel above
-//! it is an alpha overlay, so it composites correctly either way and there is no
-//! second palette to keep in sync.
+//! The window ground changes between chromes: in glass it is translucent so the
+//! compositor's blur shows through, in solid it is opaque. The workbench
+//! surfaces above it are alpha overlays, so title bars, sidebars and data panes
+//! keep one palette while still feeling layered.
 
 use gpui::{rgb, rgba, Hsla, WindowAppearance};
 
@@ -31,6 +31,16 @@ pub struct Theme {
     pub ground: Hsla,
     /// Sidebar, toolbar and status bar.
     pub panel: Hsla,
+    /// Heavier window chrome: title bar, sidebar and docked utility panes.
+    pub chrome: Hsla,
+    /// Stronger chrome for strips that need to sit above data, such as tabs
+    /// and table headers.
+    pub chrome_strong: Hsla,
+    /// The data canvas between the chrome surfaces.
+    pub workspace: Hsla,
+    /// Raised but still in-window surfaces: inspector sections, grid media
+    /// wells and compact controls.
+    pub surface_high: Hsla,
     /// Dialogs and popovers. Opaque, unlike [`panel`]: a panel is an alpha wash
     /// meant to composite over the ground, which is right for a sidebar and
     /// wrong for something floating over content — at 5% alpha the content
@@ -66,6 +76,10 @@ impl Theme {
                     rgb(0x0e0f12).into()
                 },
                 panel: rgba(0xffffff0a).into(),
+                chrome: rgba(0xffffff10).into(),
+                chrome_strong: rgba(0xffffff17).into(),
+                workspace: rgba(0xffffff05).into(),
+                surface_high: rgba(0xffffff13).into(),
                 modal: rgb(0x17191d).into(),
                 hover: rgba(0xffffff0f).into(),
                 selected: rgba(0x3b82f62e).into(),
@@ -103,6 +117,10 @@ impl Theme {
                 },
                 // On a light ground the panels read as *lighter*, not darker.
                 panel: rgba(0xffffffb8).into(),
+                chrome: rgba(0xffffffcf).into(),
+                chrome_strong: rgba(0xffffffeb).into(),
+                workspace: rgba(0xffffff78).into(),
+                surface_high: rgba(0xffffffea).into(),
                 modal: rgb(0xffffff).into(),
                 hover: rgba(0x1c202412).into(),
                 selected: rgba(0x2563eb1f).into(),
@@ -248,6 +266,12 @@ impl Theme {
             chosen
         };
 
+        let panel = surface(near, 1.0).alpha(if dark { 0.72 } else { 0.78 });
+        let chrome_surface = surface(near, 1.25).alpha(if dark { 0.78 } else { 0.86 });
+        let chrome_strong = surface(near, 1.55).alpha(if dark { 0.86 } else { 0.94 });
+        let workspace = surface(ground, 0.35).alpha(if dark { 0.34 } else { 0.42 });
+        let surface_high = surface(near, 1.45).alpha(if dark { 0.88 } else { 0.96 });
+
         Self {
             // Glass keeps the palette's ground but lets the compositor
             // through, exactly as the built-in theme does.
@@ -256,7 +280,11 @@ impl Theme {
             } else {
                 ground
             },
-            panel: surface(near, 1.0),
+            panel,
+            chrome: chrome_surface,
+            chrome_strong,
+            workspace,
+            surface_high,
             modal: surface(near, 1.7),
             hover: surface(ground, 2.1),
             selected: accent.alpha(if dark { 0.24 } else { 0.20 }),
@@ -486,6 +514,10 @@ mod tests {
                     for (name, surface) in [
                         ("ground", ground),
                         ("panel", theme.panel),
+                        ("chrome", theme.chrome),
+                        ("chrome_strong", theme.chrome_strong),
+                        ("workspace", theme.workspace),
+                        ("surface_high", theme.surface_high),
                         ("modal", theme.modal),
                         ("hover", theme.hover),
                     ] {
