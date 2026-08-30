@@ -1,7 +1,23 @@
-# s3browser
+<div align="center">
 
-A desktop S3 client written in Rust on [GPUI](https://gpui.rs), for macOS,
-Windows and Linux.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/s3-browser-logo-dark.svg">
+  <img src="assets/brand/s3-browser-logo-light.svg" alt="S3 Browser" width="300">
+</picture>
+
+**A desktop S3 client written in Rust on [GPUI](https://gpui.rs)** — for macOS, Windows and Linux.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#status-and-limitations)
+[![Status](https://img.shields.io/badge/status-usable%2C%20unsigned-orange)](#status-and-limitations)
+
+</div>
+
+<div align="center">
+  <img src="docs/screenshots/browsing.png" alt="Browsing a bucket in grid layout, with image thumbnails" width="900">
+</div>
+
+---
 
 It talks to Amazon S3 and to S3-compatible stores — Cloudflare R2, Backblaze
 B2, Wasabi, DigitalOcean Spaces, MinIO — and treats "S3-compatible" as a
@@ -12,53 +28,85 @@ Credentials never live in a config file. Secret keys go to the operating
 system's credential store (Keychain, Credential Manager, Secret Service) and
 only profile metadata is stored as JSON.
 
+> [!IMPORTANT]
 > **Status: usable, unsigned.** The application works and is used against real
 > providers, and GitHub releases are published manually. There are no signed
 > binaries, no release automation and no CI. See
-> [Status and limitations](#status-and-limitations) before
-> depending on it.
+> [Status and limitations](#status-and-limitations) before depending on it.
 
 ## Features
 
-**Browsing.** Tabs, a clickable breadcrumb, an `s3://` path bar, list and
-grid layouts, pinned and recent places, and an all-buckets page. Listings
-page automatically as you scroll; sorting by anything other than name loads
-the rest of the prefix first, under explicit request and item caps, and says
-when it stopped short rather than presenting a partial answer as a complete
-one.
+### Browsing
 
-**Search.** Typing filters what is loaded, for free. Pressing Enter scans the
-whole bucket — a LIST request per thousand keys, so it waits to be asked —
-with caps, a stop button, and a status line that distinguishes "finished",
+<img src="docs/screenshots/listing.png" alt="A list of backup archives, with storage-class marks in the size column" width="820">
+
+Tabs, a clickable breadcrumb, an `s3://` path bar, list and grid layouts,
+pinned and recent places, and an all-buckets page. Listings page
+automatically as you scroll; sorting by anything other than name loads the
+rest of the prefix first, under explicit request and item caps, and says when
+it stopped short rather than presenting a partial answer as a complete one.
+
+Objects in the archived storage classes are marked where the size is, so a
+Glacier restore is never a surprise.
+
+### Search
+
+Typing filters what is loaded, for free. Pressing Enter scans the whole
+bucket — a LIST request per thousand keys, so it waits to be asked — with
+caps, a stop button, and a status line that distinguishes "finished",
 "stopped" and "hit the cap".
 
-**Transfers.** An upload/download queue with progress, pause, resume and
-cancel, journalled in SQLite so it survives a restart. Multipart uploads are
-implemented directly rather than through the AWS transfer manager, so a
-resumed job asks the server which parts it already holds instead of starting
-over. Downloads use concurrent ranged GETs pinned to an ETag, so an
-interrupted transfer cannot splice two versions of an object together.
-Bandwidth throttling and adaptive retry for 503 SlowDown are built in.
+### Transfers
 
-**Object operations.** Rename, copy and move (server-side, switching to
-UploadPartCopy above 5 GiB), delete with a per-object fallback for stores
-without `DeleteObjects`, versioning, tags, storage class and Glacier restore,
-header editing in bulk, an ACL editor, presigned URLs, and copying `s3://`
-paths or bare keys.
+An upload/download queue with progress, pause, resume and cancel, journalled
+in SQLite so it survives a restart. Multipart uploads are implemented
+directly rather than through the AWS transfer manager, so a resumed job asks
+the server which parts it already holds instead of starting over. Downloads
+use concurrent ranged GETs pinned to an ETag, so an interrupted transfer
+cannot splice two versions of an object together. Bandwidth throttling and
+adaptive retry for 503 SlowDown are built in.
 
-**Preview.** Images, text — editable and saved back — and CSV/TSV rendered as
-a table by an RFC 4180 parser. Everything else is handed to the operating
-system rather than half-rendered in the app.
+### Object operations
 
-**Integrity.** CRC32 checksums are sent on upload and verified on download.
-The ETag is deliberately not used for this: for a multipart object it is a
-digest of digests, so comparing it against a whole-file hash fails on exactly
-the large files most worth checking.
+Rename, copy and move (server-side, switching to UploadPartCopy above 5 GiB),
+delete with a per-object fallback for stores without `DeleteObjects`,
+versioning, tags, storage class and Glacier restore, header editing in bulk,
+an ACL editor, presigned URLs, and copying `s3://` paths or bare keys.
 
-**Interface.** A command palette (`⌘K`) whose search ignores Vietnamese
-diacritics, an error log that keeps the provider's own wording alongside a
-plain-language summary, per-region loading and empty states, light and dark
-themes following the system, and crash reports written to disk.
+### Preview
+
+<img src="docs/screenshots/preview.png" alt="A CSV rendered as a table beside the object's properties panel" width="900">
+
+Images, text — editable and saved back — and CSV/TSV rendered as a table by
+an RFC 4180 parser. Everything else is handed to the operating system rather
+than half-rendered in the app. The details panel beside it carries size,
+ETag, storage class, encryption and access in one place.
+
+### Integrity
+
+CRC32 checksums are sent on upload and verified on download. The ETag is
+deliberately not used for this: for a multipart object it is a digest of
+digests, so comparing it against a whole-file hash fails on exactly the large
+files most worth checking.
+
+### Interface
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/command-palette.png" alt="The command palette listing every command with its shortcut"></td>
+<td width="50%"><img src="docs/screenshots/settings.png" alt="The settings dialog: language, theme, colour palette, transfers, preview limit"></td>
+</tr>
+<tr>
+<td>A command palette (<code>⌘K</code>) reaching every command, including
+those without a button. Its search ignores Vietnamese diacritics.</td>
+<td>Light and dark themes following the system, accent palettes, motion and
+transfer settings, and a preview size limit.</td>
+</tr>
+</table>
+
+An error log keeps the provider's own wording alongside a plain-language
+summary, loading and empty states are written per region, and crash reports
+are written to disk.
 
 ## Status and limitations
 
@@ -75,33 +123,8 @@ themes following the system, and crash reports written to disk.
 Verification status for each area is recorded in more detail in
 [PLAN.md](PLAN.md).
 
-## Building from source
-
-Rust stable (developed against 1.97.1) plus a per-platform toolchain:
-
-| Platform | Additional requirements |
-|---|---|
-| macOS | Xcode and the **Metal Toolchain**. GPUI compiles Metal shaders at build time, and Xcode 26 ships that component separately — without it `cargo build` fails with `cannot execute tool 'metal'`. Install once with `xcodebuild -downloadComponent MetalToolchain` (688 MB). |
-| Windows | MSVC build tools (Visual Studio Build Tools). GPUI uses Direct3D 11 and DirectWrite. |
-| Linux | Wayland and X11 development libraries, plus a Vulkan loader — GPUI renders through blade-graphics there. |
-
-```bash
-git clone <repository-url>
-cd s3browser
-cargo build --release -p s3browser
-```
-
-The binary lands in `target/release/s3browser`.
-
-Cross-compiling both the Windows executable and the Linux binary from macOS
-works and is documented in [docs/PACKAGING.md](docs/PACKAGING.md) — including
-the three `vendor/gpui` patches Windows requires, why
-`-C target-feature=+crt-static` is not optional there, and why one Linux
-binary built against glibc 2.35 covers Ubuntu 22.04, 24.04 and 26.04 rather
-than needing one build per release.
-
-Packaging a macOS `.app` and `.dmg`, and everything known about signing and
-notarisation, is in the same document.
+> The screenshots above were taken on macOS against a local S3 server with
+> sample data, not against a production bucket.
 
 ## Getting started
 
@@ -133,6 +156,34 @@ from every `cargo build`. It **only works in debug builds** — a release build
 that accepted keys from the environment would let anyone who can set a
 variable on the process choose the key it signs with, defeating the key store
 entirely.
+
+## Building from source
+
+Rust stable (developed against 1.97.1) plus a per-platform toolchain:
+
+| Platform | Additional requirements |
+|---|---|
+| macOS | Xcode and the **Metal Toolchain**. GPUI compiles Metal shaders at build time, and Xcode 26 ships that component separately — without it `cargo build` fails with `cannot execute tool 'metal'`. Install once with `xcodebuild -downloadComponent MetalToolchain` (688 MB). |
+| Windows | MSVC build tools (Visual Studio Build Tools). GPUI uses Direct3D 11 and DirectWrite. |
+| Linux | Wayland and X11 development libraries, plus a Vulkan loader — GPUI renders through blade-graphics there. |
+
+```bash
+git clone <repository-url>
+cd s3browser
+cargo build --release -p s3browser
+```
+
+The binary lands in `target/release/s3browser`.
+
+Cross-compiling both the Windows executable and the Linux binary from macOS
+works and is documented in [docs/PACKAGING.md](docs/PACKAGING.md) — including
+the three `vendor/gpui` patches Windows requires, why
+`-C target-feature=+crt-static` is not optional there, and why one Linux
+binary built against glibc 2.35 covers Ubuntu 22.04, 24.04 and 26.04 rather
+than needing one build per release.
+
+Packaging a macOS `.app` and `.dmg`, and everything known about signing and
+notarisation, is in the same document.
 
 ## Usage
 
@@ -219,6 +270,15 @@ scripts/minio-dev.sh start       # start one, so they do not skip
 The MinIO tests distinguish three cases — no server, a server without seeded
 fixtures, and a genuine failure — and skip rather than fail for the first
 two, naming the command to run.
+
+Some behaviour cannot be checked against MinIO at all: it rejects the
+archived storage classes outright, so the marks in the size column need a
+server that keeps them.
+
+```bash
+scripts/localstack-dev.sh start                              # LocalStack plus fixtures
+S3BROWSER_TEST_ENDPOINT=http://127.0.0.1:4566 cargo test -- --ignored
+```
 
 Every platform difference lives in
 [crates/app/src/platform.rs](crates/app/src/platform.rs). Platform branches
