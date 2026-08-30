@@ -5,108 +5,127 @@
   <img src="assets/brand/s3-browser-logo-light.svg" alt="S3 Browser" width="300">
 </picture>
 
-**A desktop S3 client written in Rust on [GPUI](https://gpui.rs)** — for macOS, Windows and Linux.
+**A desktop S3 client in Rust, on [GPUI](https://gpui.rs)** — macOS, Windows, Linux.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#status-and-limitations)
 [![Status](https://img.shields.io/badge/status-usable%2C%20unsigned-orange)](#status-and-limitations)
 
-</div>
+<img src="docs/screenshots/browsing.png" alt="Browsing a bucket in grid layout" width="900">
 
-<div align="center">
-  <img src="docs/screenshots/browsing.png" alt="Browsing a bucket in grid layout, with image thumbnails" width="900">
 </div>
 
 ---
 
-It talks to Amazon S3 and to S3-compatible stores — Cloudflare R2, Backblaze
-B2, Wasabi, DigitalOcean Spaces, MinIO — and treats "S3-compatible" as a
-spectrum rather than a checkbox: it probes what each provider and each token
-can actually do, and hides the features that would only fail.
+Works with Amazon S3 and with S3-compatible stores — Cloudflare R2, Backblaze
+B2, Wasabi, DigitalOcean Spaces, MinIO. "S3-compatible" is treated as a
+spectrum, not a checkbox: the app probes what each provider and each token can
+actually do, and hides what would only fail.
 
-Credentials never live in a config file. Secret keys go to the operating
-system's credential store (Keychain, Credential Manager, Secret Service) and
-only profile metadata is stored as JSON.
+Secret keys go to the OS credential store (Keychain, Credential Manager,
+Secret Service). The config file holds profile metadata and nothing else.
 
 > [!IMPORTANT]
-> **Status: usable, unsigned.** The application works and is used against real
-> providers, and GitHub releases are published manually. There are no signed
-> binaries, no release automation and no CI. See
-> [Status and limitations](#status-and-limitations) before depending on it.
+> **Usable, unsigned.** It works and is used against real providers. There are
+> no signed binaries, no release automation and no CI — see
+> [Status and limitations](#status-and-limitations).
 
 ## Features
 
 ### Browsing
 
-<img src="docs/screenshots/listing.png" alt="A list of backup archives, with storage-class marks in the size column" width="820">
+<img src="docs/screenshots/listing.png" alt="Backup archives with storage-class marks beside the size" width="820">
 
-Tabs, a clickable breadcrumb, an `s3://` path bar, list and grid layouts,
-pinned and recent places, and an all-buckets page. Listings page
-automatically as you scroll; sorting by anything other than name loads the
-rest of the prefix first, under explicit request and item caps, and says when
-it stopped short rather than presenting a partial answer as a complete one.
+Tabs, breadcrumb, `s3://` path bar, list and grid layouts, pinned and recent
+places, an all-buckets page. Listings page as you scroll. Sorting by anything
+but name loads the rest of the prefix first, under request and item caps, and
+says when it stopped short instead of passing a partial answer off as
+complete.
 
-Objects in the archived storage classes are marked where the size is, so a
-Glacier restore is never a surprise.
+Archived storage classes are marked beside the size, so a Glacier restore is
+never a surprise.
+
+### Preview
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/image-preview.png" alt="An image preview beside its properties"></td>
+<td width="50%"><img src="docs/screenshots/preview.png" alt="A CSV rendered as a table"></td>
+</tr>
+</table>
+
+Images, text — editable, saved back — and CSV/TSV as a table via an RFC 4180
+parser. Anything else goes to the OS rather than being half-rendered here. The
+panel beside it carries size, type, storage class, encryption, ETag and access.
+
+### Sharing and access
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/share.png" alt="The share dialog with expiry presets and a presigned URL"></td>
+<td width="50%"><img src="docs/screenshots/permissions.png" alt="The permission table: read, write and full per grantee"></td>
+</tr>
+</table>
+
+Presigned URLs with expiry presets, and an ACL editor — read, write and full
+control per grantee, plus the four canned presets.
 
 ### Search
 
-Typing filters what is loaded, for free. Pressing Enter scans the whole
-bucket — a LIST request per thousand keys, so it waits to be asked — with
-caps, a stop button, and a status line that distinguishes "finished",
-"stopped" and "hit the cap".
+Typing filters what is loaded, for free. Enter scans the whole bucket — one
+LIST per thousand keys, so it waits to be asked — with caps, a stop button,
+and a status line that separates "finished", "stopped" and "hit the cap".
 
 ### Transfers
 
-An upload/download queue with progress, pause, resume and cancel, journalled
-in SQLite so it survives a restart. Multipart uploads are implemented
-directly rather than through the AWS transfer manager, so a resumed job asks
-the server which parts it already holds instead of starting over. Downloads
-use concurrent ranged GETs pinned to an ETag, so an interrupted transfer
-cannot splice two versions of an object together. Bandwidth throttling and
-adaptive retry for 503 SlowDown are built in.
+Upload/download queue with progress, pause, resume and cancel, journalled in
+SQLite so it survives a restart. Multipart uploads are implemented directly
+rather than through the AWS transfer manager, so a resumed job asks the server
+which parts it already holds. Downloads use concurrent ranged GETs pinned to
+an ETag, so an interrupted transfer cannot splice two versions together.
+Bandwidth throttling and adaptive retry for 503 SlowDown included.
 
 ### Object operations
 
 Rename, copy and move (server-side, switching to UploadPartCopy above 5 GiB),
 delete with a per-object fallback for stores without `DeleteObjects`,
-versioning, tags, storage class and Glacier restore, header editing in bulk,
-an ACL editor, presigned URLs, and copying `s3://` paths or bare keys.
-
-### Preview
-
-<img src="docs/screenshots/preview.png" alt="A CSV rendered as a table beside the object's properties panel" width="900">
-
-Images, text — editable and saved back — and CSV/TSV rendered as a table by
-an RFC 4180 parser. Everything else is handed to the operating system rather
-than half-rendered in the app. The details panel beside it carries size,
-ETag, storage class, encryption and access in one place.
+versioning, tags, storage class and Glacier restore, bulk header editing, and
+copying `s3://` paths or bare keys.
 
 ### Integrity
 
-CRC32 checksums are sent on upload and verified on download. The ETag is
-deliberately not used for this: for a multipart object it is a digest of
-digests, so comparing it against a whole-file hash fails on exactly the large
-files most worth checking.
+CRC32 is sent on upload and verified on download. The ETag is deliberately not
+used: for a multipart object it is a digest of digests, so comparing it to a
+whole-file hash fails on exactly the large files most worth checking.
 
-### Interface
+### Appearance
 
 <table>
 <tr>
-<td width="50%"><img src="docs/screenshots/command-palette.png" alt="The command palette listing every command with its shortcut"></td>
-<td width="50%"><img src="docs/screenshots/settings.png" alt="The settings dialog: language, theme, colour palette, transfers, preview limit"></td>
-</tr>
-<tr>
-<td>A command palette (<code>⌘K</code>) reaching every command, including
-those without a button. Its search ignores Vietnamese diacritics.</td>
-<td>Light and dark themes following the system, accent palettes, motion and
-transfer settings, and a preview size limit.</td>
+<td width="33%"><img src="docs/screenshots/palette-mauve.png" alt="Mauve palette"></td>
+<td width="33%"><img src="docs/screenshots/palette-cream.png" alt="Cream palette"></td>
+<td width="33%"><img src="docs/screenshots/palette-blue.png" alt="Pale blue palette"></td>
 </tr>
 </table>
 
-An error log keeps the provider's own wording alongside a plain-language
-summary, loading and empty states are written per region, and crash reports
-are written to disk.
+Accent palettes from [Color Hunt](https://colorhunt.co), browsable by
+category. The palette sets light or dark; the app otherwise follows the
+system.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/palette-picker.png" alt="The palette picker, browsable by category"></td>
+<td width="50%"><img src="docs/screenshots/settings.png" alt="Settings: language, theme, palette, transfers, preview limit"></td>
+</tr>
+</table>
+
+### Command palette
+
+<img src="docs/screenshots/command-palette.png" alt="The command palette listing every command with its shortcut" width="820">
+
+`⌘K` reaches every command, including those without a button; the search
+ignores Vietnamese diacritics. The error log keeps the provider's own wording
+next to a plain-language summary, and crash reports are written to disk.
 
 ## Status and limitations
 
@@ -115,31 +134,27 @@ are written to disk.
 | Signed builds | None. macOS Gatekeeper rejects the unsigned `.app`; Developer ID signing and notarisation need a paid Apple Developer account. See [docs/PACKAGING.md](docs/PACKAGING.md). |
 | CI and releases | No CI or release automation yet. GitHub releases are built and uploaded manually. |
 | Windows | Cross-compiled from macOS and verified only by inspecting the executable — never run on Windows. |
-| Linux | Cross-compiled from macOS and verified only by inspecting the binary — never run on a Linux desktop. The build targets glibc 2.35, so it runs on Ubuntu 22.04 and newer. Window blur is unavailable outside KDE, so the theme falls back to solid. |
-| AWS SSO | The device flow talks to real AWS endpoints and cannot be simulated with MinIO. Only its pure logic is unit tested; treat it as unverified. |
+| Linux | Cross-compiled from macOS and verified only by inspecting the binary — never run on a Linux desktop. Targets glibc 2.35, so it runs on Ubuntu 22.04 and newer. Window blur is unavailable outside KDE; the theme falls back to solid. |
+| AWS SSO | The device flow talks to real AWS endpoints and cannot be simulated locally. Only its pure logic is unit tested; treat it as unverified. |
 | ACL writes | Exercised against MinIO, which refuses `PutObjectAcl`. The write path has not run against an ACL-enabled AWS bucket. |
 | Auto-update | Not implemented. |
 
-Verification status for each area is recorded in more detail in
-[PLAN.md](PLAN.md).
+Per-area verification status is in [PLAN.md](PLAN.md).
 
-> The screenshots above were taken on macOS against a local S3 server with
-> sample data, not against a production bucket.
+> Screenshots were taken on macOS against a local S3 server with sample data.
 
 ## Getting started
 
-On first run, with no profile configured, the welcome screen offers three
-ways in: enter credentials manually, connect to a local MinIO, or sign in
-with AWS SSO.
+With no profile configured, the welcome screen offers three ways in: enter
+credentials, connect to a local MinIO, or sign in with AWS SSO.
 
-The credential form has presets for AWS, Cloudflare R2, Backblaze B2, Wasabi,
-DigitalOcean Spaces, MinIO and a generic S3-compatible option; choosing one
-fills in the endpoint and region. There is a **Test connection** button that
-saves nothing, and a reveal button for the secret key.
+The credential form has presets for AWS, R2, B2, Wasabi, Spaces, MinIO and a
+generic S3-compatible option; choosing one fills in endpoint and region. **Test
+connection** saves nothing.
 
-A denied `ListBuckets` is not treated as a failed connection: a token scoped
-to a single bucket — Cloudflare's recommended setup for R2 — signs correctly,
-and you can reach the bucket by name or by typing an `s3://` path.
+A denied `ListBuckets` is not treated as a failed connection: a token scoped to
+one bucket — Cloudflare's recommended setup for R2 — signs correctly, and the
+bucket is reachable by name or by `s3://` path.
 
 ### Trying it against MinIO
 
@@ -149,13 +164,12 @@ cargo run -p vault --example dev_profile     # create a "MinIO local" profile
 S3BROWSER_DEV_SECRET=minioadmin cargo run -p s3browser
 ```
 
-`S3BROWSER_DEV_SECRET` exists so that iterating on the UI does not mean
-retyping a keychain password on every launch: the macOS Keychain grants
-access by code signature, and an unsigned debug build gets a new signature
-from every `cargo build`. It **only works in debug builds** — a release build
-that accepted keys from the environment would let anyone who can set a
-variable on the process choose the key it signs with, defeating the key store
-entirely.
+`S3BROWSER_DEV_SECRET` exists so iterating on the UI does not mean retyping a
+keychain password every launch: the macOS Keychain grants access by code
+signature, and an unsigned debug build gets a new one from every `cargo build`.
+It **only works in debug builds** — a release build that took keys from the
+environment would let anyone who can set a variable choose the signing key,
+defeating the key store.
 
 ## Building from source
 
@@ -163,9 +177,9 @@ Rust stable (developed against 1.97.1) plus a per-platform toolchain:
 
 | Platform | Additional requirements |
 |---|---|
-| macOS | Xcode and the **Metal Toolchain**. GPUI compiles Metal shaders at build time, and Xcode 26 ships that component separately — without it `cargo build` fails with `cannot execute tool 'metal'`. Install once with `xcodebuild -downloadComponent MetalToolchain` (688 MB). |
-| Windows | MSVC build tools (Visual Studio Build Tools). GPUI uses Direct3D 11 and DirectWrite. |
-| Linux | Wayland and X11 development libraries, plus a Vulkan loader — GPUI renders through blade-graphics there. |
+| macOS | Xcode and the **Metal Toolchain**. GPUI compiles Metal shaders at build time and Xcode 26 ships that separately — without it `cargo build` fails with `cannot execute tool 'metal'`. Install once: `xcodebuild -downloadComponent MetalToolchain` (688 MB). |
+| Windows | MSVC build tools. GPUI uses Direct3D 11 and DirectWrite. |
+| Linux | Wayland and X11 development libraries plus a Vulkan loader — GPUI renders through blade-graphics. |
 
 ```bash
 git clone <repository-url>
@@ -175,15 +189,12 @@ cargo build --release -p s3browser
 
 The binary lands in `target/release/s3browser`.
 
-Cross-compiling both the Windows executable and the Linux binary from macOS
-works and is documented in [docs/PACKAGING.md](docs/PACKAGING.md) — including
-the three `vendor/gpui` patches Windows requires, why
-`-C target-feature=+crt-static` is not optional there, and why one Linux
-binary built against glibc 2.35 covers Ubuntu 22.04, 24.04 and 26.04 rather
-than needing one build per release.
-
-Packaging a macOS `.app` and `.dmg`, and everything known about signing and
-notarisation, is in the same document.
+Cross-compiling the Windows executable and the Linux binary from macOS works
+and is documented in [docs/PACKAGING.md](docs/PACKAGING.md) — the three
+`vendor/gpui` patches Windows needs, why `-C target-feature=+crt-static` is
+not optional there, and why one glibc 2.35 build covers Ubuntu 22.04, 24.04
+and 26.04. Packaging a macOS `.app` and `.dmg`, and everything known about
+signing, is in the same document.
 
 ## Usage
 
@@ -193,18 +204,18 @@ notarisation, is in the same document.
 
 | Key | Action |
 |---|---|
-| `⌘K` | Command palette — every command, including those without a button |
-| `⌘F` | Focus the filter box (`Esc` clears it and returns the keyboard to the list) |
-| `Enter` in the filter | Scan the whole bucket for that string; stoppable |
-| `⌘L` | Type an `s3://bucket/prefix/` path directly |
+| `⌘K` | Command palette |
+| `⌘F` | Focus the filter (`Esc` clears it, returns focus to the list) |
+| `Enter` in the filter | Scan the whole bucket; stoppable |
+| `⌘L` | Type an `s3://bucket/prefix/` path |
 | `⌘T` / `⌘W` | New tab / close tab |
-| `⌘1`…`⌘9` | Switch tabs (`⌘9` is the last tab) |
+| `⌘1`…`⌘9` | Switch tabs (`⌘9` is the last) |
 | `⌘N` / `⌘⇧N` | New folder / new bucket |
-| `⌘R` | Reload the current prefix |
-| `⌘↑` / `⌫` | Go up one level |
+| `⌘R` | Reload the prefix |
+| `⌘↑` / `⌫` | Go up |
 | `↑` `↓` | Move the cursor |
 | `⇧↑` `⇧↓` | Extend the selection |
-| `⌘A` | Select all (visible rows only) |
+| `⌘A` | Select all (visible rows) |
 | `⌘C` / `⌘X` / `⌘V` | Copy / cut / paste objects |
 | `⌘I` | Details panel |
 | `Space` | Preview |
@@ -212,38 +223,36 @@ notarisation, is in the same document.
 | `⌘⏎` | Rename |
 | `⌘⌫` | Delete the selection |
 | `⌘J` | Transfer queue |
-| `Enter` | Open: folders navigate, files preview |
-| Double click | Enter a folder, or preview a file |
-| `⌘`+click | Add to the selection |
-| `⇧`+click | Extend the selection |
+| `Enter` | Folders navigate, files preview |
+| Double click | Enter a folder, or preview |
+| `⌘`+click / `⇧`+click | Add to / extend the selection |
 
 ### Command-line flags
 
 | Flag | Effect |
 |---|---|
-| `--open bucket/prefix/` | Open a location directly at startup |
-| `--verify-glass` | Ask AppKit whether the glass effect is really attached, print a report and exit (macOS) |
+| `--open bucket/prefix/` | Open a location at startup |
+| `--verify-glass` | Ask AppKit whether the glass effect is attached, print a report, exit (macOS) |
 
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
 | `S3BROWSER_DEBUG=1` | Diagnostic logging (connections, item counts, paging) |
-| `S3BROWSER_GLASS=0/1` | Force solid or glass chrome, overriding the platform default |
+| `S3BROWSER_GLASS=0/1` | Force solid or glass chrome |
 | `S3BROWSER_CRASH_DIR=…` | Where crash reports are written |
-| `S3BROWSER_DEV_SECRET=…` | Take the secret key from the environment instead of the credential store. Debug builds only |
+| `S3BROWSER_DEV_SECRET=…` | Secret key from the environment. Debug builds only |
 
 ### Files on disk
 
-All in the platform config directory —
-`~/Library/Application Support/s3browser`, `%APPDATA%\s3browser` or
-`~/.config/s3browser`:
+In the platform config directory — `~/Library/Application Support/s3browser`,
+`%APPDATA%\s3browser` or `~/.config/s3browser`:
 
 | File | Contents |
 |---|---|
-| `profiles.json` | Profiles, endpoints and provider quirks. No secrets |
-| `settings.json` | Theme, motion, preview limit, transfer concurrency, bandwidth |
-| `places.json` | Pinned and recent locations, scoped per profile |
+| `profiles.json` | Profiles, endpoints, provider quirks. No secrets |
+| `settings.json` | Theme, palette, motion, preview limit, transfer concurrency, bandwidth |
+| `places.json` | Pinned and recent locations, per profile |
 | `crashes/` | Crash reports. The About dialog names this directory |
 
 ## Development
@@ -258,22 +267,20 @@ crates/
 vendor/gpui/    # gpui 0.2.2, vendored through [patch.crates-io]
 ```
 
-`s3core`, `transfer` and `vault` deliberately know nothing about GPUI, so the
-S3 logic, the transfer engine and profile handling are testable with a plain
-`cargo test`.
+`s3core`, `transfer` and `vault` know nothing about GPUI, so the S3 logic, the
+transfer engine and profile handling are testable with a plain `cargo test`.
 
 ```bash
-cargo test                       # MinIO integration tests skip themselves if no server is running
+cargo test                       # MinIO tests skip themselves if no server is running
 scripts/minio-dev.sh start       # start one, so they do not skip
 ```
 
-The MinIO tests distinguish three cases — no server, a server without seeded
-fixtures, and a genuine failure — and skip rather than fail for the first
-two, naming the command to run.
+The MinIO tests separate three cases — no server, a server without fixtures,
+and a genuine failure — and skip rather than fail for the first two, naming the
+command to run.
 
-Some behaviour cannot be checked against MinIO at all: it rejects the
-archived storage classes outright, so the marks in the size column need a
-server that keeps them.
+Some behaviour cannot be checked against MinIO: it rejects the archived storage
+classes outright, so the marks beside the size need a server that keeps them.
 
 ```bash
 scripts/localstack-dev.sh start                              # LocalStack plus fixtures
@@ -281,33 +288,28 @@ S3BROWSER_TEST_ENDPOINT=http://127.0.0.1:4566 cargo test -- --ignored
 ```
 
 Every platform difference lives in
-[crates/app/src/platform.rs](crates/app/src/platform.rs). Platform branches
-use the `cfg!(target_os = …)` macro rather than `#[cfg]`, so every branch is
-compiled and type-checked on every machine and the Windows and Linux paths
-cannot rot silently while work happens on a Mac. `glass_check.rs` is the one
-genuinely macOS-only module.
+[crates/app/src/platform.rs](crates/app/src/platform.rs). Branches use
+`cfg!(target_os = …)` rather than `#[cfg]`, so every branch is compiled and
+type-checked on every machine and the Windows and Linux paths cannot rot
+silently. `glass_check.rs` is the one genuinely macOS-only module.
 
 ## Contributing
 
-Issues and pull requests are welcome.
+Issues and pull requests are welcome. Two conventions:
 
-Two conventions worth knowing before opening a PR:
-
-- **Commit messages are in English** and explain *why* a change is made
-  rather than restating the diff. Where a change was verified against a real
-  provider, the message says so; where it was not, the message says that too.
+- **Commit messages are in English** and say *why*, not what the diff already
+  shows. Where a change was verified against a real provider, the message says
+  so; where it was not, it says that too.
 - **Do not claim more verification than was performed.** "Compiles" and
-  "works" are different statements, and this project keeps them apart on
-  purpose.
+  "works" are different statements, kept apart on purpose.
 
-`PLAN.md` and the documents under `docs/` are written in Vietnamese and
-record the design reasoning behind most decisions.
+`PLAN.md` and the documents under `docs/` are in Vietnamese and record the
+design reasoning.
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).
 
-The bundled Inter font is licensed under the SIL Open Font License; see
-[assets/fonts/Inter-LICENSE.txt](assets/fonts/Inter-LICENSE.txt). The
-vendored copy of GPUI in `vendor/gpui/` is Apache-2.0, copyright Zed
-Industries.
+The bundled Inter font is under the SIL Open Font License
+([assets/fonts/Inter-LICENSE.txt](assets/fonts/Inter-LICENSE.txt)). The
+vendored GPUI in `vendor/gpui/` is Apache-2.0, copyright Zed Industries.
