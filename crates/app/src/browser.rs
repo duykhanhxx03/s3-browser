@@ -5584,14 +5584,22 @@ impl Browser {
     }
 
     fn restore_inspected(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(bucket), Some(inspector)) = (
-            self.client.clone(),
-            self.bucket.clone(),
-            self.inspector.as_ref(),
-        ) else {
+        let Some(inspector) = self.inspector.as_ref() else {
             return;
         };
         let key = inspector.key.clone();
+        self.restore_key(key, cx);
+    }
+
+    /// Asks S3 to thaw one object, by key.
+    ///
+    /// Reachable from the row as well as from the inspector: an archived
+    /// object announces itself in the listing now, and the answer to "this
+    /// cannot be opened" should be within reach of the thing that said so.
+    fn restore_key(&mut self, key: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bucket)) = (self.client.clone(), self.bucket.clone()) else {
+            return;
+        };
         let reload = key.clone();
 
         let restoring = Tokio::spawn(cx, async move {
@@ -10544,7 +10552,26 @@ impl Browser {
                                         ),
                                     )
                             } else {
+                                let frozen = s3core::temperature_of(entry.storage_class.as_deref())
+                                    == s3core::Temperature::Frozen;
+                                let frozen_key = entry.key.clone();
                                 actions
+                                    .when(frozen, |actions| {
+                                        actions.child(
+                                            row_action(
+                                                ("row-restore", position),
+                                                "refresh",
+                                                locale::text("restore.action"),
+                                                theme,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _event, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.restore_key(frozen_key.clone(), cx);
+                                                }),
+                                            ),
+                                        )
+                                    })
                                     .child(
                                         row_action(
                                             ("row-info", position),
@@ -14897,7 +14924,14 @@ fn object_row(
             div()
                 .w(px(84.))
                 .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1p5()
                 .text_color(theme.text_muted)
+                // Beside the size rather than in a column of its own: the two
+                // are the same fact about an object, what it costs to keep and
+                // how readily it comes back.
+                .children(temperature_marker(entry, theme))
                 .child(size_label),
         )
         .child(
@@ -16452,6 +16486,56 @@ fn object_context_menu(
     )
 }
 
+/// The mark on a row whose storage class is worth knowing about.
+///
+/// Nothing at all for Standard, which is nearly every object: a list that
+/// annotates every row has told the reader nothing. Only the exceptions
+/// speak, and the loudest is the one that cannot be opened at all.
+///
+/// Shape carries the meaning rather than hue, so this cannot fight whatever
+/// palette is loaded — and the colours are theme tokens, so they inherit the
+/// contrast guarantees the rest of the interface has.
+fn temperature_marker(entry: &Entry, theme: Theme) -> Option<gpui::Stateful<gpui::Div>> {
+    if entry.is_folder {
+        return None;
+    }
+    let class = entry.storage_class.as_deref();
+    let dot = |color: gpui::Hsla| div().size(px(6.)).rounded_full().bg(color);
+
+    let (marker, tip) = match s3core::temperature_of(class) {
+        s3core::Temperature::Standard => return None,
+        s3core::Temperature::Infrequent => (
+            dot(theme.text_faint),
+            locale::text("temperature.infrequent"),
+        ),
+        s3core::Temperature::Cold => (dot(theme.text_muted), locale::text("temperature.cold")),
+        // A ring, not a dot: this one is a hole in the listing. The object is
+        // there and a plain GET on it fails.
+        s3core::Temperature::Frozen => (
+            div()
+                .size(px(7.))
+                .rounded_full()
+                .border_1()
+                .border_color(theme.accent),
+            locale::text("temperature.frozen"),
+        ),
+    };
+
+    // The exact class as well as the tier: "Infrequent" does not tell someone
+    // whether they are paying for one zone or three.
+    let tip = SharedString::from(match class {
+        Some(class) => format!("{tip} ({class})"),
+        None => tip.to_string(),
+    });
+    Some(
+        div()
+            .flex_shrink_0()
+            .id(SharedString::from(format!("temp-{}", entry.key)))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .child(marker),
+    )
+}
+
 /// The palette to paint: the setting when it names one, the system otherwise.
 ///
 /// Takes the whole `Settings` rather than one argument per token: the three
@@ -17568,6 +17652,51 @@ fn parent_prefix(prefix: &str) -> String {
 mod tests {
     use super::*;
     use crate::theme::Mode;
+
+    fn entry_in(class: Option<&str>, is_folder: bool) -> Entry {
+        Entry {
+            name: "thing".into(),
+            key: "thing".into(),
+            is_folder,
+            size: 1,
+            modified_epoch: None,
+            storage_class: class.map(str::to_string),
+        }
+    }
+
+    /// The listing only annotates what is out of the ordinary.
+    ///
+    /// Nearly every object is Standard, so marking them all would say nothing
+    /// while adding a mark to every row. What has to be marked is the tier
+    /// that changes what the object costs, and above all the one that cannot
+    /// be opened at all.
+    #[test]
+    fn only_the_unusual_storage_classes_are_marked() {
+        let theme = Theme::new(Mode::Dark, Chrome::Solid);
+
+        for quiet in [None, Some("STANDARD"), Some("EXPRESS_ONEZONE")] {
+            assert!(
+                temperature_marker(&entry_in(quiet, false), theme).is_none(),
+                "{quiet:?} should pass without comment"
+            );
+        }
+        for marked in [
+            Some("STANDARD_IA"),
+            Some("ONEZONE_IA"),
+            Some("INTELLIGENT_TIERING"),
+            Some("GLACIER_IR"),
+            Some("GLACIER"),
+            Some("DEEP_ARCHIVE"),
+        ] {
+            assert!(
+                temperature_marker(&entry_in(marked, false), theme).is_some(),
+                "{marked:?} should be marked"
+            );
+        }
+        // A folder is a common prefix, not an object; it has no storage class
+        // of its own to report even if the field were somehow populated.
+        assert!(temperature_marker(&entry_in(Some("GLACIER"), true), theme).is_none());
+    }
 
     /// A mouse wheel's notches, which arrive as whole lines.
     fn lines(y: f32) -> gpui::ScrollDelta {

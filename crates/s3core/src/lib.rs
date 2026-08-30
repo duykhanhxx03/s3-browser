@@ -1880,6 +1880,42 @@ pub fn restore_state(restore_header: Option<&str>, storage_class: Option<&str>) 
     }
 }
 
+/// How readily a storage class hands an object back.
+///
+/// S3 is the only filesystem most people meet where a file can exist and still
+/// not be readable — a `GET` against Glacier fails until a restore has been
+/// asked for and has finished. A listing already carries the class for every
+/// object, so this is knowable before anyone double-clicks and is told no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Temperature {
+    /// Served at once. The overwhelming majority of objects, and therefore
+    /// the one the interface should say nothing about.
+    Standard,
+    /// Served at once, cheaper to keep and dearer to read.
+    Infrequent,
+    /// Served at once, but the coldest tier that still does.
+    Cold,
+    /// Not readable at all until restored.
+    Frozen,
+}
+
+/// The temperature of a storage class, as a listing reports it.
+///
+/// An unrecognised class counts as [`Temperature::Standard`]. AWS adds classes
+/// over time, and marking something unknown as cold would put a restore button
+/// on an object that does not need one — a worse error than staying quiet.
+pub fn temperature_of(storage_class: Option<&str>) -> Temperature {
+    match storage_class {
+        Some("STANDARD_IA") | Some("ONEZONE_IA") | Some("INTELLIGENT_TIERING") => {
+            Temperature::Infrequent
+        }
+        // Instant Retrieval is cold to keep but still answers a plain GET.
+        Some("GLACIER_IR") => Temperature::Cold,
+        Some(class) if is_archived_class(class) => Temperature::Frozen,
+        _ => Temperature::Standard,
+    }
+}
+
 /// Storage classes that cannot be read without restoring first.
 ///
 /// `GLACIER_IR` is deliberately absent: Instant Retrieval is cheap-but-slow
@@ -2681,5 +2717,158 @@ mod content_type_tests {
         let text = content_type_for("notes.txt").unwrap();
         assert_eq!(text, "text/plain");
         assert!(!text.contains(';'), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod temperature_tests {
+    use super::{is_archived_class, temperature_of, Temperature};
+
+    #[test]
+    fn temperature_agrees_with_what_needs_restoring() {
+        // The two must never disagree: a class that needs a restore is
+        // exactly the one the list should mark as unreadable, and an
+        // interface offering a restore for anything else asks for an
+        // operation that does nothing.
+        for class in [
+            "STANDARD",
+            "STANDARD_IA",
+            "ONEZONE_IA",
+            "INTELLIGENT_TIERING",
+            "GLACIER_IR",
+            "GLACIER",
+            "DEEP_ARCHIVE",
+            "REDUCED_REDUNDANCY",
+            "EXPRESS_ONEZONE",
+            "SOMETHING_AWS_ADDS_LATER",
+        ] {
+            assert_eq!(
+                temperature_of(Some(class)) == Temperature::Frozen,
+                is_archived_class(class),
+                "{class} is classified inconsistently"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_class_is_left_alone() {
+        // Better to say nothing than to put a restore button on an object
+        // that does not need one.
+        assert_eq!(temperature_of(None), Temperature::Standard);
+        assert_eq!(temperature_of(Some("")), Temperature::Standard);
+        assert_eq!(
+            temperature_of(Some("GLACIER_SOMETHING_NEW")),
+            Temperature::Standard
+        );
+    }
+
+    #[test]
+    fn instant_retrieval_is_cold_but_still_readable() {
+        // The distinction the whole feature turns on.
+        assert_eq!(temperature_of(Some("GLACIER_IR")), Temperature::Cold);
+        assert_eq!(temperature_of(Some("GLACIER")), Temperature::Frozen);
+        assert_eq!(temperature_of(Some("DEEP_ARCHIVE")), Temperature::Frozen);
+    }
+}
+
+/// End-to-end checks against a real S3 API.
+///
+/// Skipped unless `S3BROWSER_TEST_ENDPOINT` is set, so an ordinary `cargo test`
+/// needs no network and no container:
+///
+/// ```text
+/// docker run -d --name localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack:3.8
+/// S3BROWSER_TEST_ENDPOINT=http://127.0.0.1:4566 cargo test -p s3core -- --ignored
+/// ```
+///
+/// What these are for is the half that unit tests cannot reach: that the SDK
+/// really does hand back a storage class on a plain listing, which is the
+/// assumption the whole storage-temperature feature rests on.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    const BUCKET: &str = "s3browser-dev";
+
+    fn endpoint() -> Option<String> {
+        std::env::var("S3BROWSER_TEST_ENDPOINT").ok()
+    }
+
+    fn profile(endpoint: String) -> Profile {
+        Profile {
+            name: "live".into(),
+            endpoint: Some(endpoint),
+            region: "us-east-1".into(),
+            path_style: true,
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            session_token: None,
+            relaxed_checksums: true,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs S3BROWSER_TEST_ENDPOINT"]
+    async fn a_listing_really_does_carry_the_storage_class() {
+        let Some(endpoint) = endpoint() else { return };
+        let client = S3Client::connect(&profile(endpoint)).await.unwrap();
+
+        let page = client
+            .list_flat_page(BUCKET, "archive/", None)
+            .await
+            .unwrap();
+        assert!(!page.entries.is_empty(), "fixture bucket is empty");
+
+        let mut seen = Vec::new();
+        for entry in &page.entries {
+            let class = entry
+                .storage_class
+                .as_deref()
+                .unwrap_or_else(|| panic!("{} came back with no storage class", entry.key));
+            seen.push((
+                entry.key.clone(),
+                class.to_string(),
+                temperature_of(Some(class)),
+            ));
+        }
+
+        // The exact claim the feature makes: these four are distinguishable
+        // from a listing alone, with no HEAD per object.
+        let of = |needle: &str| {
+            seen.iter()
+                .find(|(k, _, _)| k.contains(needle))
+                .map(|(_, _, t)| *t)
+                .unwrap_or_else(|| panic!("no fixture matching {needle}"))
+        };
+        assert_eq!(of("2019-cold"), Temperature::Frozen);
+        assert_eq!(of("2018-deep"), Temperature::Frozen);
+        assert_eq!(of("instant"), Temperature::Cold);
+        assert_eq!(of("infrequent"), Temperature::Infrequent);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs S3BROWSER_TEST_ENDPOINT"]
+    async fn a_flat_listing_pages_through_everything() {
+        let Some(endpoint) = endpoint() else { return };
+        let client = S3Client::connect(&profile(endpoint)).await.unwrap();
+
+        let mut total = 0usize;
+        let mut bytes = 0i64;
+        let mut continuation = None;
+        loop {
+            let page = client
+                .list_flat_page(BUCKET, "", continuation)
+                .await
+                .unwrap();
+            total += page.entries.len();
+            bytes += page.entries.iter().map(|e| e.size).sum::<i64>();
+            continuation = page.continuation;
+            if continuation.is_none() {
+                break;
+            }
+        }
+        // 225 generated objects plus the four storage-class fixtures.
+        assert_eq!(total, 229, "walked {total} objects");
+        assert!(bytes > 0, "every object came back with size zero");
     }
 }
